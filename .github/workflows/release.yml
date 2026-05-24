@@ -48,8 +48,11 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Checkout release tag
+      - name: Checkout release branch
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,8 +72,21 @@ jobs:
       - name: Install cargo-release
         run: cargo install cargo-release --locked
 
-      - name: Patch workspace crate versions
-        run: cargo release version "${{ steps.version.outputs.version }}" --workspace --execute --no-confirm --allow-branch 'main'
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump versions, commit, and push
+        run: >-
+          cargo release "${{ steps.version.outputs.version }}"
+          --workspace
+          --execute
+          --no-confirm
+          --no-publish
+          --no-verify
+          --no-tag
+          --allow-branch main
 
       - name: Upload patched source
         uses: actions/upload-artifact@v4
@@ -81,7 +97,6 @@ jobs:
             Cargo.toml
             Makefile.toml
             openapi/**
-            openapitools.json
             crates/**
 
   build-assets:
