@@ -1,13 +1,11 @@
+use languagetool_lsp::lsp::Backend;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::io::{duplex, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tower_lsp::lsp_types::Url;
 use tower_lsp::{LspService, Server};
-
-use languagetool_lsp::lsp::Backend;
 
 fn encode_message(message: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", message.len(), message)

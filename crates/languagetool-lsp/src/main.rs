@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
-
 use clap::{Parser, Subcommand};
 use languagetool_lsp::config::ClientOptions;
 use languagetool_lsp::languagetool::LanguageToolClient;
 use languagetool_lsp::lsp::Backend;
 use languagetool_lsp::masking::{annotated_for_language, ignored_ranges_for_language};
+use std::path::{Path, PathBuf};
 use tower_lsp::{LspService, Server};
 
 #[derive(Parser)]

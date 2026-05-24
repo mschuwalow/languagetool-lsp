@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, TextDocumentItem, Url};
 
 #[derive(Debug, Clone)]

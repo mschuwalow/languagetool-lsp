@@ -1,8 +1,7 @@
-use serde::Serialize;
-use thiserror::Error;
-
 use crate::config::ClientOptions;
 use languagetool_client as api;
+use serde::Serialize;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LanguageToolError {

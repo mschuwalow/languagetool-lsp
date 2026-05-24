@@ -1,13 +1,3 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-
-use serde_json::Value;
-use tower_lsp::jsonrpc::Result as RpcResult;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
-
 use crate::config::{BackendConfig, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
     diagnostic_data, make_lsp_diagnostic, match_offsets, parse_diagnostic_data, SOURCE,
@@ -18,6 +8,14 @@ use crate::languagetool::{
 };
 use crate::line_index::LineIndex;
 use crate::masking::{annotated_for_language, ignored_ranges_for_language};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tower_lsp::jsonrpc::Result as RpcResult;
+use tower_lsp::lsp_types::*;
+use tower_lsp::{Client, LanguageServer};
 
 const COMMAND_IGNORE_WORD: &str = "languagetool.ignoreWordInWorkspace";
 const COMMAND_DISABLE_RULE: &str = "languagetool.disableRuleInWorkspace";
