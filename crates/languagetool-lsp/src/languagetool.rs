@@ -57,6 +57,7 @@ impl LanguageToolClient {
         options: &ClientOptions,
     ) -> Result<LanguageToolResponse, LanguageToolError> {
         let endpoint = options.endpoint();
+        let api_base_url = options.api_base_url();
         let preferred_variants = join_parameter(&options.preferred_variants);
         let disabled_rules = join_parameter(&options.disabled_rules);
         let disabled_categories = join_parameter(&options.disabled_categories);
@@ -98,7 +99,7 @@ impl LanguageToolClient {
                 source,
             })?;
         let configuration = api::apis::configuration::Configuration {
-            base_path: endpoint.trim_end_matches("/check").to_string(),
+            base_path: api_base_url,
             client,
             ..api::apis::configuration::Configuration::default()
         };
@@ -126,74 +127,25 @@ impl LanguageToolClient {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub type LanguageToolSoftware = languagetool_client::models::CheckPost200ResponseSoftware;
+pub type LanguageToolMatch = languagetool_client::models::CheckPost200ResponseMatchesInner;
+pub type LanguageToolReplacement =
+    languagetool_client::models::CheckPost200ResponseMatchesInnerReplacementsInner;
+pub type LanguageToolRule = languagetool_client::models::CheckPost200ResponseMatchesInnerRule;
+pub type LanguageToolCategory =
+    languagetool_client::models::CheckPost200ResponseMatchesInnerRuleCategory;
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LanguageToolResponse {
     pub software: Option<LanguageToolSoftware>,
     pub matches: Vec<LanguageToolMatch>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanguageToolSoftware {
-    pub name: String,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanguageToolMatch {
-    pub message: String,
-    pub offset: i32,
-    pub length: i32,
-    pub replacements: Vec<String>,
-    pub rule: Option<LanguageToolRule>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanguageToolRule {
-    pub id: String,
-    pub issue_type: Option<String>,
-    pub category: Option<LanguageToolCategory>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanguageToolCategory {
-    pub id: Option<String>,
-}
-
 impl From<api::models::CheckPost200Response> for LanguageToolResponse {
     fn from(response: api::models::CheckPost200Response) -> Self {
         Self {
-            software: response.software.map(|software| LanguageToolSoftware {
-                name: software.name,
-                version: software.version,
-            }),
-            matches: response
-                .matches
-                .unwrap_or_default()
-                .into_iter()
-                .map(LanguageToolMatch::from)
-                .collect(),
-        }
-    }
-}
-
-impl From<api::models::CheckPost200ResponseMatchesInner> for LanguageToolMatch {
-    fn from(item: api::models::CheckPost200ResponseMatchesInner) -> Self {
-        Self {
-            message: item.message,
-            offset: item.offset,
-            length: item.length,
-            replacements: item
-                .replacements
-                .into_iter()
-                .filter_map(|replacement| replacement.value)
-                .collect(),
-            rule: item.rule.map(|rule| LanguageToolRule {
-                id: rule.id,
-                issue_type: rule.issue_type,
-                category: Some(LanguageToolCategory {
-                    id: rule.category.id,
-                }),
-            }),
+            software: response.software.map(|software| *software),
+            matches: response.matches.unwrap_or_default().into_iter().collect(),
         }
     }
 }
@@ -322,11 +274,14 @@ mod tests {
             serde_json::from_str::<api::models::CheckPost200Response>(json).unwrap(),
         );
         assert_eq!(response.matches.len(), 1);
-        assert_eq!(response.matches[0].replacements, vec!["test"]);
+        assert_eq!(
+            response.matches[0].replacements[0].value.as_deref(),
+            Some("test")
+        );
         assert_eq!(
             response.matches[0]
                 .rule
-                .as_ref()
+                .as_deref()
                 .map(|rule| rule.id.as_str()),
             Some("MORFOLOGIK_RULE_EN_US")
         );

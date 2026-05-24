@@ -54,17 +54,13 @@ pub fn diagnostic_data(
     let start = line_index.position(offset);
     let end = line_index.position(offset + length);
     let matched_text = text_for_range(text, start, end);
-    let rule = item.rule.as_ref();
-    let category_id = rule.and_then(|rule| {
-        rule.category
-            .as_ref()
-            .and_then(|category| category.id.clone())
-    });
+    let rule = item.rule.as_deref();
+    let category_id = rule.and_then(|rule| rule.category.id.clone());
     let replacements = item
         .replacements
         .iter()
         .take(options.max_replacements)
-        .cloned()
+        .filter_map(|replacement| replacement.value.clone())
         .collect::<Vec<_>>();
     DiagnosticData {
         rule_id: rule.map(|rule| rule.id.clone()).unwrap_or_default(),
@@ -87,7 +83,7 @@ pub fn severity_for(item: &LanguageToolMatch, options: &ClientOptions) -> Diagno
         return options.configured_severity();
     }
 
-    let Some(rule) = item.rule.as_ref() else {
+    let Some(rule) = item.rule.as_deref() else {
         return options.configured_severity();
     };
 
@@ -95,11 +91,7 @@ pub fn severity_for(item: &LanguageToolMatch, options: &ClientOptions) -> Diagno
         return DiagnosticSeverity::WARNING;
     }
 
-    match rule
-        .category
-        .as_ref()
-        .and_then(|category| category.id.as_deref())
-    {
+    match rule.category.id.as_deref() {
         Some("GRAMMAR" | "PUNCTUATION" | "TYPOGRAPHY") => DiagnosticSeverity::WARNING,
         _ => options.configured_severity(),
     }
@@ -167,21 +159,28 @@ fn text_for_range(text: &str, start: Position, end: Position) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::languagetool::{LanguageToolCategory, LanguageToolRule};
+    use crate::languagetool::{LanguageToolCategory, LanguageToolReplacement, LanguageToolRule};
 
     fn lt_match(rule_id: &str, category_id: &str) -> LanguageToolMatch {
         LanguageToolMatch {
             message: "message".to_string(),
+            short_message: None,
             offset: 0,
             length: 4,
-            replacements: Vec::new(),
-            rule: Some(LanguageToolRule {
+            replacements: Vec::<LanguageToolReplacement>::new(),
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
                 id: rule_id.to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
                 issue_type: None,
-                category: Some(LanguageToolCategory {
+                category: Box::new(LanguageToolCategory {
                     id: Some(category_id.to_string()),
+                    name: None,
                 }),
-            }),
+            })),
         }
     }
 

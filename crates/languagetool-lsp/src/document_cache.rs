@@ -23,7 +23,13 @@ impl Document {
 
 #[derive(Debug, Default, Clone)]
 pub struct DocumentCache {
-    documents: Arc<RwLock<HashMap<String, Document>>>,
+    documents: Arc<RwLock<HashMap<String, DocumentEntry>>>,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentEntry {
+    document: Document,
+    generation: u64,
 }
 
 impl DocumentCache {
@@ -32,23 +38,31 @@ impl DocumentCache {
         self.documents
             .write()
             .expect("document cache poisoned")
-            .insert(document.uri.to_string(), document);
+            .entry(document.uri.to_string())
+            .and_modify(|entry| entry.document = document.clone())
+            .or_insert(DocumentEntry {
+                document,
+                generation: 0,
+            });
     }
 
     pub fn update(&self, uri: &Url, version: Option<i32>, text: String) {
         let key = uri.to_string();
         let mut documents = self.documents.write().expect("document cache poisoned");
-        if let Some(document) = documents.get_mut(&key) {
-            document.version = version.or(document.version);
-            document.text = text;
+        if let Some(entry) = documents.get_mut(&key) {
+            entry.document.version = version.or(entry.document.version);
+            entry.document.text = text;
         } else {
             documents.insert(
                 key,
-                Document {
-                    uri: uri.clone(),
-                    version,
-                    language_id: None,
-                    text,
+                DocumentEntry {
+                    document: Document {
+                        uri: uri.clone(),
+                        version,
+                        language_id: None,
+                        text,
+                    },
+                    generation: 0,
                 },
             );
         }
@@ -63,21 +77,24 @@ impl DocumentCache {
         if let Some(range) = change.range {
             let key = uri.to_string();
             let mut documents = self.documents.write().expect("document cache poisoned");
-            if let Some(document) = documents.get_mut(&key) {
+            if let Some(entry) = documents.get_mut(&key) {
                 if let Some((start, end)) =
-                    byte_range_for_lsp_range(&document.text, range.start, range.end)
+                    byte_range_for_lsp_range(&entry.document.text, range.start, range.end)
                 {
-                    document.text.replace_range(start..end, &change.text);
-                    document.version = version.or(document.version);
+                    entry.document.text.replace_range(start..end, &change.text);
+                    entry.document.version = version.or(entry.document.version);
                 }
             } else {
                 documents.insert(
                     key,
-                    Document {
-                        uri: uri.clone(),
-                        version,
-                        language_id: None,
-                        text: change.text,
+                    DocumentEntry {
+                        document: Document {
+                            uri: uri.clone(),
+                            version,
+                            language_id: None,
+                            text: change.text,
+                        },
+                        generation: 0,
                     },
                 );
             }
@@ -98,7 +115,24 @@ impl DocumentCache {
             .read()
             .expect("document cache poisoned")
             .get(uri.as_str())
-            .cloned()
+            .map(|entry| entry.document.clone())
+    }
+
+    pub fn bump_generation(&self, uri: &Url) -> u64 {
+        let mut documents = self.documents.write().expect("document cache poisoned");
+        let Some(entry) = documents.get_mut(uri.as_str()) else {
+            return 0;
+        };
+        entry.generation += 1;
+        entry.generation
+    }
+
+    pub fn generation(&self, uri: &Url) -> u64 {
+        self.documents
+            .read()
+            .expect("document cache poisoned")
+            .get(uri.as_str())
+            .map_or(0, |entry| entry.generation)
     }
 
     pub fn urls(&self) -> Vec<Url> {
@@ -106,7 +140,7 @@ impl DocumentCache {
             .read()
             .expect("document cache poisoned")
             .values()
-            .map(|document| document.uri.clone())
+            .map(|entry| entry.document.uri.clone())
             .collect()
     }
 }
@@ -190,5 +224,22 @@ mod tests {
             },
         );
         assert_eq!(cache.get(&uri).unwrap().text, "axb");
+    }
+
+    #[test]
+    fn tracks_generation_with_document_entry() {
+        let cache = DocumentCache::default();
+        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        assert_eq!(cache.generation(&uri), 0);
+        assert_eq!(cache.bump_generation(&uri), 0);
+
+        cache.update(&uri, Some(1), "hello".to_string());
+        assert_eq!(cache.generation(&uri), 0);
+        assert_eq!(cache.bump_generation(&uri), 1);
+        assert_eq!(cache.generation(&uri), 1);
+        assert_eq!(cache.bump_generation(&uri), 2);
+
+        cache.remove(&uri);
+        assert_eq!(cache.generation(&uri), 0);
     }
 }

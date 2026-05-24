@@ -731,7 +731,7 @@ mod tests {
     fn official_rust_language_id_is_supported_before_masking() {
         let text = indoc! {r#"
             assert_eq!(
-                normalize_check_url("http://localhost:8081/v2/check"),
+                options.endpoint(),
                 "http://localhost:8081/v2/check"
             );
         "#};
@@ -745,7 +745,7 @@ mod tests {
     fn masking_handles_comment_like_strings() {
         let text = indoc! {r##"
             assert_eq!(
-                normalize_check_url("http://localhost:8081/v2/check"),
+                options.endpoint(),
                 "http://localhost:8081/v2/check"
             );
             let uri = Url::parse("file:///tmp/test.txt").unwrap();

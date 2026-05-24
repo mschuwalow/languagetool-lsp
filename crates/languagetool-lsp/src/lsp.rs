@@ -28,7 +28,6 @@ pub struct Backend {
     documents: DocumentCache,
     initialization_options: Arc<RwLock<ClientOptions>>,
     project_config: Arc<RwLock<ProjectConfig>>,
-    generations: Arc<RwLock<HashMap<String, u64>>>,
     language_tool: LanguageToolClient,
 }
 
@@ -40,7 +39,6 @@ impl Backend {
             documents: DocumentCache::default(),
             initialization_options: Arc::new(RwLock::new(ClientOptions::default())),
             project_config: Arc::new(RwLock::new(ProjectConfig::default())),
-            generations: Arc::new(RwLock::new(HashMap::new())),
             language_tool: LanguageToolClient::new(),
         }
     }
@@ -57,42 +55,19 @@ impl Backend {
             .merged_options(&initialization_options)
     }
 
-    fn bump_generation(&self, uri: &Url) -> u64 {
-        let mut generations = self.generations.write().expect("generations poisoned");
-        let generation = generations.get(uri.as_str()).copied().unwrap_or(0) + 1;
-        generations.insert(uri.to_string(), generation);
-        generation
-    }
-
-    fn generation(&self, uri: &Url) -> u64 {
-        self.generations
-            .read()
-            .expect("generations poisoned")
-            .get(uri.as_str())
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn remove_generation(&self, uri: &Url) {
-        self.generations
-            .write()
-            .expect("generations poisoned")
-            .remove(uri.as_str());
-    }
-
     fn schedule_check(&self, uri: Url, generation: u64) {
         let debounce = self.options().debounce_ms;
         let backend = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
-            if backend.generation(&uri) == generation {
+            if backend.documents.generation(&uri) == generation {
                 backend.check_uri(&uri, generation).await;
             }
         });
     }
 
     async fn check_uri_now(&self, uri: &Url) {
-        let generation = self.bump_generation(uri);
+        let generation = self.documents.bump_generation(uri);
         self.check_uri(uri, generation).await;
     }
 
@@ -126,7 +101,7 @@ impl Backend {
             }
         };
 
-        if self.generation(&document.uri) != generation {
+        if self.documents.generation(&document.uri) != generation {
             return;
         }
         if self
@@ -431,7 +406,7 @@ impl LanguageServer for Backend {
                 .apply_change(&uri, Some(params.text_document.version), change);
         }
         if had_changes {
-            let generation = self.bump_generation(&uri);
+            let generation = self.documents.bump_generation(&uri);
             if self.options().check_while_typing {
                 self.schedule_check(uri, generation);
             }
@@ -450,7 +425,6 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
-        self.remove_generation(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
@@ -550,7 +524,9 @@ impl LanguageServer for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::languagetool::{LanguageToolCategory, LanguageToolMatch, LanguageToolRule};
+    use crate::languagetool::{
+        LanguageToolCategory, LanguageToolMatch, LanguageToolReplacement, LanguageToolRule,
+    };
 
     #[test]
     fn builds_diagnostics_for_document() {
@@ -563,16 +539,25 @@ mod tests {
         let options = ClientOptions::default();
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
+            short_message: None,
             offset: 11,
             length: 4,
-            replacements: vec!["test".to_string()],
-            rule: Some(LanguageToolRule {
+            replacements: vec![LanguageToolReplacement {
+                value: Some("test".to_string()),
+            }],
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
                 id: "MORFOLOGIK_RULE_EN_US".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
                 issue_type: Some("misspelling".to_string()),
-                category: Some(LanguageToolCategory {
+                category: Box::new(LanguageToolCategory {
                     id: Some("TYPOS".to_string()),
+                    name: None,
                 }),
-            }),
+            })),
         };
 
         let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);
@@ -592,14 +577,20 @@ mod tests {
         let options = ClientOptions::default();
         let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),
+            short_message: None,
             offset: 18,
             length: 4,
             replacements: Vec::new(),
-            rule: Some(LanguageToolRule {
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
                 id: "THIS_NNS".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
                 issue_type: None,
-                category: None,
-            }),
+                category: Box::new(LanguageToolCategory::new()),
+            })),
         };
 
         let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);

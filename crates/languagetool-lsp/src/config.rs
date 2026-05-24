@@ -13,7 +13,7 @@ fn default_local_url() -> String {
 }
 
 fn default_cloud_url() -> String {
-    "https://api.languagetool.org/v2/check".to_string()
+    "https://api.languagetool.org".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -140,11 +140,19 @@ impl ClientOptions {
         }
     }
 
-    pub fn endpoint(&self) -> String {
+    pub fn base_url(&self) -> String {
         let url = match &self.backend {
             BackendConfig::Local { url } | BackendConfig::Cloud { url } => url.as_str(),
         };
-        normalize_check_url(url)
+        url.trim().trim_end_matches('/').to_string()
+    }
+
+    pub fn api_base_url(&self) -> String {
+        format!("{}/v2", self.base_url())
+    }
+
+    pub fn endpoint(&self) -> String {
+        format!("{}/check", self.api_base_url())
     }
 
     pub fn timeout(&self) -> Duration {
@@ -297,35 +305,26 @@ fn push_unique_sorted(values: &mut Vec<String>, value: String) -> bool {
     true
 }
 
-pub fn normalize_check_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/v2/check") {
-        trimmed.to_string()
-    } else if trimmed.ends_with("/v2") {
-        format!("{trimmed}/check")
-    } else {
-        format!("{trimmed}/v2/check")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_base_url() {
-        assert_eq!(
-            normalize_check_url("http://localhost:8081"),
-            "http://localhost:8081/v2/check"
-        );
-        assert_eq!(
-            normalize_check_url("http://localhost:8081/v2"),
-            "http://localhost:8081/v2/check"
-        );
-        assert_eq!(
-            normalize_check_url("http://localhost:8081/v2/check"),
-            "http://localhost:8081/v2/check"
-        );
+    fn builds_api_urls_from_backend_base_url() {
+        let options = ClientOptions::default();
+        assert_eq!(options.base_url(), "http://localhost:8081");
+        assert_eq!(options.api_base_url(), "http://localhost:8081/v2");
+        assert_eq!(options.endpoint(), "http://localhost:8081/v2/check");
+
+        let options = ClientOptions {
+            backend: BackendConfig::Cloud {
+                url: " https://api.languagetool.org/ ".to_string(),
+            },
+            ..ClientOptions::default()
+        };
+        assert_eq!(options.base_url(), "https://api.languagetool.org");
+        assert_eq!(options.api_base_url(), "https://api.languagetool.org/v2");
+        assert_eq!(options.endpoint(), "https://api.languagetool.org/v2/check");
     }
 
     #[test]
