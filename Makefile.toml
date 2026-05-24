@@ -1,0 +1,82 @@
+[config]
+default_to_workspace = false
+
+[env]
+OPENAPI_GENERATOR_CLI_VERSION = "2.34.0"
+OPENAPI_SOURCE = "openapi/languagetool-swagger.json"
+OPENAPI_NORMALIZED = "target/openapi/languagetool-swagger-urlencoded.json"
+LANGUAGETOOL_CLIENT_DIR = "crates/languagetool-client"
+
+[tasks.normalize-openapi]
+description = "Create the urlencoded Swagger document consumed by OpenAPI Generator."
+script_runner = "@shell"
+script = '''
+mkdir -p "$(dirname "${OPENAPI_NORMALIZED}")"
+node <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const source = process.env.OPENAPI_SOURCE;
+const destination = process.env.OPENAPI_NORMALIZED;
+const spec = JSON.parse(fs.readFileSync(source, "utf8"));
+const consumes = ["application/x-www-form-urlencoded"];
+
+spec.consumes = consumes;
+for (const pathItem of Object.values(spec.paths ?? {})) {
+  for (const operation of Object.values(pathItem ?? {})) {
+    if (operation && typeof operation === "object" && Array.isArray(operation.parameters)) {
+      operation.consumes = consumes;
+    }
+  }
+}
+
+fs.mkdirSync(path.dirname(destination), { recursive: true });
+fs.writeFileSync(destination, `${JSON.stringify(spec, null, 2)}\n`);
+NODE
+'''
+
+[tasks.generate-client]
+description = "Regenerate the checked-in LanguageTool API client crate."
+dependencies = ["normalize-openapi"]
+script_runner = "@shell"
+script = '''
+rm -rf "${LANGUAGETOOL_CLIENT_DIR}"
+npx --yes "@openapitools/openapi-generator-cli@${OPENAPI_GENERATOR_CLI_VERSION}" generate \
+  -g rust \
+  -i "${OPENAPI_NORMALIZED}" \
+  -o "${LANGUAGETOOL_CLIENT_DIR}" \
+  --additional-properties=packageName=languagetool-client,packageVersion=0.1.0,supportMiddleware=false \
+  --global-property=apiDocs=false,modelDocs=false,apiTests=false,modelTests=false
+rm -rf \
+  "${LANGUAGETOOL_CLIENT_DIR}/docs" \
+  "${LANGUAGETOOL_CLIENT_DIR}/.openapi-generator" \
+  "${LANGUAGETOOL_CLIENT_DIR}/.openapi-generator-ignore" \
+  "${LANGUAGETOOL_CLIENT_DIR}/.gitignore" \
+  "${LANGUAGETOOL_CLIENT_DIR}/.travis.yml" \
+  "${LANGUAGETOOL_CLIENT_DIR}/git_push.sh" \
+  "${LANGUAGETOOL_CLIENT_DIR}/README.md"
+node <<'NODE'
+const fs = require("fs");
+const lib = `${process.env.LANGUAGETOOL_CLIENT_DIR}/src/lib.rs`;
+let content = fs.readFileSync(lib, "utf8");
+content = content.replace("#![allow(clippy::too_many_arguments)]", "#![allow(clippy::all)]");
+fs.writeFileSync(lib, content);
+NODE
+cargo fmt -p languagetool-client
+'''
+
+[tasks.verify]
+description = "Run the standard workspace verification checks."
+dependencies = ["format", "test", "clippy"]
+
+[tasks.format]
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.test]
+command = "cargo"
+args = ["test", "--workspace"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]

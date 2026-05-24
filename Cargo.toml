@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "crates/languagetool-client",
+  "crates/languagetool-lsp",
+]
+resolver = "2"
