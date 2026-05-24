@@ -54,7 +54,22 @@ impl TestContext {
     }
 
     async fn initialize(&mut self) -> Value {
+        self.initialize_with_options(json!({})).await
+    }
+
+    async fn initialize_with_options(&mut self, extra_options: Value) -> Value {
         let root_uri = self.root_uri();
+        let mut initialization_options = json!({
+            "backend": { "type": "local", "url": "http://localhost:8081" },
+            "language": "en-US",
+            "checkOnOpen": true,
+            "checkOnSave": true,
+            "checkWhileTyping": false,
+            "debounceMs": 10,
+            "maxReplacements": 8
+        });
+        merge_json(&mut initialization_options, extra_options);
+
         let response = self
             .request(
                 "initialize",
@@ -74,19 +89,10 @@ impl TestContext {
                     "processId": null,
                     "rootUri": root_uri,
                     "workspaceFolders": [{ "name": "test", "uri": root_uri }],
-                    "initializationOptions": {
-                        "backend": { "type": "local", "url": "http://localhost:8081" },
-                        "language": "en-US",
-                        "checkOnOpen": true,
-                        "checkOnSave": true,
-                        "checkWhileTyping": false,
-                        "debounceMs": 10,
-                        "maxReplacements": 8
-                    }
+                    "initializationOptions": initialization_options
                 }),
             )
             .await;
-        self.notify("initialized", json!({})).await;
         response
     }
 
@@ -199,6 +205,15 @@ impl TestContext {
             .await
             .expect("LSP body should be readable");
         serde_json::from_slice(&content).expect("LSP body should be JSON")
+    }
+}
+
+fn merge_json(base: &mut Value, patch: Value) {
+    let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) else {
+        return;
+    };
+    for (key, value) in patch {
+        base.insert(key.clone(), value.clone());
     }
 }
 
@@ -319,4 +334,66 @@ async fn execute_ignore_word_command_writes_project_config() {
         .expect("ignore command should write project config");
     let config: Value = serde_json::from_str(&config).expect("project config should be JSON");
     assert_eq!(config["ignored_words"], json!(["tset"]));
+}
+
+#[tokio::test]
+async fn execute_command_uses_configured_project_config_path() {
+    let mut ctx = TestContext::new();
+    ctx.initialize_with_options(json!({
+        "projectConfigPath": ".idea/languagetool.json"
+    }))
+    .await;
+
+    let result = ctx
+        .request(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+
+    assert_eq!(result, Value::Null);
+    assert!(!ctx.project_config_path().exists());
+    let config_path = ctx.workspace.path().join(".idea/languagetool.json");
+    let config = std::fs::read_to_string(config_path)
+        .expect("ignore command should write configured project config");
+    let config: Value = serde_json::from_str(&config).expect("project config should be JSON");
+    assert_eq!(config["ignored_words"], json!(["tset"]));
+}
+
+#[tokio::test]
+async fn existing_project_config_is_loaded_on_initialize() {
+    let mut ctx = TestContext::new();
+    let config_path = ctx.workspace.path().join(".idea/languagetool.json");
+    std::fs::create_dir_all(config_path.parent().unwrap())
+        .expect("project config directory should be created");
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&json!({ "ignored_words": ["tset"] })).unwrap(),
+    )
+    .expect("project config should be written");
+
+    ctx.initialize_with_options(json!({
+        "projectConfigPath": ".idea/languagetool.json"
+    }))
+    .await;
+    let uri = ctx.doc_uri("document.txt");
+
+    ctx.open_document(&uri, "plaintext", "This are a tset.")
+        .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic["data"]["matchedText"] != "tset"
+            && diagnostic["data"]["replacements"]
+                .as_array()
+                .is_none_or(|replacements| replacements.iter().all(|value| value != "test"))
+    }));
 }

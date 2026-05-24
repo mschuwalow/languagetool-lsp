@@ -8,6 +8,10 @@ use tower_lsp::lsp_types::DiagnosticSeverity;
 pub const CONFIG_DIR: &str = ".zed";
 pub const CONFIG_FILE: &str = "languagetool.json";
 
+fn default_project_config_path() -> String {
+    format!("{CONFIG_DIR}/{CONFIG_FILE}")
+}
+
 fn default_local_url() -> String {
     "http://localhost:8081".to_string()
 }
@@ -99,6 +103,7 @@ pub struct ClientOptions {
     pub enabled_languages: Vec<String>,
     pub disabled_languages: Vec<String>,
     pub ignored_words: Vec<String>,
+    pub project_config_path: String,
 }
 
 impl Default for ClientOptions {
@@ -125,6 +130,7 @@ impl Default for ClientOptions {
             enabled_languages: Vec::new(),
             disabled_languages: Vec::new(),
             ignored_words: Vec::new(),
+            project_config_path: default_project_config_path(),
         }
     }
 }
@@ -153,6 +159,19 @@ impl ClientOptions {
 
     pub fn endpoint(&self) -> String {
         format!("{}/check", self.api_base_url())
+    }
+
+    pub fn project_config_path(&self, root: &Path) -> PathBuf {
+        let path = PathBuf::from(self.project_config_path.trim());
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    }
+
+    pub fn project_config_display_path(&self) -> String {
+        self.project_config_path.trim().to_string()
     }
 
     pub fn timeout(&self) -> Duration {
@@ -204,9 +223,8 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    pub fn load(root: &Path) -> Self {
-        let path = Self::path(root);
-        let Ok(text) = std::fs::read_to_string(&path) else {
+    pub fn load(path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
         };
 
@@ -216,21 +234,12 @@ impl ProjectConfig {
         })
     }
 
-    pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        let path = Self::path(root);
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = self.to_json_string();
         std::fs::write(path, text)
-    }
-
-    pub fn path(root: &Path) -> PathBuf {
-        root.join(CONFIG_DIR).join(CONFIG_FILE)
-    }
-
-    pub fn display_path() -> String {
-        format!("{CONFIG_DIR}/{CONFIG_FILE}")
     }
 
     pub fn to_json_string(&self) -> String {
@@ -336,6 +345,7 @@ mod tests {
             "preferredVariants": ["en-US"],
             "level": "picky",
             "checkOnSave": false,
+            "projectConfigPath": ".config/languagetool/project.json",
             "diagnosticSeverity": "warning"
         })));
         assert_eq!(
@@ -349,7 +359,43 @@ mod tests {
         assert_eq!(options.preferred_variants, vec!["en-US"]);
         assert_eq!(options.level, Some(CheckingLevel::Picky));
         assert!(!options.check_on_save);
+        assert_eq!(
+            options.project_config_path,
+            ".config/languagetool/project.json"
+        );
         assert_eq!(options.configured_severity(), DiagnosticSeverity::WARNING);
+    }
+
+    #[test]
+    fn resolves_project_config_paths() {
+        let root = Path::new("/tmp/workspace");
+        let options = ClientOptions::default();
+        assert_eq!(
+            options.project_config_path(root),
+            PathBuf::from("/tmp/workspace/.zed/languagetool.json")
+        );
+        assert_eq!(
+            options.project_config_display_path(),
+            ".zed/languagetool.json"
+        );
+
+        let options = ClientOptions {
+            project_config_path: ".idea/languagetool.json".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            options.project_config_path(root),
+            PathBuf::from("/tmp/workspace/.idea/languagetool.json")
+        );
+
+        let options = ClientOptions {
+            project_config_path: "/tmp/languagetool.json".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            options.project_config_path(root),
+            PathBuf::from("/tmp/languagetool.json")
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::masking::{annotated_for_language, ignored_ranges_for_language};
 use crate::text_offsets::{text_for_utf16_range, LineIndex};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tower_lsp::jsonrpc::Result as RpcResult;
@@ -142,21 +142,34 @@ impl Backend {
         }
     }
 
-    fn save_project_config(&self, project_config: &ProjectConfig) -> Result<(), String> {
+    fn project_config_path(&self) -> PathBuf {
+        self.options().project_config_path(&self.root)
+    }
+
+    fn project_config_display_path(&self) -> String {
+        self.options().project_config_display_path()
+    }
+
+    fn save_project_config(
+        &self,
+        project_config: &ProjectConfig,
+        path: &Path,
+    ) -> Result<(), String> {
         project_config
-            .save(&self.root)
+            .save(path)
             .map_err(|err| format!("Failed to save project config: {err}"))
     }
 
-    async fn add_ignored_word(&self, word: &str) {
+    async fn update_project_config(&self, update: impl FnOnce(&mut ProjectConfig) -> bool) {
+        let project_config_path = self.project_config_path();
         let updated = {
             let mut project_config = self
                 .project_config
                 .write()
                 .expect("project config poisoned");
-            let updated = project_config.add_ignored_word(word);
+            let updated = update(&mut project_config);
             if updated {
-                if let Err(err) = self.save_project_config(&project_config) {
+                if let Err(err) = self.save_project_config(&project_config, &project_config_path) {
                     log::error!("{err}");
                 }
             }
@@ -166,46 +179,23 @@ impl Backend {
         if updated {
             self.recheck_all().await;
         }
+    }
+
+    async fn add_ignored_word(&self, word: &str) {
+        self.update_project_config(|project_config| project_config.add_ignored_word(word))
+            .await;
     }
 
     async fn add_disabled_rule(&self, rule_id: &str) {
-        let updated = {
-            let mut project_config = self
-                .project_config
-                .write()
-                .expect("project config poisoned");
-            let updated = project_config.add_disabled_rule(rule_id);
-            if updated {
-                if let Err(err) = self.save_project_config(&project_config) {
-                    log::error!("{err}");
-                }
-            }
-            updated
-        };
-
-        if updated {
-            self.recheck_all().await;
-        }
+        self.update_project_config(|project_config| project_config.add_disabled_rule(rule_id))
+            .await;
     }
 
     async fn add_disabled_category(&self, category_id: &str) {
-        let updated = {
-            let mut project_config = self
-                .project_config
-                .write()
-                .expect("project config poisoned");
-            let updated = project_config.add_disabled_category(category_id);
-            if updated {
-                if let Err(err) = self.save_project_config(&project_config) {
-                    log::error!("{err}");
-                }
-            }
-            updated
-        };
-
-        if updated {
-            self.recheck_all().await;
-        }
+        self.update_project_config(|project_config| {
+            project_config.add_disabled_category(category_id)
+        })
+        .await;
     }
 }
 
@@ -307,7 +297,7 @@ fn make_command(title: String, command: &str, argument: String) -> Command {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
         let options = ClientOptions::from_value(params.initialization_options);
-        let project_config = ProjectConfig::load(&self.root);
+        let project_config = ProjectConfig::load(&options.project_config_path(&self.root));
         log::info!(
             "LanguageTool LSP initialized for {} using {}",
             self.root.display(),
@@ -413,6 +403,7 @@ impl LanguageServer for Backend {
     async fn code_action(&self, params: CodeActionParams) -> RpcResult<Option<CodeActionResponse>> {
         let mut actions = Vec::new();
         let uri = params.text_document.uri;
+        let project_config_display_path = self.project_config_display_path();
 
         for diagnostic in params.context.diagnostics {
             if diagnostic.source.as_deref() != Some(SOURCE) {
@@ -439,8 +430,7 @@ impl LanguageServer for Backend {
                 actions.push(CodeActionOrCommand::Command(make_command(
                     format!(
                         "Ignore '{}' in {}",
-                        data.matched_text,
-                        ProjectConfig::display_path()
+                        data.matched_text, project_config_display_path
                     ),
                     COMMAND_IGNORE_WORD,
                     data.matched_text.clone(),
@@ -450,8 +440,7 @@ impl LanguageServer for Backend {
             actions.push(CodeActionOrCommand::Command(make_command(
                 format!(
                     "Disable rule '{}' in {}",
-                    data.rule_id,
-                    ProjectConfig::display_path()
+                    data.rule_id, project_config_display_path
                 ),
                 COMMAND_DISABLE_RULE,
                 data.rule_id.clone(),
@@ -461,7 +450,7 @@ impl LanguageServer for Backend {
                 actions.push(CodeActionOrCommand::Command(make_command(
                     format!(
                         "Disable category '{category_id}' in {}",
-                        ProjectConfig::display_path()
+                        project_config_display_path
                     ),
                     COMMAND_DISABLE_CATEGORY,
                     category_id,
@@ -479,10 +468,15 @@ impl LanguageServer for Backend {
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if params.settings != Value::Null {
             let options = ClientOptions::from_value(Some(params.settings));
+            let project_config = ProjectConfig::load(&options.project_config_path(&self.root));
             *self
                 .initialization_options
                 .write()
                 .expect("initialization options poisoned") = options;
+            *self
+                .project_config
+                .write()
+                .expect("project config poisoned") = project_config;
             self.recheck_all().await;
         }
     }

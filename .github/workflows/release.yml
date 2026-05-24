@@ -88,6 +88,17 @@ jobs:
           --no-tag
           --allow-branch main
 
+      - name: Upload patched source
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-source
+          path: |
+            Cargo.lock
+            Cargo.toml
+            Makefile.toml
+            openapi/**
+            crates/**
+
   build-assets:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
