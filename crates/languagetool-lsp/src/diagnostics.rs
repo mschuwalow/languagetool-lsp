@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{
 
 use crate::config::ClientOptions;
 use crate::languagetool::LanguageToolMatch;
-use crate::text_offsets::{text_for_lsp_range, LineIndex};
+use crate::text_index::TextIndex;
 
 pub const SOURCE: &str = "LanguageTool";
 
@@ -20,7 +20,7 @@ pub struct DiagnosticData {
 }
 
 pub fn make_lsp_diagnostic(
-    line_index: &LineIndex,
+    index: &TextIndex,
     item: &LanguageToolMatch,
     data: DiagnosticData,
     options: &ClientOptions,
@@ -28,8 +28,8 @@ pub fn make_lsp_diagnostic(
     let Some((offset, length)) = match_offsets(item) else {
         return Diagnostic::default();
     };
-    let start = line_index.position(offset);
-    let end = line_index.position(offset + length);
+    let start = index.position(offset);
+    let end = index.position(offset + length);
     let rule_id = item.rule.as_ref().map(|rule| rule.id.as_str());
     Diagnostic {
         range: Range { start, end },
@@ -46,14 +46,15 @@ pub fn make_lsp_diagnostic(
 
 pub fn diagnostic_data(
     text: &str,
-    line_index: &LineIndex,
+    index: &TextIndex,
     item: &LanguageToolMatch,
     options: &ClientOptions,
 ) -> DiagnosticData {
     let (offset, length) = match_offsets(item).unwrap_or_default();
-    let start = line_index.position(offset);
-    let end = line_index.position(offset + length);
-    let matched_text = text_for_lsp_range(text, Range { start, end });
+    let matched_text = index
+        .text_for_utf16_range(text, offset, offset + length)
+        .unwrap_or_default()
+        .to_string();
     let rule = item.rule.as_deref();
     let category_id = rule.and_then(|rule| rule.category.id.clone());
     let replacements = item

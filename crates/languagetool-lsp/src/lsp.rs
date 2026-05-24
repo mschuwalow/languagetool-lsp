@@ -7,7 +7,6 @@ use crate::languagetool::{
     AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
 };
 use crate::masking::{annotated_for_language, ignored_ranges_for_language};
-use crate::text_offsets::{text_for_utf16_range, LineIndex};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -205,22 +204,23 @@ fn diagnostics_for_document(
     options: &ClientOptions,
     ignored_ranges: &[(usize, usize)],
 ) -> Vec<Diagnostic> {
-    let line_index = LineIndex::new(&document.text);
+    let index = &document.index;
     matches
         .iter()
         .filter_map(|item| match_offsets(item).map(|(offset, length)| (item, offset, length)))
         .filter(|(_, offset, length)| {
-            !text_for_utf16_range(&document.text, *offset, *offset + *length)
-                .trim()
-                .is_empty()
+            !index
+                .text_for_utf16_range(&document.text, *offset, *offset + *length)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
         })
         .filter(|(_, offset, length)| {
             !intersects_ignored_ranges(*offset, *offset + *length, ignored_ranges)
         })
         .filter_map(|(item, _, _)| {
-            let data = diagnostic_data(&document.text, &line_index, item, options);
+            let data = diagnostic_data(&document.text, index, item, options);
             (!options.is_ignored_word(&data.matched_text))
-                .then(|| make_lsp_diagnostic(&line_index, item, data, options))
+                .then(|| make_lsp_diagnostic(index, item, data, options))
         })
         .collect()
 }
@@ -246,7 +246,11 @@ fn annotated_for_document(document: &Document) -> AnnotatedText {
 }
 
 fn ignored_ranges_for_document(document: &Document) -> Vec<(usize, usize)> {
-    let ranges = ignored_ranges_for_language(&document.text, document.language_id.as_deref());
+    let ranges = ignored_ranges_for_language(
+        &document.text,
+        &document.index,
+        document.language_id.as_deref(),
+    );
     if !ranges.is_empty() {
         return ranges;
     }
@@ -256,7 +260,7 @@ fn ignored_ranges_for_document(document: &Document) -> Vec<(usize, usize)> {
             .and_then(|extension| extension.to_str())
             .map(str::to_string)
     });
-    ignored_ranges_for_language(&document.text, extension.as_deref())
+    ignored_ranges_for_language(&document.text, &document.index, extension.as_deref())
 }
 
 fn make_replacement_action(uri: &Url, diagnostic: &Diagnostic, replacement: &str) -> CodeAction {
@@ -504,12 +508,12 @@ mod tests {
 
     #[test]
     fn builds_diagnostics_for_document() {
-        let document = Document {
-            uri: Url::parse("file:///tmp/test.txt").unwrap(),
-            version: Some(1),
-            language_id: Some("plaintext".to_string()),
-            text: "This are a tset.".to_string(),
-        };
+        let document = Document::new(
+            Url::parse("file:///tmp/test.txt").unwrap(),
+            Some(1),
+            Some("plaintext".to_string()),
+            "This are a tset.".to_string(),
+        );
         let options = ClientOptions::default();
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
@@ -542,12 +546,12 @@ mod tests {
 
     #[test]
     fn diagnostics_use_original_document_offsets() {
-        let document = Document {
-            uri: Url::parse("file:///tmp/test.rs").unwrap(),
-            version: Some(1),
-            language_id: Some("rust".to_string()),
-            text: "let value = 1; // This are a comment.".to_string(),
-        };
+        let document = Document::new(
+            Url::parse("file:///tmp/test.rs").unwrap(),
+            Some(1),
+            Some("rust".to_string()),
+            "let value = 1; // This are a comment.".to_string(),
+        );
         let options = ClientOptions::default();
         let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),

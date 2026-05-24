@@ -1,5 +1,5 @@
 use crate::languagetool::{AnnotatedText, Annotation};
-use crate::text_offsets::utf16_offset_for_byte;
+use crate::text_index::TextIndex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Range {
@@ -19,7 +19,11 @@ pub fn annotated_for_language(text: &str, language_id: Option<&str>) -> Annotate
     AnnotatedText { annotation }
 }
 
-pub fn ignored_ranges_for_language(text: &str, language_id: Option<&str>) -> Vec<(usize, usize)> {
+pub fn ignored_ranges_for_language(
+    text: &str,
+    index: &TextIndex,
+    language_id: Option<&str>,
+) -> Vec<(usize, usize)> {
     match classify_language(language_id) {
         LanguageKind::Markdown => {
             let mut ranges = Vec::new();
@@ -27,25 +31,25 @@ pub fn ignored_ranges_for_language(text: &str, language_id: Option<&str>) -> Vec
             collect_markdown_fenced_code(text, &mut ranges);
             collect_inline_code(text, &mut ranges);
             collect_link_destinations(text, &mut ranges);
-            ranges_as_utf16(text, &mut ranges)
+            ranges_as_utf16(index, &mut ranges)
         }
         LanguageKind::Html => {
             let mut ranges = Vec::new();
             collect_html_tags(text, &mut ranges);
             collect_html_element_contents(text, "script", &mut ranges);
             collect_html_element_contents(text, "style", &mut ranges);
-            ranges_as_utf16(text, &mut ranges)
+            ranges_as_utf16(index, &mut ranges)
         }
         LanguageKind::CLike => {
             let mut keep_ranges = Vec::new();
             collect_c_like_comment_ranges(text, &mut keep_ranges);
-            inverse_ranges_as_utf16(text, &mut keep_ranges)
+            inverse_ranges_as_utf16(text, index, &mut keep_ranges)
         }
         LanguageKind::HashComment => {
             let mut keep_ranges = Vec::new();
             collect_hash_comment_ranges(text, &mut keep_ranges);
             collect_python_triple_quotes(text, &mut keep_ranges);
-            inverse_ranges_as_utf16(text, &mut keep_ranges)
+            inverse_ranges_as_utf16(text, index, &mut keep_ranges)
         }
         LanguageKind::PlainText => Vec::new(),
     }
@@ -484,19 +488,23 @@ fn merge_ranges(ranges: &mut [Range]) -> Vec<Range> {
     merged
 }
 
-fn ranges_as_utf16(text: &str, ranges: &mut [Range]) -> Vec<(usize, usize)> {
+fn ranges_as_utf16(index: &TextIndex, ranges: &mut [Range]) -> Vec<(usize, usize)> {
     merge_ranges(ranges)
         .into_iter()
         .map(|range| {
             (
-                utf16_offset_for_byte(text, range.start),
-                utf16_offset_for_byte(text, range.end),
+                index.utf16_offset_for_byte(range.start),
+                index.utf16_offset_for_byte(range.end),
             )
         })
         .collect()
 }
 
-fn inverse_ranges_as_utf16(text: &str, keep_ranges: &mut [Range]) -> Vec<(usize, usize)> {
+fn inverse_ranges_as_utf16(
+    text: &str,
+    index: &TextIndex,
+    keep_ranges: &mut [Range],
+) -> Vec<(usize, usize)> {
     let mut ignored = Vec::new();
     let mut cursor = 0;
     for range in merge_ranges(keep_ranges) {
@@ -514,7 +522,7 @@ fn inverse_ranges_as_utf16(text: &str, keep_ranges: &mut [Range]) -> Vec<(usize,
             end: text.len(),
         });
     }
-    ranges_as_utf16(text, &mut ignored)
+    ranges_as_utf16(index, &mut ignored)
 }
 
 #[cfg(test)]

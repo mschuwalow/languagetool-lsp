@@ -1,4 +1,4 @@
-use crate::text_offsets::byte_range_for_lsp_range;
+use crate::text_index::TextIndex;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Url};
@@ -9,16 +9,44 @@ pub struct Document {
     pub version: Option<i32>,
     pub language_id: Option<String>,
     pub text: String,
+    pub index: TextIndex,
 }
 
 impl Document {
-    fn from_text_document(document: &TextDocumentItem) -> Self {
+    pub fn new(uri: Url, version: Option<i32>, language_id: Option<String>, text: String) -> Self {
+        let index = TextIndex::new(&text);
         Self {
-            uri: document.uri.clone(),
-            version: Some(document.version),
-            language_id: Some(document.language_id.clone()),
-            text: document.text.clone(),
+            uri,
+            version,
+            language_id,
+            text,
+            index,
         }
+    }
+
+    fn set_text(&mut self, text: String) {
+        self.index = TextIndex::new(&text);
+        self.text = text;
+    }
+
+    fn apply_range_change(&mut self, range: tower_lsp::lsp_types::Range, new_text: &str) -> bool {
+        let Some((byte_start, byte_end, utf16_start, utf16_end)) = self.index.edit_offsets(range)
+        else {
+            return false;
+        };
+        self.text.replace_range(byte_start..byte_end, new_text);
+        self.index
+            .apply_edit(byte_start, byte_end, utf16_start, utf16_end, new_text);
+        true
+    }
+
+    fn from_text_document(document: &TextDocumentItem) -> Self {
+        Self::new(
+            document.uri.clone(),
+            Some(document.version),
+            Some(document.language_id.clone()),
+            document.text.clone(),
+        )
     }
 }
 
@@ -52,17 +80,12 @@ impl DocumentCache {
         let mut documents = self.documents.write().expect("document cache poisoned");
         if let Some(entry) = documents.get_mut(&key) {
             entry.document.version = version.or(entry.document.version);
-            entry.document.text = text;
+            entry.document.set_text(text);
         } else {
             documents.insert(
                 key,
                 DocumentEntry {
-                    document: Document {
-                        uri: uri.clone(),
-                        version,
-                        language_id: None,
-                        text,
-                    },
+                    document: Document::new(uri.clone(), version, None, text),
                     generation: 0,
                 },
             );
@@ -79,20 +102,14 @@ impl DocumentCache {
             let key = uri.to_string();
             let mut documents = self.documents.write().expect("document cache poisoned");
             if let Some(entry) = documents.get_mut(&key) {
-                if let Some((start, end)) = byte_range_for_lsp_range(&entry.document.text, range) {
-                    entry.document.text.replace_range(start..end, &change.text);
+                if entry.document.apply_range_change(range, &change.text) {
                     entry.document.version = version.or(entry.document.version);
                 }
             } else {
                 documents.insert(
                     key,
                     DocumentEntry {
-                        document: Document {
-                            uri: uri.clone(),
-                            version,
-                            language_id: None,
-                            text: change.text,
-                        },
+                        document: Document::new(uri.clone(), version, None, change.text),
                         generation: 0,
                     },
                 );
@@ -193,6 +210,120 @@ mod tests {
             },
         );
         assert_eq!(cache.get(&uri).unwrap().text, "axb");
+    }
+
+    // Verify that document.index always matches TextIndex::new(&document.text) after
+    // a sequence of incremental changes.
+    fn assert_index_consistent(cache: &DocumentCache, uri: &Url) {
+        let doc = cache.get(uri).unwrap();
+        let expected = TextIndex::new(&doc.text);
+        assert_eq!(
+            doc.index, expected,
+            "index is inconsistent with text {:?}",
+            doc.text
+        );
+    }
+
+    #[test]
+    fn incremental_changes_keep_index_consistent() {
+        let cache = DocumentCache::default();
+        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        cache.update(&uri, Some(1), "hello world\nfoo bar".to_string());
+        assert_index_consistent(&cache, &uri);
+
+        // Replace word on first line.
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 6), Position::new(0, 11))),
+                range_length: None,
+                text: "zed".to_string(),
+            },
+        );
+        assert_index_consistent(&cache, &uri);
+        assert_eq!(cache.get(&uri).unwrap().text, "hello zed\nfoo bar");
+
+        // Insert a newline in the middle of the second line.
+        cache.apply_change(
+            &uri,
+            Some(3),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 3), Position::new(1, 3))),
+                range_length: None,
+                text: "\n".to_string(),
+            },
+        );
+        assert_index_consistent(&cache, &uri);
+        assert_eq!(cache.get(&uri).unwrap().text, "hello zed\nfoo\n bar");
+
+        // Delete the second newline, merging lines 1 and 2.
+        cache.apply_change(
+            &uri,
+            Some(4),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 3), Position::new(2, 0))),
+                range_length: None,
+                text: String::new(),
+            },
+        );
+        assert_index_consistent(&cache, &uri);
+        assert_eq!(cache.get(&uri).unwrap().text, "hello zed\nfoo bar");
+    }
+
+    #[test]
+    fn incremental_changes_with_emoji_keep_index_consistent() {
+        let cache = DocumentCache::default();
+        let uri = Url::parse("file:///tmp/emoji.txt").unwrap();
+        cache.update(&uri, Some(1), "hi 😀 there".to_string());
+        assert_index_consistent(&cache, &uri);
+
+        // Replace the emoji with ASCII — removes the checkpoint.
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 3), Position::new(0, 5))),
+                range_length: None,
+                text: "x".to_string(),
+            },
+        );
+        assert_index_consistent(&cache, &uri);
+        assert_eq!(cache.get(&uri).unwrap().text, "hi x there");
+
+        // Insert an emoji after existing ASCII — adds a new checkpoint at the right offset.
+        cache.apply_change(
+            &uri,
+            Some(3),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 4), Position::new(0, 4))),
+                range_length: None,
+                text: "😂".to_string(),
+            },
+        );
+        assert_index_consistent(&cache, &uri);
+        assert_eq!(cache.get(&uri).unwrap().text, "hi x😂 there");
+    }
+
+    #[test]
+    fn incremental_changes_with_crlf_keep_index_consistent() {
+        let cache = DocumentCache::default();
+        let uri = Url::parse("file:///tmp/crlf.txt").unwrap();
+        cache.update(&uri, Some(1), "line one\r\nline two".to_string());
+        assert_index_consistent(&cache, &uri);
+
+        // Edit on the second line using positions from the CRLF-aware index.
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 5), Position::new(1, 8))),
+                range_length: None,
+                text: "three".to_string(),
+            },
+        );
+        assert_index_consistent(&cache, &uri);
+        assert_eq!(cache.get(&uri).unwrap().text, "line one\r\nline three");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use languagetool_lsp::config::ClientOptions;
 use languagetool_lsp::languagetool::LanguageToolClient;
 use languagetool_lsp::lsp::Backend;
 use languagetool_lsp::masking::{annotated_for_language, ignored_ranges_for_language};
-use languagetool_lsp::text_offsets::text_for_utf16_range;
+use languagetool_lsp::text_index::TextIndex;
 use std::path::{Path, PathBuf};
 use tower_lsp::{LspService, Server};
 
@@ -85,7 +85,9 @@ async fn check(files: Vec<PathBuf>) {
         };
 
         let data = annotated_for_language(&text, language_id_for_path(&path));
-        let ignored_ranges = ignored_ranges_for_language(&text, language_id_for_path(&path));
+        let index = TextIndex::new(&text);
+        let ignored_ranges =
+            ignored_ranges_for_language(&text, &index, language_id_for_path(&path));
         let mut hits = Vec::new();
 
         if data.has_text() {
@@ -94,9 +96,10 @@ async fn check(files: Vec<PathBuf>) {
                     hits.extend(response.matches.into_iter().filter_map(|item| {
                         let offset = usize::try_from(item.offset).ok()?;
                         let length = usize::try_from(item.length).ok()?;
-                        if text_for_utf16_range(&text, offset, offset + length)
-                            .trim()
-                            .is_empty()
+                        if index
+                            .text_for_utf16_range(&text, offset, offset + length)
+                            .map(|s| s.trim().is_empty())
+                            .unwrap_or(true)
                             || intersects_ignored_ranges(offset, offset + length, &ignored_ranges)
                         {
                             None
