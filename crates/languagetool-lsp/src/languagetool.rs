@@ -3,6 +3,14 @@ use languagetool_client as api;
 use serde::Serialize;
 use thiserror::Error;
 
+pub type LanguageToolSoftware = languagetool_client::models::CheckPost200ResponseSoftware;
+pub type LanguageToolMatch = languagetool_client::models::CheckPost200ResponseMatchesInner;
+pub type LanguageToolReplacement =
+    languagetool_client::models::CheckPost200ResponseMatchesInnerReplacementsInner;
+pub type LanguageToolRule = languagetool_client::models::CheckPost200ResponseMatchesInnerRule;
+pub type LanguageToolCategory =
+    languagetool_client::models::CheckPost200ResponseMatchesInnerRuleCategory;
+
 #[derive(Debug, Error)]
 pub enum LanguageToolError {
     #[error("LanguageTool request to {endpoint} failed: {source}")]
@@ -126,14 +134,6 @@ impl LanguageToolClient {
         .map_err(|source| LanguageToolError::Api { endpoint, source })
     }
 }
-
-pub type LanguageToolSoftware = languagetool_client::models::CheckPost200ResponseSoftware;
-pub type LanguageToolMatch = languagetool_client::models::CheckPost200ResponseMatchesInner;
-pub type LanguageToolReplacement =
-    languagetool_client::models::CheckPost200ResponseMatchesInnerReplacementsInner;
-pub type LanguageToolRule = languagetool_client::models::CheckPost200ResponseMatchesInnerRule;
-pub type LanguageToolCategory =
-    languagetool_client::models::CheckPost200ResponseMatchesInnerRuleCategory;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LanguageToolResponse {

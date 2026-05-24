@@ -50,16 +50,6 @@ pub fn ignored_ranges_for_language(text: &str, language_id: Option<&str>) -> Vec
     }
 }
 
-pub fn mask_for_language(text: &str, language_id: Option<&str>) -> String {
-    match classify_language(language_id) {
-        LanguageKind::Markdown => mask_markdown(text),
-        LanguageKind::Html => mask_html(text),
-        LanguageKind::CLike => mask_c_like_comments(text),
-        LanguageKind::HashComment => mask_hash_comments(text),
-        LanguageKind::PlainText => text.to_string(),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageKind {
     Markdown,
@@ -71,7 +61,6 @@ enum LanguageKind {
 
 fn classify_language(language_id: Option<&str>) -> LanguageKind {
     match language_id.unwrap_or_default() {
-        // Standard LSP/VS Code language ids.
         "markdown" | "md" | "mdx" => LanguageKind::Markdown,
         "html" => LanguageKind::Html,
         "c" | "cpp" | "c++" | "css" | "go" | "java" | "javascript" | "javascriptreact" | "jsx"
@@ -113,29 +102,6 @@ fn hash_annotations(text: &str) -> Vec<Annotation> {
     collect_hash_comment_ranges(text, &mut keep_ranges);
     collect_python_triple_quotes(text, &mut keep_ranges);
     annotations_from_keep_ranges(text, &mut keep_ranges)
-}
-
-pub fn mask_markdown(text: &str) -> String {
-    let mut ranges = Vec::new();
-    collect_markdown_front_matter(text, &mut ranges);
-    collect_markdown_fenced_code(text, &mut ranges);
-    collect_inline_code(text, &mut ranges);
-    collect_link_destinations(text, &mut ranges);
-    apply_ranges(text, &mut ranges)
-}
-
-pub fn mask_html(text: &str) -> String {
-    let mut ranges = Vec::new();
-    collect_html_tags(text, &mut ranges);
-    collect_html_element_contents(text, "script", &mut ranges);
-    collect_html_element_contents(text, "style", &mut ranges);
-    apply_ranges(text, &mut ranges)
-}
-
-pub fn mask_c_like_comments(text: &str) -> String {
-    let mut keep_ranges = Vec::new();
-    collect_c_like_comment_ranges(text, &mut keep_ranges);
-    apply_keep_ranges(text, &mut keep_ranges)
 }
 
 fn collect_c_like_comment_ranges(text: &str, keep_ranges: &mut Vec<Range>) {
@@ -218,13 +184,6 @@ fn skip_raw_rust_string(bytes: &[u8], start: usize) -> Option<usize> {
     }
 
     Some(bytes.len())
-}
-
-pub fn mask_hash_comments(text: &str) -> String {
-    let mut keep_ranges = Vec::new();
-    collect_hash_comment_ranges(text, &mut keep_ranges);
-    collect_python_triple_quotes(text, &mut keep_ranges);
-    apply_keep_ranges(text, &mut keep_ranges)
 }
 
 fn collect_hash_comment_ranges(text: &str, keep_ranges: &mut Vec<Range>) {
@@ -442,75 +401,6 @@ fn collect_html_element_contents(text: &str, tag: &str, ranges: &mut Vec<Range>)
     }
 }
 
-fn apply_ranges(text: &str, ranges: &mut [Range]) -> String {
-    ranges.sort_by_key(|range| (range.start, range.end));
-    let mut merged: Vec<Range> = Vec::new();
-    for range in ranges
-        .iter()
-        .copied()
-        .filter(|range| range.start < range.end)
-    {
-        if let Some(last) = merged.last_mut() {
-            if range.start <= last.end {
-                last.end = last.end.max(range.end);
-                continue;
-            }
-        }
-        merged.push(range);
-    }
-
-    let mut output = String::with_capacity(text.len());
-    let mut range_index = 0;
-
-    for (byte_index, ch) in text.char_indices() {
-        while range_index < merged.len() && byte_index >= merged[range_index].end {
-            range_index += 1;
-        }
-        let masked = range_index < merged.len()
-            && byte_index >= merged[range_index].start
-            && byte_index < merged[range_index].end;
-
-        if masked && ch != '\n' && ch != '\r' {
-            for _ in 0..ch.len_utf16() {
-                output.push(' ');
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-
-    output
-}
-
-fn apply_keep_ranges(text: &str, keep_ranges: &mut [Range]) -> String {
-    keep_ranges.sort_by_key(|range| (range.start, range.end));
-    let mut ranges_to_mask = Vec::new();
-    let mut cursor = 0;
-
-    for range in keep_ranges
-        .iter()
-        .copied()
-        .filter(|range| range.start < range.end)
-    {
-        if cursor < range.start {
-            ranges_to_mask.push(Range {
-                start: cursor,
-                end: range.start,
-            });
-        }
-        cursor = cursor.max(range.end);
-    }
-
-    if cursor < text.len() {
-        ranges_to_mask.push(Range {
-            start: cursor,
-            end: text.len(),
-        });
-    }
-
-    apply_ranges(text, &mut ranges_to_mask)
-}
-
 fn annotations_from_skip_ranges(text: &str, skip_ranges: &mut [Range]) -> Vec<Annotation> {
     let mut annotations = Vec::new();
     let mut cursor = 0;
@@ -635,56 +525,6 @@ mod tests {
     use super::*;
     use indoc::indoc;
 
-    fn utf16_len(text: &str) -> usize {
-        text.chars().map(char::len_utf16).sum()
-    }
-
-    #[test]
-    fn markdown_masks_code_fences() {
-        let text = indoc! {"
-            Good prose.
-            ```
-            This are code.
-            ```
-            More prose.
-        "};
-        let masked = mask_markdown(text);
-        assert!(masked.contains("Good prose."));
-        assert!(!masked.contains("This are code"));
-        assert_eq!(utf16_len(text), utf16_len(&masked));
-    }
-
-    #[test]
-    fn markdown_masks_inline_code() {
-        let text = "Use `This are code` in prose.";
-        let masked = mask_markdown(text);
-        assert!(!masked.contains("This are code"));
-        assert_eq!(utf16_len(text), utf16_len(&masked));
-    }
-
-    #[test]
-    fn html_masks_tags_and_scripts() {
-        let text = "<p class=\"bad\">This are prose.</p><script>This are code.</script>";
-        let masked = mask_html(text);
-        assert!(masked.contains("This are prose."));
-        assert!(!masked.contains("class"));
-        assert!(!masked.contains("This are code"));
-        assert_eq!(utf16_len(text), utf16_len(&masked));
-    }
-
-    #[test]
-    fn c_like_mask_keeps_only_comment_text() {
-        let text = indoc! {r#"
-            let value = 1; // This are a comment.
-            let other = "This are code";
-        "#};
-        let masked = mask_c_like_comments(text);
-        assert!(masked.contains("This are a comment"));
-        assert!(!masked.contains("This are code"));
-        assert!(!masked.contains("let value"));
-        assert_eq!(utf16_len(text), utf16_len(&masked));
-    }
-
     #[test]
     fn c_like_annotations_mark_code_as_markup_and_comments_as_text() {
         let text = indoc! {r#"
@@ -711,53 +551,6 @@ mod tests {
         );
         assert!(markup.contains("let value = 1; //"));
         assert!(markup.contains("This are code"));
-    }
-
-    #[test]
-    fn hash_mask_keeps_comments_and_docstrings() {
-        let text = indoc! {"
-            value = 1 # This are a comment.
-            '''This are docs.'''
-            code = 'This are code'
-        "};
-        let masked = mask_hash_comments(text);
-        assert!(masked.contains("This are a comment"));
-        assert!(masked.contains("This are docs"));
-        assert!(!masked.contains("This are code"));
-        assert_eq!(utf16_len(text), utf16_len(&masked));
-    }
-
-    #[test]
-    fn official_rust_language_id_is_supported_before_masking() {
-        let text = indoc! {r#"
-            assert_eq!(
-                options.endpoint(),
-                "http://localhost:8081/v2/check"
-            );
-        "#};
-        let masked = mask_for_language(text, Some("rust"));
-        assert!(!masked.contains("assert_eq"));
-        assert!(!masked.contains("http://localhost"));
-        assert_eq!(utf16_len(text), utf16_len(&masked));
-    }
-
-    #[test]
-    fn masking_handles_comment_like_strings() {
-        let text = indoc! {r##"
-            assert_eq!(
-                options.endpoint(),
-                "http://localhost:8081/v2/check"
-            );
-            let uri = Url::parse("file:///tmp/test.txt").unwrap();
-            let raw = r#"http://localhost:8081/v2/check"#;
-        "##};
-        let masked = mask_for_language(text, Some("rust"));
-        assert!(!masked.contains("test.txt"));
-        assert!(!masked.contains("localhost"));
-        assert_eq!(utf16_len(text), utf16_len(&masked));
-
-        let data = annotated_for_language(text, Some("rust"));
-        assert!(!data.has_text());
     }
 
     #[test]

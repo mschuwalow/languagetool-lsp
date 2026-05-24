@@ -55,7 +55,8 @@ impl Backend {
             .merged_options(&initialization_options)
     }
 
-    fn schedule_check(&self, uri: Url, generation: u64) {
+    fn schedule_check(&self, uri: Url) {
+        let generation = self.documents.bump_generation(&uri);
         let debounce = self.options().debounce_ms;
         let backend = self.clone();
         tokio::spawn(async move {
@@ -405,11 +406,8 @@ impl LanguageServer for Backend {
             self.documents
                 .apply_change(&uri, Some(params.text_document.version), change);
         }
-        if had_changes {
-            let generation = self.documents.bump_generation(&uri);
-            if self.options().check_while_typing {
-                self.schedule_check(uri, generation);
-            }
+        if had_changes && self.options().check_while_typing {
+            self.schedule_check(uri);
         }
     }
 
