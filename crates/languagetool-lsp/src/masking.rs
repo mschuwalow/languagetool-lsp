@@ -1,4 +1,5 @@
 use crate::languagetool::{AnnotatedText, Annotation};
+use crate::text_offsets::utf16_offset_for_byte;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Range {
@@ -514,10 +515,6 @@ fn inverse_ranges_as_utf16(text: &str, keep_ranges: &mut [Range]) -> Vec<(usize,
         });
     }
     ranges_as_utf16(text, &mut ignored)
-}
-
-fn utf16_offset_for_byte(text: &str, byte_offset: usize) -> usize {
-    text[..byte_offset].chars().map(char::len_utf16).sum()
 }
 
 #[cfg(test)]

@@ -6,8 +6,8 @@ use crate::document_cache::{Document, DocumentCache};
 use crate::languagetool::{
     AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
 };
-use crate::line_index::LineIndex;
 use crate::masking::{annotated_for_language, ignored_ranges_for_language};
+use crate::text_offsets::{text_for_utf16_range, LineIndex};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -220,7 +220,7 @@ fn diagnostics_for_document(
         .iter()
         .filter_map(|item| match_offsets(item).map(|(offset, length)| (item, offset, length)))
         .filter(|(_, offset, length)| {
-            !utf16_text_for_range(&document.text, *offset, *offset + *length)
+            !text_for_utf16_range(&document.text, *offset, *offset + *length)
                 .trim()
                 .is_empty()
         })
@@ -267,24 +267,6 @@ fn ignored_ranges_for_document(document: &Document) -> Vec<(usize, usize)> {
             .map(str::to_string)
     });
     ignored_ranges_for_language(&document.text, extension.as_deref())
-}
-
-fn utf16_text_for_range(text: &str, start: usize, end: usize) -> String {
-    let mut offset = 0;
-    let mut output = String::new();
-
-    for ch in text.chars() {
-        let next = offset + ch.len_utf16();
-        if offset >= start && next <= end {
-            output.push(ch);
-        }
-        offset = next;
-        if offset >= end {
-            break;
-        }
-    }
-
-    output
 }
 
 fn make_replacement_action(uri: &Url, diagnostic: &Diagnostic, replacement: &str) -> CodeAction {

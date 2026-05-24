@@ -1,6 +1,7 @@
+use crate::text_offsets::byte_range_for_lsp_range;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, TextDocumentItem, Url};
+use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Url};
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -78,9 +79,7 @@ impl DocumentCache {
             let key = uri.to_string();
             let mut documents = self.documents.write().expect("document cache poisoned");
             if let Some(entry) = documents.get_mut(&key) {
-                if let Some((start, end)) =
-                    byte_range_for_lsp_range(&entry.document.text, range.start, range.end)
-                {
+                if let Some((start, end)) = byte_range_for_lsp_range(&entry.document.text, range) {
                     entry.document.text.replace_range(start..end, &change.text);
                     entry.document.version = version.or(entry.document.version);
                 }
@@ -145,40 +144,10 @@ impl DocumentCache {
     }
 }
 
-fn byte_range_for_lsp_range(text: &str, start: Position, end: Position) -> Option<(usize, usize)> {
-    let start = byte_offset_for_position(text, start)?;
-    let end = byte_offset_for_position(text, end)?;
-    Some((start.min(end), end.max(start)))
-}
-
-fn byte_offset_for_position(text: &str, position: Position) -> Option<usize> {
-    let mut line = 0u32;
-    let mut character = 0u32;
-
-    for (byte_offset, ch) in text.char_indices() {
-        if line == position.line && character == position.character {
-            return Some(byte_offset);
-        }
-
-        if ch == '\n' {
-            line += 1;
-            character = 0;
-        } else {
-            character += ch.len_utf16() as u32;
-        }
-    }
-
-    if line == position.line && character == position.character {
-        Some(text.len())
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::Range;
+    use tower_lsp::lsp_types::{Position, Range};
 
     #[test]
     fn applies_all_incremental_changes() {

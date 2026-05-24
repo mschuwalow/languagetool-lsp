@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::{
-    CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url,
+    CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Range, Url,
 };
 
 use crate::config::ClientOptions;
 use crate::languagetool::LanguageToolMatch;
-use crate::line_index::LineIndex;
+use crate::text_offsets::{text_for_lsp_range, LineIndex};
 
 pub const SOURCE: &str = "LanguageTool";
 
@@ -53,7 +53,7 @@ pub fn diagnostic_data(
     let (offset, length) = match_offsets(item).unwrap_or_default();
     let start = line_index.position(offset);
     let end = line_index.position(offset + length);
-    let matched_text = text_for_range(text, start, end);
+    let matched_text = text_for_lsp_range(text, Range { start, end });
     let rule = item.rule.as_deref();
     let category_id = rule.and_then(|rule| rule.category.id.clone());
     let replacements = item
@@ -126,34 +126,6 @@ fn code_description(rule_id: &str, language: &str) -> Option<CodeDescription> {
         urlencoding::encode(language)
     );
     Url::parse(&uri).ok().map(|href| CodeDescription { href })
-}
-
-fn text_for_range(text: &str, start: Position, end: Position) -> String {
-    let mut current_line = 0u32;
-    let mut current_col = 0u32;
-    let mut result = String::new();
-    let mut in_range = false;
-
-    for ch in text.chars() {
-        let before = Position::new(current_line, current_col);
-        if before == start {
-            in_range = true;
-        }
-        if before == end {
-            break;
-        }
-        if in_range {
-            result.push(ch);
-        }
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 0;
-        } else {
-            current_col += ch.len_utf16() as u32;
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]

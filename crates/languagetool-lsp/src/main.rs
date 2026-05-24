@@ -3,6 +3,7 @@ use languagetool_lsp::config::ClientOptions;
 use languagetool_lsp::languagetool::LanguageToolClient;
 use languagetool_lsp::lsp::Backend;
 use languagetool_lsp::masking::{annotated_for_language, ignored_ranges_for_language};
+use languagetool_lsp::text_offsets::text_for_utf16_range;
 use std::path::{Path, PathBuf};
 use tower_lsp::{LspService, Server};
 
@@ -93,7 +94,7 @@ async fn check(files: Vec<PathBuf>) {
                     hits.extend(response.matches.into_iter().filter_map(|item| {
                         let offset = usize::try_from(item.offset).ok()?;
                         let length = usize::try_from(item.length).ok()?;
-                        if utf16_text_for_range(&text, offset, offset + length)
+                        if text_for_utf16_range(&text, offset, offset + length)
                             .trim()
                             .is_empty()
                             || intersects_ignored_ranges(offset, offset + length, &ignored_ranges)
@@ -147,22 +148,4 @@ fn language_id_for_path(path: &Path) -> Option<&'static str> {
         Some("ts") | Some("tsx") => Some("typescript"),
         _ => None,
     }
-}
-
-fn utf16_text_for_range(text: &str, start: usize, end: usize) -> String {
-    let mut offset = 0;
-    let mut output = String::new();
-
-    for ch in text.chars() {
-        let next = offset + ch.len_utf16();
-        if offset >= start && next <= end {
-            output.push(ch);
-        }
-        offset = next;
-        if offset >= end {
-            break;
-        }
-    }
-
-    output
 }
