@@ -4,3 +4,7 @@ members = [
   "crates/languagetool-lsp",
 ]
 resolver = "2"
+
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"

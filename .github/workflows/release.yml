@@ -1,9 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, without the leading v
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -59,13 +62,15 @@ jobs:
 
       - name: Read release version
         id: version
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Tag ${GITHUB_REF_NAME} is not a supported semver release tag" >&2
+          version="${VERSION}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version ${version} is not a supported semver release version" >&2
             exit 1
           fi
-          version="${GITHUB_REF_NAME#v}"
-          tag="${GITHUB_REF_NAME}"
+          tag="v${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
@@ -77,7 +82,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Bump versions, commit, and push
+      - name: Bump versions, commit, tag, and push
         run: >-
           cargo release "${{ steps.version.outputs.version }}"
           --workspace
@@ -85,19 +90,15 @@ jobs:
           --no-confirm
           --no-publish
           --no-verify
-          --no-tag
+          --tag-name "${{ steps.version.outputs.tag }}"
           --allow-branch main
 
-      - name: Upload patched source
-        uses: actions/upload-artifact@v4
+      - name: Create release
+        uses: softprops/action-gh-release@v2
         with:
-          name: release-source
-          path: |
-            Cargo.lock
-            Cargo.toml
-            Makefile.toml
-            openapi/**
-            crates/**
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
 
   build-assets:
     name: Build ${{ matrix.target }}
@@ -121,11 +122,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: languagetool-lsp-x86_64-pc-windows-msvc.zip
     steps:
-      - name: Download patched source
-        uses: actions/download-artifact@v4
+      - name: Checkout release tag
+        uses: actions/checkout@v4
         with:
-          name: release-source
-          path: .
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
