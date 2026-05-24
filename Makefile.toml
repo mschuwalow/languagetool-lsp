@@ -7,21 +7,46 @@ OPENAPI_SOURCE = "openapi/languagetool-swagger.json"
 OPENAPI_NORMALIZED = "target/openapi/languagetool-swagger-urlencoded.json"
 LANGUAGETOOL_CLIENT_DIR = "crates/languagetool-client"
 
-[tasks.verify]
+[tasks.check]
 description = "Run the standard workspace verification checks."
-dependencies = ["format", "test", "clippy"]
+dependencies = ["check-rustfmt", "check-clippy"]
 
-[tasks.format]
+[tasks.check-rustfmt]
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+[tasks.check-clippy]
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "--no-deps", "warnings"]
+
+[tasks.fix]
+description = "Runs rustfmt and clippy checks and applies fixes"
+dependencies = ["fix-clippy", "fix-rustfmt"]
+
+[tasks.fix-rustfmt]
+description = "Runs rustfmt checks and applies fixes"
+install_crate = "rustfmt"
 command = "cargo"
 args = ["fmt", "--all"]
+
+[tasks.fix-clippy]
+description = "Runs clippy checks and applies fixes"
+install_crate = "clippy"
+command = "cargo"
+args = [
+    "clippy",
+    "--all-targets",
+    "--fix",
+    "--allow-dirty",
+    "--allow-staged",
+    "--",
+    "--no-deps",
+    "-Dwarnings",
+]
 
 [tasks.test]
 command = "cargo"
 args = ["test", "--workspace"]
-
-[tasks.clippy]
-command = "cargo"
-args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
 
 [tasks.normalize-openapi]
 description = "Create the urlencoded Swagger document consumed by OpenAPI Generator."
