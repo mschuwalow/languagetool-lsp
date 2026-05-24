@@ -35,18 +35,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-make
-        run: cargo install cargo-make --locked
-
-      - name: Wait for LanguageTool
-        run: |
-          for attempt in {1..60}; do
-            if curl -fsS http://localhost:8081/v2/languages >/dev/null; then
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "LanguageTool did not become ready" >&2
-          exit 1
+        uses: davidB/rust-cargo-make@v1
 
       - name: Run CI checks
         run: cargo make ci
