@@ -125,7 +125,8 @@ rm -rf \
   "${LANGUAGETOOL_CLIENT_DIR}/.gitignore" \
   "${LANGUAGETOOL_CLIENT_DIR}/.travis.yml" \
   "${LANGUAGETOOL_CLIENT_DIR}/git_push.sh" \
-  "${LANGUAGETOOL_CLIENT_DIR}/README.md"
+  "${LANGUAGETOOL_CLIENT_DIR}/README.md" \
+  "openapitools.json"
 
 node <<'NODE'
 const fs = require("fs");
