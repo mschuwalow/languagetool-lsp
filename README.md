@@ -17,26 +17,8 @@ Regenerate the client with cargo-make:
 cargo make generate-client
 ```
 
-The Makefile writes a temporary normalized Swagger file under `target/openapi/` that adds `application/x-www-form-urlencoded` as the consumed form encoding. This makes OpenAPI Generator emit `reqwest::RequestBuilder::form(...)`, which works with LanguageTool.
-
 ## Verify
 
 ```sh
-cargo make verify
-```
-
-Or run the checks directly:
-
-```sh
-cargo fmt --all
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-## Health Check
-
-With a local LanguageTool server running on `localhost:8081`:
-
-```sh
-cargo run -p languagetool-lsp -- --root . health
+cargo make check
 ```

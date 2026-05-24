@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      languagetool:
+        image: languagetool/languagetool:latest
+        ports:
+          - 8081:8010
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-make
+        run: cargo install cargo-make --locked
+
+      - name: Wait for LanguageTool
+        run: |
+          for attempt in {1..60}; do
+            if curl -fsS http://localhost:8081/v2/languages >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "LanguageTool did not become ready" >&2
+          exit 1
+
+      - name: Run CI checks
+        run: cargo make ci
