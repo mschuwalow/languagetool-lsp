@@ -60,10 +60,7 @@ async fn health() {
                 .as_ref()
                 .map(|software| format!("{} {}", software.name, software.version))
                 .unwrap_or_else(|| "LanguageTool".to_string());
-            println!(
-                "{software}: {} match(es)",
-                response.matches.as_ref().map_or(0, Vec::len)
-            );
+            println!("{software}: {} match(es)", response.matches.len());
         }
         Err(err) => {
             eprintln!("LanguageTool health check failed: {err}");
@@ -94,25 +91,19 @@ async fn check(files: Vec<PathBuf>) {
         if data.has_text() {
             match client.check_annotated(&data, &options).await {
                 Ok(response) => {
-                    hits.extend(response.matches.unwrap_or_default().into_iter().filter_map(
-                        |item| {
-                            let offset = usize::try_from(item.offset).ok()?;
-                            let length = usize::try_from(item.length).ok()?;
-                            if utf16_text_for_range(&text, offset, offset + length)
-                                .trim()
-                                .is_empty()
-                                || intersects_ignored_ranges(
-                                    offset,
-                                    offset + length,
-                                    &ignored_ranges,
-                                )
-                            {
-                                None
-                            } else {
-                                Some((offset, length, item.message))
-                            }
-                        },
-                    ));
+                    hits.extend(response.matches.into_iter().filter_map(|item| {
+                        let offset = usize::try_from(item.offset).ok()?;
+                        let length = usize::try_from(item.length).ok()?;
+                        if utf16_text_for_range(&text, offset, offset + length)
+                            .trim()
+                            .is_empty()
+                            || intersects_ignored_ranges(offset, offset + length, &ignored_ranges)
+                        {
+                            None
+                        } else {
+                            Some((offset, length, item.message))
+                        }
+                    }));
                 }
                 Err(err) => {
                     eprintln!("{}: {err}", path.display());

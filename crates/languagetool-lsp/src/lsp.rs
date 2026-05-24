@@ -13,10 +13,11 @@ use crate::diagnostics::{
     diagnostic_data, make_lsp_diagnostic, match_offsets, parse_diagnostic_data, SOURCE,
 };
 use crate::document_cache::{Document, DocumentCache};
-use crate::languagetool::{AnnotatedText, LanguageToolClient, LanguageToolError};
+use crate::languagetool::{
+    AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
+};
 use crate::line_index::LineIndex;
 use crate::masking::{annotated_for_language, ignored_ranges_for_language};
-use languagetool_client::models::CheckPost200ResponseMatchesInner as Match;
 
 const COMMAND_IGNORE_WORD: &str = "languagetool.ignoreWordInWorkspace";
 const COMMAND_DISABLE_RULE: &str = "languagetool.disableRuleInWorkspace";
@@ -137,12 +138,8 @@ impl Backend {
         {
             return;
         }
-        let diagnostics = diagnostics_for_document(
-            &document,
-            response.matches.unwrap_or_default(),
-            &options,
-            &ignored_ranges,
-        );
+        let diagnostics =
+            diagnostics_for_document(&document, response.matches, &options, &ignored_ranges);
         self.client
             .publish_diagnostics(document.uri, diagnostics, document.version)
             .await;
@@ -240,7 +237,7 @@ impl Backend {
 
 fn diagnostics_for_document(
     document: &Document,
-    matches: Vec<Match>,
+    matches: Vec<LanguageToolMatch>,
     options: &ClientOptions,
     ignored_ranges: &[(usize, usize)],
 ) -> Vec<Diagnostic> {
@@ -555,13 +552,7 @@ impl LanguageServer for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use languagetool_client::models::{
-        CheckPost200ResponseMatchesInner as Match,
-        CheckPost200ResponseMatchesInnerContext as Context,
-        CheckPost200ResponseMatchesInnerReplacementsInner as Replacement,
-        CheckPost200ResponseMatchesInnerRule as Rule,
-        CheckPost200ResponseMatchesInnerRuleCategory as Category,
-    };
+    use crate::languagetool::{LanguageToolCategory, LanguageToolMatch, LanguageToolRule};
 
     #[test]
     fn builds_diagnostics_for_document() {
@@ -572,31 +563,18 @@ mod tests {
             text: "This are a tset.".to_string(),
         };
         let options = ClientOptions::default();
-        let item = Match {
+        let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
-            short_message: None,
             offset: 11,
             length: 4,
-            replacements: vec![Replacement {
-                value: Some("test".to_string()),
-            }],
-            context: Box::new(Context {
-                text: String::new(),
-                offset: 0,
-                length: 0,
-            }),
-            sentence: String::new(),
-            rule: Some(Box::new(Rule {
+            replacements: vec!["test".to_string()],
+            rule: Some(LanguageToolRule {
                 id: "MORFOLOGIK_RULE_EN_US".to_string(),
-                sub_id: None,
-                description: String::new(),
-                urls: None,
                 issue_type: Some("misspelling".to_string()),
-                category: Box::new(Category {
+                category: Some(LanguageToolCategory {
                     id: Some("TYPOS".to_string()),
-                    name: None,
                 }),
-            })),
+            }),
         };
 
         let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);
@@ -614,26 +592,16 @@ mod tests {
             text: "let value = 1; // This are a comment.".to_string(),
         };
         let options = ClientOptions::default();
-        let item = Match {
+        let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),
-            short_message: None,
             offset: 18,
             length: 4,
             replacements: Vec::new(),
-            context: Box::new(Context {
-                text: String::new(),
-                offset: 0,
-                length: 0,
-            }),
-            sentence: String::new(),
-            rule: Some(Box::new(Rule {
+            rule: Some(LanguageToolRule {
                 id: "THIS_NNS".to_string(),
-                sub_id: None,
-                description: String::new(),
-                urls: None,
                 issue_type: None,
-                category: Box::new(Category::new()),
-            })),
+                category: None,
+            }),
         };
 
         let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);

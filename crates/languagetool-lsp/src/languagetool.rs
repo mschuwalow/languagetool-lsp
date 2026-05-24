@@ -38,7 +38,7 @@ impl LanguageToolClient {
         &self,
         text: &str,
         options: &ClientOptions,
-    ) -> Result<api::models::CheckPost200Response, LanguageToolError> {
+    ) -> Result<LanguageToolResponse, LanguageToolError> {
         self.check_with_payload(CheckPayload::Text(text), options)
             .await
     }
@@ -47,7 +47,7 @@ impl LanguageToolClient {
         &self,
         data: &AnnotatedText,
         options: &ClientOptions,
-    ) -> Result<api::models::CheckPost200Response, LanguageToolError> {
+    ) -> Result<LanguageToolResponse, LanguageToolError> {
         self.check_with_payload(CheckPayload::Data(data), options)
             .await
     }
@@ -56,7 +56,7 @@ impl LanguageToolClient {
         &self,
         payload: CheckPayload<'_>,
         options: &ClientOptions,
-    ) -> Result<api::models::CheckPost200Response, LanguageToolError> {
+    ) -> Result<LanguageToolResponse, LanguageToolError> {
         let endpoint = options.endpoint();
         let preferred_variants = join_parameter(&options.preferred_variants);
         let disabled_rules = join_parameter(&options.disabled_rules);
@@ -122,7 +122,80 @@ impl LanguageToolClient {
             level,
         )
         .await
+        .map(LanguageToolResponse::from)
         .map_err(|source| LanguageToolError::Api { endpoint, source })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageToolResponse {
+    pub software: Option<LanguageToolSoftware>,
+    pub matches: Vec<LanguageToolMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageToolSoftware {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageToolMatch {
+    pub message: String,
+    pub offset: i32,
+    pub length: i32,
+    pub replacements: Vec<String>,
+    pub rule: Option<LanguageToolRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageToolRule {
+    pub id: String,
+    pub issue_type: Option<String>,
+    pub category: Option<LanguageToolCategory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageToolCategory {
+    pub id: Option<String>,
+}
+
+impl From<api::models::CheckPost200Response> for LanguageToolResponse {
+    fn from(response: api::models::CheckPost200Response) -> Self {
+        Self {
+            software: response.software.map(|software| LanguageToolSoftware {
+                name: software.name,
+                version: software.version,
+            }),
+            matches: response
+                .matches
+                .unwrap_or_default()
+                .into_iter()
+                .map(LanguageToolMatch::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<api::models::CheckPost200ResponseMatchesInner> for LanguageToolMatch {
+    fn from(item: api::models::CheckPost200ResponseMatchesInner) -> Self {
+        Self {
+            message: item.message,
+            offset: item.offset,
+            length: item.length,
+            replacements: item
+                .replacements
+                .into_iter()
+                .filter_map(|replacement| replacement.value)
+                .collect(),
+            rule: item.rule.map(|rule| LanguageToolRule {
+                id: rule.id,
+                issue_type: rule.issue_type,
+                category: Some(LanguageToolCategory {
+                    id: rule.category.id,
+                }),
+            }),
+        }
     }
 }
 
@@ -246,9 +319,17 @@ mod tests {
           }]
         }"#;
 
-        let response: api::models::CheckPost200Response = serde_json::from_str(json).unwrap();
-        let matches = response.matches.unwrap();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].replacements[0].value.as_deref(), Some("test"));
+        let response = LanguageToolResponse::from(
+            serde_json::from_str::<api::models::CheckPost200Response>(json).unwrap(),
+        );
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].replacements, vec!["test"]);
+        assert_eq!(
+            response.matches[0]
+                .rule
+                .as_ref()
+                .map(|rule| rule.id.as_str()),
+            Some("MORFOLOGIK_RULE_EN_US")
+        );
     }
 }

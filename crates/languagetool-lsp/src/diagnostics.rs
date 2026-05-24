@@ -4,8 +4,8 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::config::ClientOptions;
+use crate::languagetool::LanguageToolMatch;
 use crate::line_index::LineIndex;
-use languagetool_client::models::CheckPost200ResponseMatchesInner as Match;
 
 pub const SOURCE: &str = "LanguageTool";
 
@@ -21,7 +21,7 @@ pub struct DiagnosticData {
 
 pub fn make_lsp_diagnostic(
     line_index: &LineIndex,
-    item: &Match,
+    item: &LanguageToolMatch,
     data: DiagnosticData,
     options: &ClientOptions,
 ) -> Diagnostic {
@@ -47,20 +47,24 @@ pub fn make_lsp_diagnostic(
 pub fn diagnostic_data(
     text: &str,
     line_index: &LineIndex,
-    item: &Match,
+    item: &LanguageToolMatch,
     options: &ClientOptions,
 ) -> DiagnosticData {
     let (offset, length) = match_offsets(item).unwrap_or_default();
     let start = line_index.position(offset);
     let end = line_index.position(offset + length);
     let matched_text = text_for_range(text, start, end);
-    let rule = item.rule.as_deref();
-    let category_id = rule.and_then(|rule| rule.category.id.clone());
+    let rule = item.rule.as_ref();
+    let category_id = rule.and_then(|rule| {
+        rule.category
+            .as_ref()
+            .and_then(|category| category.id.clone())
+    });
     let replacements = item
         .replacements
         .iter()
         .take(options.max_replacements)
-        .filter_map(|replacement| replacement.value.clone())
+        .cloned()
         .collect::<Vec<_>>();
     DiagnosticData {
         rule_id: rule.map(|rule| rule.id.clone()).unwrap_or_default(),
@@ -71,19 +75,19 @@ pub fn diagnostic_data(
     }
 }
 
-pub fn match_offsets(item: &Match) -> Option<(usize, usize)> {
+pub fn match_offsets(item: &LanguageToolMatch) -> Option<(usize, usize)> {
     Some((
         usize::try_from(item.offset).ok()?,
         usize::try_from(item.length).ok()?,
     ))
 }
 
-pub fn severity_for(item: &Match, options: &ClientOptions) -> DiagnosticSeverity {
+pub fn severity_for(item: &LanguageToolMatch, options: &ClientOptions) -> DiagnosticSeverity {
     if !options.diagnostic_severity_auto {
         return options.configured_severity();
     }
 
-    let Some(rule) = item.rule.as_deref() else {
+    let Some(rule) = item.rule.as_ref() else {
         return options.configured_severity();
     };
 
@@ -91,7 +95,11 @@ pub fn severity_for(item: &Match, options: &ClientOptions) -> DiagnosticSeverity
         return DiagnosticSeverity::WARNING;
     }
 
-    match rule.category.id.as_deref() {
+    match rule
+        .category
+        .as_ref()
+        .and_then(|category| category.id.as_deref())
+    {
         Some("GRAMMAR" | "PUNCTUATION" | "TYPOGRAPHY") => DiagnosticSeverity::WARNING,
         _ => options.configured_severity(),
     }
@@ -159,31 +167,21 @@ fn text_for_range(text: &str, start: Position, end: Position) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use languagetool_client::models::{
-        CheckPost200ResponseMatchesInnerRule as Rule,
-        CheckPost200ResponseMatchesInnerRuleCategory as Category,
-    };
+    use crate::languagetool::{LanguageToolCategory, LanguageToolRule};
 
-    fn lt_match(rule_id: &str, category_id: &str) -> Match {
-        Match {
+    fn lt_match(rule_id: &str, category_id: &str) -> LanguageToolMatch {
+        LanguageToolMatch {
             message: "message".to_string(),
-            short_message: None,
             offset: 0,
             length: 4,
             replacements: Vec::new(),
-            context: Box::default(),
-            sentence: String::new(),
-            rule: Some(Box::new(Rule {
+            rule: Some(LanguageToolRule {
                 id: rule_id.to_string(),
-                sub_id: None,
-                description: String::new(),
-                urls: None,
                 issue_type: None,
-                category: Box::new(Category {
+                category: Some(LanguageToolCategory {
                     id: Some(category_id.to_string()),
-                    name: None,
                 }),
-            })),
+            }),
         }
     }
 

@@ -7,11 +7,28 @@ OPENAPI_SOURCE = "openapi/languagetool-swagger.json"
 OPENAPI_NORMALIZED = "target/openapi/languagetool-swagger-urlencoded.json"
 LANGUAGETOOL_CLIENT_DIR = "crates/languagetool-client"
 
+[tasks.verify]
+description = "Run the standard workspace verification checks."
+dependencies = ["format", "test", "clippy"]
+
+[tasks.format]
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.test]
+command = "cargo"
+args = ["test", "--workspace"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
 [tasks.normalize-openapi]
 description = "Create the urlencoded Swagger document consumed by OpenAPI Generator."
 script_runner = "@shell"
 script = '''
 mkdir -p "$(dirname "${OPENAPI_NORMALIZED}")"
+
 node <<'NODE'
 const fs = require("fs");
 const path = require("path");
@@ -41,12 +58,14 @@ dependencies = ["normalize-openapi"]
 script_runner = "@shell"
 script = '''
 rm -rf "${LANGUAGETOOL_CLIENT_DIR}"
+
 npx --yes "@openapitools/openapi-generator-cli@${OPENAPI_GENERATOR_CLI_VERSION}" generate \
   -g rust \
   -i "${OPENAPI_NORMALIZED}" \
   -o "${LANGUAGETOOL_CLIENT_DIR}" \
   --additional-properties=packageName=languagetool-client,packageVersion=0.1.0,supportMiddleware=false \
   --global-property=apiDocs=false,modelDocs=false,apiTests=false,modelTests=false
+
 rm -rf \
   "${LANGUAGETOOL_CLIENT_DIR}/docs" \
   "${LANGUAGETOOL_CLIENT_DIR}/.openapi-generator" \
@@ -55,6 +74,7 @@ rm -rf \
   "${LANGUAGETOOL_CLIENT_DIR}/.travis.yml" \
   "${LANGUAGETOOL_CLIENT_DIR}/git_push.sh" \
   "${LANGUAGETOOL_CLIENT_DIR}/README.md"
+
 node <<'NODE'
 const fs = require("fs");
 const lib = `${process.env.LANGUAGETOOL_CLIENT_DIR}/src/lib.rs`;
@@ -62,21 +82,6 @@ let content = fs.readFileSync(lib, "utf8");
 content = content.replace("#![allow(clippy::too_many_arguments)]", "#![allow(clippy::all)]");
 fs.writeFileSync(lib, content);
 NODE
+
 cargo fmt -p languagetool-client
 '''
-
-[tasks.verify]
-description = "Run the standard workspace verification checks."
-dependencies = ["format", "test", "clippy"]
-
-[tasks.format]
-command = "cargo"
-args = ["fmt", "--all"]
-
-[tasks.test]
-command = "cargo"
-args = ["test", "--workspace"]
-
-[tasks.clippy]
-command = "cargo"
-args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
