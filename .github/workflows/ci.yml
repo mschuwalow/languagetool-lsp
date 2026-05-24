@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       languagetool:
-        image: languagetool/languagetool:latest
+        image: erikvl87/languagetool:latest
         ports:
           - 8081:8010
     steps:
