@@ -206,14 +206,7 @@ impl TextIndex {
         text.get(byte_start..byte_end)
     }
 
-    pub fn byte_range_for_lsp_range(&self, range: Range) -> Option<(usize, usize)> {
-        let start = self.byte_offset_for_lsp_position(range.start)?;
-        let end = self.byte_offset_for_lsp_position(range.end)?;
-        Some((start.min(end), end.max(start)))
-    }
-
-    /// Like [`Self::byte_range_for_lsp_range`] but also returns the UTF-16 offsets,
-    /// avoiding a second lookup when both are needed (e.g. for [`Self::apply_edit`]).
+    /// Returns byte and UTF-16 offsets for an LSP range.
     pub fn edit_offsets(&self, range: Range) -> Option<(usize, usize, usize, usize)> {
         let utf16_start = self.utf16_offset_for_lsp_position(range.start)?;
         let utf16_end = self.utf16_offset_for_lsp_position(range.end)?;
@@ -225,10 +218,6 @@ impl TextIndex {
         let byte_lo = self.byte_offset_for_utf16(utf16_lo)?;
         let byte_hi = self.byte_offset_for_utf16(utf16_hi)?;
         Some((byte_lo, byte_hi, utf16_lo, utf16_hi))
-    }
-
-    pub fn byte_offset_for_lsp_position(&self, position: Position) -> Option<usize> {
-        self.byte_offset_for_utf16(self.utf16_offset_for_lsp_position(position)?)
     }
 
     fn utf16_offset_for_lsp_position(&self, position: Position) -> Option<usize> {
@@ -407,8 +396,8 @@ mod tests {
         let text = "a😀b";
         let index = TextIndex::new(text);
         assert_eq!(
-            index.byte_range_for_lsp_range(Range::new(Position::new(0, 1), Position::new(0, 3))),
-            Some((1, 5))
+            index.edit_offsets(Range::new(Position::new(0, 1), Position::new(0, 3))),
+            Some((1, 5, 1, 3))
         );
         assert_eq!(index.text_for_utf16_range(text, 1, 3), Some("😀"));
     }
@@ -417,12 +406,12 @@ mod tests {
     fn clamps_lsp_positions_to_line_end() {
         let index = TextIndex::new("a\nb");
         assert_eq!(
-            index.byte_offset_for_lsp_position(Position::new(0, 2)),
-            Some(1)
+            index.edit_offsets(Range::new(Position::new(0, 2), Position::new(0, 2))),
+            Some((1, 1, 1, 1))
         );
         assert_eq!(
-            index.byte_offset_for_lsp_position(Position::new(1, 99)),
-            Some(3)
+            index.edit_offsets(Range::new(Position::new(1, 99), Position::new(1, 99))),
+            Some((3, 3, 3, 3))
         );
     }
 
@@ -431,11 +420,7 @@ mod tests {
         let index = TextIndex::new("a😀b");
         assert_eq!(index.byte_offset_for_utf16(2), None);
         assert_eq!(
-            index.byte_offset_for_lsp_position(Position::new(0, 2)),
-            None
-        );
-        assert_eq!(
-            index.byte_range_for_lsp_range(Range::new(Position::new(0, 2), Position::new(0, 2))),
+            index.edit_offsets(Range::new(Position::new(0, 2), Position::new(0, 2))),
             None
         );
     }
@@ -647,8 +632,10 @@ mod tests {
                 let line_end = index.line_ends_utf16[line];
                 let overlong = Position::new(line as u32, (line_end - line_start + 100) as u32);
                 assert_eq!(
-                    index.byte_offset_for_lsp_position(overlong),
-                    index.byte_offset_for_utf16(line_end),
+                    index.edit_offsets(Range::new(overlong, overlong)),
+                    index
+                        .byte_offset_for_utf16(line_end)
+                        .map(|byte| (byte, byte, line_end, line_end)),
                     "text={text:?} line={line}"
                 );
             }

@@ -5,12 +5,7 @@ use thiserror::Error;
 use tree_sitter::{InputEdit, Language as TreeSitterLanguage, Node, Parser, Point, Tree};
 use tree_sitter_md_025::{MarkdownParser, MarkdownTree};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Range {
-    start: usize,
-    end: usize,
-}
-
+/// Maintains parser-backed masking state for a document and produces checkable text ranges.
 #[derive(Debug, Clone)]
 pub struct Masker {
     parsed: ParsedMask,
@@ -302,6 +297,12 @@ fn strip_hash_comment(source: &str, node: Node<'_>) -> Option<(usize, usize)> {
     let node_end = node.end_byte();
     let text = source.get(node_start..node_end)?;
     text.starts_with('#').then_some((node_start + 1, node_end))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Range {
+    start: usize,
+    end: usize,
 }
 
 enum MaskRanges {
