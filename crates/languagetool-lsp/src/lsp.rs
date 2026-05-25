@@ -576,4 +576,43 @@ mod tests {
         assert_eq!(diagnostics[0].range.start, Position::new(0, 18));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 22));
     }
+
+    #[test]
+    fn diagnostics_use_languagetool_utf16_offsets() {
+        let document = Document::new(
+            Url::parse("file:///tmp/test.txt").unwrap(),
+            Some(1),
+            Some("plaintext".to_string()),
+            "😀 This are a tset.".to_string(),
+        );
+        let options = ClientOptions::default();
+        let item = LanguageToolMatch {
+            message: "The verb 'are' is plural.".to_string(),
+            short_message: None,
+            offset: 3,
+            length: 8,
+            replacements: Vec::new(),
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
+                id: "PLURAL_VERB_AFTER_THIS".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
+                issue_type: Some("grammar".to_string()),
+                category: Box::new(LanguageToolCategory {
+                    id: Some("GRAMMAR".to_string()),
+                    name: None,
+                }),
+            })),
+        };
+
+        let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start, Position::new(0, 3));
+        assert_eq!(diagnostics[0].range.end, Position::new(0, 11));
+
+        let data = parse_diagnostic_data(&diagnostics[0]).unwrap();
+        assert_eq!(data.matched_text, "This are");
+    }
 }
