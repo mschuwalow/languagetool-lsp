@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
+use crate::language::Language;
+
 pub const CONFIG_DIR: &str = ".zed";
 pub const CONFIG_FILE: &str = "languagetool.json";
 
@@ -185,10 +187,8 @@ impl ClientOptions {
         self.diagnostic_severity.as_lsp()
     }
 
-    pub fn language_enabled(&self, language_id: Option<&str>) -> bool {
-        let Some(language_id) = language_id else {
-            return true;
-        };
+    pub fn language_enabled(&self, language: &Language) -> bool {
+        let language_id = language.id();
 
         if self
             .disabled_languages

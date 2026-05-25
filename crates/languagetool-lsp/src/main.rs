@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
 use languagetool_lsp::config::ClientOptions;
+use languagetool_lsp::language::Language;
 use languagetool_lsp::languagetool::LanguageToolClient;
 use languagetool_lsp::lsp::Backend;
-use languagetool_lsp::masking::{annotated_for_language, ignored_ranges_for_language};
+use languagetool_lsp::masking::Masker;
 use languagetool_lsp::text_index::TextIndex;
 use std::path::{Path, PathBuf};
 use tower_lsp::{LspService, Server};
@@ -84,10 +85,11 @@ async fn check(files: Vec<PathBuf>) {
             }
         };
 
-        let data = annotated_for_language(&text, language_id_for_path(&path));
+        let language = Language::from_path(&path);
+        let mask = Masker::new(&text, language);
+        let data = mask.annotated(&text);
         let index = TextIndex::new(&text);
-        let ignored_ranges =
-            ignored_ranges_for_language(&text, &index, language_id_for_path(&path));
+        let ignored_ranges = mask.ignored_ranges(&text, &index);
         let mut hits = Vec::new();
 
         if data.has_text() {
@@ -132,23 +134,4 @@ fn intersects_ignored_ranges(start: usize, end: usize, ignored_ranges: &[(usize,
     ignored_ranges
         .iter()
         .any(|(ignored_start, ignored_end)| start < *ignored_end && end > *ignored_start)
-}
-
-fn language_id_for_path(path: &Path) -> Option<&'static str> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("c") | Some("h") => Some("c"),
-        Some("cc") | Some("cpp") | Some("cxx") | Some("hpp") => Some("cpp"),
-        Some("css") => Some("css"),
-        Some("go") => Some("go"),
-        Some("html") | Some("htm") => Some("html"),
-        Some("java") => Some("java"),
-        Some("js") | Some("jsx") => Some("javascript"),
-        Some("md") | Some("markdown") => Some("markdown"),
-        Some("mdx") => Some("mdx"),
-        Some("py") => Some("python"),
-        Some("rs") => Some("rust"),
-        Some("sh") | Some("bash") => Some("shell"),
-        Some("ts") | Some("tsx") => Some("typescript"),
-        _ => None,
-    }
 }

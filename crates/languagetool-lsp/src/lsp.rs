@@ -6,7 +6,6 @@ use crate::document_cache::{Document, DocumentCache};
 use crate::languagetool::{
     AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
 };
-use crate::masking::{annotated_for_language, ignored_ranges_for_language};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -76,7 +75,7 @@ impl Backend {
         };
 
         let options = self.options();
-        if !options.language_enabled(document.language_id.as_deref()) {
+        if !options.language_enabled(&document.language) {
             self.client
                 .publish_diagnostics(document.uri, Vec::new(), document.version)
                 .await;
@@ -238,35 +237,13 @@ fn intersects_ignored_ranges(start: usize, end: usize, ignored_ranges: &[(usize,
 }
 
 fn annotated_for_document(document: &Document) -> AnnotatedText {
-    let data = annotated_for_language(&document.text, document.language_id.as_deref());
-    if data.has_text() {
-        return data;
-    }
-
-    let extension = document.uri.to_file_path().ok().and_then(|path| {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_string)
-    });
-    annotated_for_language(&document.text, extension.as_deref())
+    document.mask.annotated(&document.text)
 }
 
 fn ignored_ranges_for_document(document: &Document) -> Vec<(usize, usize)> {
-    let ranges = ignored_ranges_for_language(
-        &document.text,
-        &document.index,
-        document.language_id.as_deref(),
-    );
-    if !ranges.is_empty() {
-        return ranges;
-    }
-
-    let extension = document.uri.to_file_path().ok().and_then(|path| {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_string)
-    });
-    ignored_ranges_for_language(&document.text, &document.index, extension.as_deref())
+    document
+        .mask
+        .ignored_ranges(&document.text, &document.index)
 }
 
 fn make_replacement_action(
@@ -396,8 +373,12 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let had_changes = !params.content_changes.is_empty();
         for change in params.content_changes {
-            self.documents
-                .apply_change(&uri, Some(params.text_document.version), change);
+            if let Err(err) =
+                self.documents
+                    .apply_change(&uri, Some(params.text_document.version), change)
+            {
+                log::warn!("Failed to update document mask for {uri}: {err}");
+            }
         }
         if had_changes && self.options().check_while_typing {
             self.schedule_check(uri);
