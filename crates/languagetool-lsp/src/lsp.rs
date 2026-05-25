@@ -8,11 +8,10 @@ use crate::languagetool::{
 };
 use crate::masking::{annotated_for_language, ignored_ranges_for_language};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tower_lsp::jsonrpc::Result as RpcResult;
+use tower_lsp::jsonrpc::{Error as RpcError, Result as RpcResult};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
@@ -23,7 +22,7 @@ const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace"
 #[derive(Clone)]
 pub struct Backend {
     client: Client,
-    root: PathBuf,
+    root: Arc<RwLock<PathBuf>>,
     documents: DocumentCache,
     initialization_options: Arc<RwLock<ClientOptions>>,
     project_config: Arc<RwLock<ProjectConfig>>,
@@ -34,7 +33,7 @@ impl Backend {
     pub fn new(client: Client, root: PathBuf) -> Self {
         Self {
             client,
-            root,
+            root: Arc::new(RwLock::new(root)),
             documents: DocumentCache::default(),
             initialization_options: Arc::new(RwLock::new(ClientOptions::default())),
             project_config: Arc::new(RwLock::new(ProjectConfig::default())),
@@ -97,18 +96,16 @@ impl Backend {
             Ok(response) => response,
             Err(err) => {
                 self.log_check_error(&options, err).await;
+                if self.document_is_current(&document, generation) {
+                    self.client
+                        .publish_diagnostics(document.uri, Vec::new(), document.version)
+                        .await;
+                }
                 return;
             }
         };
 
-        if self.documents.generation(&document.uri) != generation {
-            return;
-        }
-        if self
-            .documents
-            .get(&document.uri)
-            .is_none_or(|current| current.version != document.version)
-        {
+        if !self.document_is_current(&document, generation) {
             return;
         }
         let diagnostics =
@@ -142,7 +139,8 @@ impl Backend {
     }
 
     fn project_config_path(&self) -> PathBuf {
-        self.options().project_config_path(&self.root)
+        let root = self.root.read().expect("workspace root poisoned");
+        self.options().project_config_path(&root)
     }
 
     fn project_config_display_path(&self) -> String {
@@ -159,42 +157,50 @@ impl Backend {
             .map_err(|err| format!("Failed to save project config: {err}"))
     }
 
-    async fn update_project_config(&self, update: impl FnOnce(&mut ProjectConfig) -> bool) {
+    fn update_project_config(
+        &self,
+        update: impl FnOnce(&mut ProjectConfig) -> bool,
+    ) -> Result<bool, String> {
         let project_config_path = self.project_config_path();
-        let updated = {
-            let mut project_config = self
-                .project_config
-                .write()
-                .expect("project config poisoned");
-            let updated = update(&mut project_config);
-            if updated {
-                if let Err(err) = self.save_project_config(&project_config, &project_config_path) {
-                    log::error!("{err}");
-                }
-            }
-            updated
+        let (updated, next_config) = {
+            let project_config = self.project_config.read().expect("project config poisoned");
+            let mut next_config = project_config.clone();
+            let updated = update(&mut next_config);
+            (updated, next_config)
         };
 
-        if updated {
-            self.recheck_all().await;
+        if !updated {
+            return Ok(false);
         }
+
+        self.save_project_config(&next_config, &project_config_path)?;
+        *self
+            .project_config
+            .write()
+            .expect("project config poisoned") = next_config;
+        Ok(true)
     }
 
-    async fn add_ignored_word(&self, word: &str) {
+    async fn add_ignored_word(&self, word: &str) -> Result<bool, String> {
         self.update_project_config(|project_config| project_config.add_ignored_word(word))
-            .await;
     }
 
-    async fn add_disabled_rule(&self, rule_id: &str) {
+    async fn add_disabled_rule(&self, rule_id: &str) -> Result<bool, String> {
         self.update_project_config(|project_config| project_config.add_disabled_rule(rule_id))
-            .await;
     }
 
-    async fn add_disabled_category(&self, category_id: &str) {
+    async fn add_disabled_category(&self, category_id: &str) -> Result<bool, String> {
         self.update_project_config(|project_config| {
             project_config.add_disabled_category(category_id)
         })
-        .await;
+    }
+
+    fn document_is_current(&self, document: &Document, generation: u64) -> bool {
+        self.documents.generation(&document.uri) == generation
+            && self
+                .documents
+                .get(&document.uri)
+                .is_some_and(|current| current.version == document.version)
     }
 }
 
@@ -218,7 +224,7 @@ fn diagnostics_for_document(
             !intersects_ignored_ranges(*offset, *offset + *length, ignored_ranges)
         })
         .filter_map(|(item, _, _)| {
-            let data = diagnostic_data(&document.text, index, item, options);
+            let data = diagnostic_data(&document.text, index, item, options, document.version);
             (!options.is_ignored_word(&data.matched_text))
                 .then(|| make_lsp_diagnostic(index, item, data, options))
         })
@@ -263,23 +269,30 @@ fn ignored_ranges_for_document(document: &Document) -> Vec<(usize, usize)> {
     ignored_ranges_for_language(&document.text, &document.index, extension.as_deref())
 }
 
-fn make_replacement_action(uri: &Url, diagnostic: &Diagnostic, replacement: &str) -> CodeAction {
-    let mut changes = HashMap::new();
-    changes.insert(
-        uri.clone(),
-        vec![TextEdit {
-            range: diagnostic.range,
-            new_text: replacement.to_string(),
-        }],
-    );
+fn make_replacement_action(
+    uri: &Url,
+    diagnostic: &Diagnostic,
+    replacement: &str,
+    document_version: Option<i32>,
+) -> CodeAction {
+    let edit = TextEdit {
+        range: diagnostic.range,
+        new_text: replacement.to_string(),
+    };
 
     CodeAction {
         title: format!("Replace with '{replacement}'"),
         kind: Some(CodeActionKind::QUICKFIX),
         diagnostics: Some(vec![diagnostic.clone()]),
         edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            document_changes: None,
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: document_version,
+                },
+                edits: vec![OneOf::Left(edit)],
+            }])),
             change_annotations: None,
         }),
         command: None,
@@ -300,11 +313,15 @@ fn make_command(title: String, command: &str, argument: String) -> Command {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
+        if let Some(root) = workspace_root(&params) {
+            *self.root.write().expect("workspace root poisoned") = root;
+        }
         let options = ClientOptions::from_value(params.initialization_options);
-        let project_config = ProjectConfig::load(&options.project_config_path(&self.root));
+        let root = self.root.read().expect("workspace root poisoned").clone();
+        let project_config = ProjectConfig::load(&options.project_config_path(&root));
         log::info!(
             "LanguageTool LSP initialized for {} using {}",
-            self.root.display(),
+            root.display(),
             options.endpoint()
         );
         *self
@@ -425,6 +442,7 @@ impl LanguageServer for Backend {
                     &uri,
                     &diagnostic,
                     &replacement,
+                    data.document_version,
                 )));
             }
 
@@ -472,7 +490,8 @@ impl LanguageServer for Backend {
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if params.settings != Value::Null {
             let options = ClientOptions::from_value(Some(params.settings));
-            let project_config = ProjectConfig::load(&options.project_config_path(&self.root));
+            let root = self.root.read().expect("workspace root poisoned").clone();
+            let project_config = ProjectConfig::load(&options.project_config_path(&root));
             *self
                 .initialization_options
                 .write()
@@ -487,16 +506,41 @@ impl LanguageServer for Backend {
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> RpcResult<Option<Value>> {
         let first_arg = params.arguments.first().and_then(Value::as_str);
-        match (params.command.as_str(), first_arg) {
+        let updated = match (params.command.as_str(), first_arg) {
             (COMMAND_IGNORE_WORD, Some(word)) => self.add_ignored_word(word).await,
             (COMMAND_DISABLE_RULE, Some(rule_id)) => self.add_disabled_rule(rule_id).await,
             (COMMAND_DISABLE_CATEGORY, Some(category_id)) => {
                 self.add_disabled_category(category_id).await
             }
-            _ => log::warn!("Unknown or invalid command: {}", params.command),
+            _ => {
+                log::warn!("Unknown or invalid command: {}", params.command);
+                Ok(false)
+            }
+        }
+        .map_err(RpcError::invalid_params)?;
+
+        if updated {
+            let backend = self.clone();
+            tokio::spawn(async move {
+                backend.recheck_all().await;
+            });
         }
         Ok(None)
     }
+}
+
+fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
+    params
+        .workspace_folders
+        .as_ref()
+        .and_then(|folders| folders.first())
+        .and_then(|folder| folder.uri.to_file_path().ok())
+        .or_else(|| {
+            params
+                .root_uri
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+        })
 }
 
 #[cfg(test)]

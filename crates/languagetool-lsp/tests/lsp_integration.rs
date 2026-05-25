@@ -1,3 +1,4 @@
+use httpmock::prelude::*;
 use languagetool_lsp::lsp::Backend;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -22,7 +23,16 @@ struct TestContext {
 impl TestContext {
     fn new() -> Self {
         let workspace = TempDir::new().expect("test workspace should be created");
-        let root = workspace.path().to_path_buf();
+        Self::new_with_workspace_and_backend_root(workspace, None)
+    }
+
+    fn new_with_backend_root(root: PathBuf) -> Self {
+        let workspace = TempDir::new().expect("test workspace should be created");
+        Self::new_with_workspace_and_backend_root(workspace, Some(root))
+    }
+
+    fn new_with_workspace_and_backend_root(workspace: TempDir, root: Option<PathBuf>) -> Self {
+        let root = root.unwrap_or_else(|| workspace.path().to_path_buf());
         let (request_tx, server_rx) = duplex(1024 * 1024);
         let (server_tx, response_rx) = duplex(1024 * 1024);
         let response_rx = BufReader::new(response_rx);
@@ -122,6 +132,27 @@ impl TestContext {
         }))
         .await;
         self.wait_response(id).await
+    }
+
+    async fn request_error(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))
+        .await;
+        self.wait_for(|message| {
+            (message.get("id") == Some(&json!(id))).then(|| {
+                message
+                    .get("error")
+                    .cloned()
+                    .expect("expected JSON-RPC error")
+            })
+        })
+        .await
     }
 
     async fn notify(&mut self, method: &str, params: Value) {
@@ -525,12 +556,116 @@ async fn code_action_returns_replacement_and_workspace_commands() {
 
     assert!(actions.iter().any(|action| {
         action["title"] == "Replace with 'test'"
-            && action["edit"]["changes"][uri.as_str()][0]["newText"] == "test"
+            && action["edit"]["documentChanges"][0]["textDocument"]["uri"] == uri.as_str()
+            && action["edit"]["documentChanges"][0]["textDocument"]["version"] == 1
+            && action["edit"]["documentChanges"][0]["edits"][0]["newText"] == "test"
     }));
     assert!(actions.iter().any(|action| {
         action["command"] == "languagetool.ignoreWordInWorkspace"
             && action["arguments"] == json!(["tset"])
     }));
+}
+
+#[tokio::test]
+async fn initialize_workspace_root_controls_project_config_location() {
+    let backend_root = TempDir::new().expect("backend root should be created");
+    let mut ctx = TestContext::new_with_backend_root(backend_root.path().to_path_buf());
+    ctx.initialize().await;
+
+    let result = ctx
+        .request(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+
+    assert_eq!(result, Value::Null);
+    assert!(ctx.project_config_path().exists());
+    assert!(!backend_root.path().join(".zed/languagetool.json").exists());
+}
+
+#[tokio::test]
+async fn execute_command_reports_project_config_save_failure() {
+    let mut ctx = TestContext::new();
+    ctx.initialize().await;
+    std::fs::create_dir_all(ctx.project_config_path())
+        .expect("directory at config path should be created");
+
+    let error = ctx
+        .request_error(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+
+    assert_eq!(error["code"], -32602);
+}
+
+#[tokio::test]
+async fn check_failure_clears_stale_diagnostics() {
+    let server = MockServer::start();
+    let _check = server.mock(|when, then| {
+        when.method(POST).path("/v2/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{
+                    "matches": [{
+                        "message": "Possible spelling mistake found.",
+                        "offset": 11,
+                        "length": 4,
+                        "replacements": [{"value": "test"}],
+                        "context": {"text": "This are a tset.", "offset": 11, "length": 4},
+                        "sentence": "This are a tset.",
+                        "rule": {
+                            "id": "MORFOLOGIK_RULE_EN_US",
+                            "description": "Possible spelling mistake",
+                            "issueType": "misspelling",
+                            "category": {"id": "TYPOS", "name": "Possible Typo"}
+                        }
+                    }]
+                }"#,
+            );
+    });
+    let mut ctx = TestContext::new();
+    ctx.initialize_with_options(json!({
+        "backend": { "type": "local", "url": server.base_url() }
+    }))
+    .await;
+    let uri = ctx.doc_uri("document.txt");
+
+    ctx.open_document(&uri, "plaintext", "This are a tset.")
+        .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    assert!(!params["diagnostics"].as_array().unwrap().is_empty());
+
+    ctx.notify(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "backend": { "type": "local", "url": format!("{}/missing", server.base_url()) },
+                "language": "en-US",
+                "checkOnOpen": true,
+                "checkOnSave": true,
+                "checkWhileTyping": false,
+                "debounceMs": 10,
+                "maxReplacements": 8
+            }
+        }),
+    )
+    .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    assert!(params["diagnostics"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

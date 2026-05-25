@@ -119,8 +119,11 @@ fn collect_c_like_comment_ranges(text: &str, keep_ranges: &mut Vec<Range>) {
         }
 
         match (bytes[i], bytes[i + 1]) {
-            (b'"' | b'\'', _) => {
+            (b'"', _) => {
                 i = skip_quoted_string(bytes, i);
+            }
+            (b'\'', _) => {
+                i = skip_single_quoted_string(bytes, i).unwrap_or(i + 1);
             }
             (b'/', b'/') => {
                 let start = skip_horizontal_whitespace(bytes, i + 2);
@@ -143,6 +146,24 @@ fn collect_c_like_comment_ranges(text: &str, keep_ranges: &mut Vec<Range>) {
             _ => i += 1,
         }
     }
+}
+
+fn skip_single_quoted_string(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' || bytes[i] == b'\r' {
+            return None;
+        }
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn skip_quoted_string(bytes: &[u8], start: usize) -> usize {
@@ -195,16 +216,19 @@ fn collect_hash_comment_ranges(text: &str, keep_ranges: &mut Vec<Range>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'#' {
-            let start = skip_horizontal_whitespace(bytes, i + 1);
-            let mut end = start;
-            while end < bytes.len() && bytes[end] != b'\n' {
-                end += 1;
+        match bytes[i] {
+            b'"' => i = skip_quoted_string(bytes, i),
+            b'\'' => i = skip_single_quoted_string(bytes, i).unwrap_or(i + 1),
+            b'#' => {
+                let start = skip_horizontal_whitespace(bytes, i + 1);
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'\n' {
+                    end += 1;
+                }
+                keep_ranges.push(Range { start, end });
+                i = end;
             }
-            keep_ranges.push(Range { start, end });
-            i = end;
-        } else {
-            i += 1;
+            _ => i += 1,
         }
     }
 }
@@ -386,6 +410,10 @@ fn collect_html_element_contents(text: &str, tag: &str, ranges: &mut Vec<Range>)
 
     while let Some(open_rel) = lower[search_start..].find(&open) {
         let open_start = search_start + open_rel;
+        if !is_html_tag_boundary(lower.as_bytes().get(open_start + open.len()).copied()) {
+            search_start = open_start + 1;
+            continue;
+        }
         let Some(open_end_rel) = lower[open_start..].find('>') else {
             break;
         };
@@ -404,6 +432,10 @@ fn collect_html_element_contents(text: &str, tag: &str, ranges: &mut Vec<Range>)
         });
         search_start = content_end + close.len();
     }
+}
+
+fn is_html_tag_boundary(byte: Option<u8>) -> bool {
+    matches!(byte, Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r'))
 }
 
 fn annotations_from_skip_ranges(text: &str, skip_ranges: &mut [Range]) -> Vec<Annotation> {
@@ -578,6 +610,50 @@ mod tests {
 
         assert_eq!(checked_text, vec!["I am a catz.", "I like chickz."]);
         assert!(separators.iter().any(|separator| separator.contains('\n')));
+    }
+
+    #[test]
+    fn rust_lifetimes_do_not_hide_following_comments() {
+        let text = "let value: &'a str = input; // This are docs.\n";
+        let data = annotated_for_language(text, Some("rust"));
+        let checked = data
+            .annotation
+            .iter()
+            .filter_map(|annotation| annotation.as_text())
+            .collect::<String>();
+
+        assert_eq!(checked, "This are docs.");
+    }
+
+    #[test]
+    fn hash_markers_inside_strings_are_not_comments() {
+        let text = indoc! {r##"
+            value = "# This are code"
+            # This are a comment.
+        "##};
+        let data = annotated_for_language(text, Some("python"));
+        let checked = data
+            .annotation
+            .iter()
+            .filter_map(|annotation| annotation.as_text())
+            .collect::<String>();
+
+        assert!(!checked.contains("This are code"));
+        assert!(checked.contains("This are a comment."));
+    }
+
+    #[test]
+    fn html_script_and_style_matching_requires_tag_boundary() {
+        let text = "<scripture>This are prose.</scripture><stylesheet>More are prose.</stylesheet>";
+        let data = annotated_for_language(text, Some("html"));
+        let checked = data
+            .annotation
+            .iter()
+            .filter_map(|annotation| annotation.as_text())
+            .collect::<String>();
+
+        assert!(checked.contains("This are prose."));
+        assert!(checked.contains("More are prose."));
     }
 
     #[test]

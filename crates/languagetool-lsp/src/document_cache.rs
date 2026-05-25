@@ -35,8 +35,14 @@ impl Document {
             return false;
         };
         self.text.replace_range(byte_start..byte_end, new_text);
-        self.index
-            .apply_edit(byte_start, byte_end, utf16_start, utf16_end, new_text);
+        self.index.apply_edit(
+            &self.text,
+            byte_start,
+            byte_end,
+            utf16_start,
+            utf16_end,
+            new_text,
+        );
         true
     }
 
@@ -210,6 +216,25 @@ mod tests {
             },
         );
         assert_eq!(cache.get(&uri).unwrap().text, "axb");
+    }
+
+    #[test]
+    fn ignores_incremental_change_inside_surrogate_pair() {
+        let cache = DocumentCache::default();
+        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        cache.update(&uri, Some(1), "a😀b".to_string());
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 2), Position::new(0, 2))),
+                range_length: None,
+                text: "x".to_string(),
+            },
+        );
+        let document = cache.get(&uri).unwrap();
+        assert_eq!(document.text, "a😀b");
+        assert_eq!(document.version, Some(1));
     }
 
     // Verify that document.index always matches TextIndex::new(&document.text) after

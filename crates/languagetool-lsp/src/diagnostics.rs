@@ -17,6 +17,8 @@ pub struct DiagnosticData {
     pub issue_type: Option<String>,
     pub replacements: Vec<String>,
     pub matched_text: String,
+    #[serde(default)]
+    pub document_version: Option<i32>,
 }
 
 pub fn make_lsp_diagnostic(
@@ -49,6 +51,7 @@ pub fn diagnostic_data(
     index: &TextIndex,
     item: &LanguageToolMatch,
     options: &ClientOptions,
+    document_version: Option<i32>,
 ) -> DiagnosticData {
     let (offset, length) = match_offsets(item).unwrap_or_default();
     let matched_text = index
@@ -69,6 +72,7 @@ pub fn diagnostic_data(
         issue_type: rule.and_then(|rule| rule.issue_type.clone()),
         replacements,
         matched_text,
+        document_version,
     }
 }
 
