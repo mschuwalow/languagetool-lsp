@@ -51,6 +51,7 @@ async fn serve(root: &Path) {
 }
 
 async fn health() {
+    log::info!("Checking LanguageTool health");
     let options = ClientOptions::default();
     let client = LanguageToolClient::new();
     match client.check("This are a tset.", &options).await {
@@ -73,11 +74,14 @@ async fn check(files: Vec<PathBuf>) {
     let options = ClientOptions::default();
     let client = LanguageToolClient::new();
     let mut had_errors = false;
+    log::info!("Checking {} file(s) with LanguageTool", files.len());
 
     for path in files {
+        log::debug!("Reading {}", path.display());
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err) => {
+                log::debug!("Failed to read {}: {err}", path.display());
                 eprintln!("{}: {err}", path.display());
                 had_errors = true;
                 continue;
@@ -87,24 +91,42 @@ async fn check(files: Vec<PathBuf>) {
         let uri = match file_uri(&path) {
             Ok(uri) => uri,
             Err(err) => {
+                log::debug!("Failed to build file URI for {}: {err}", path.display());
                 eprintln!("{}: {err}", path.display());
                 had_errors = true;
                 continue;
             }
         };
+        log::debug!(
+            "Preparing CLI document for {} uri={uri} bytes={}",
+            path.display(),
+            text.len()
+        );
         let document = Document::new(uri, None, None, text);
         let Some(checkable_document) =
             document.checkable(|language| options.language_enabled(&language))
         else {
+            log::debug!("Skipping {} because it is not checkable", path.display());
             continue;
         };
         let mut hits = Vec::new();
 
+        log::debug!(
+            "Sending LanguageTool request for {} annotations={} ignored_ranges={}",
+            path.display(),
+            checkable_document.annotated().annotation.len(),
+            checkable_document.ignored_ranges().len()
+        );
         match client
             .check_annotated(checkable_document.annotated(), &options)
             .await
         {
             Ok(response) => {
+                log::debug!(
+                    "LanguageTool returned {} match(es) for {}",
+                    response.matches.len(),
+                    path.display()
+                );
                 hits.extend(response.matches.into_iter().filter_map(|item| {
                     let offset = usize::try_from(item.offset).ok()?;
                     let length = usize::try_from(item.length).ok()?;
@@ -126,16 +148,20 @@ async fn check(files: Vec<PathBuf>) {
                 }));
             }
             Err(err) => {
+                log::debug!("LanguageTool check failed for {}: {err}", path.display());
                 eprintln!("{}: {err}", path.display());
                 had_errors = true;
             }
         }
 
         if !hits.is_empty() {
+            log::info!("{} produced {} hit(s)", path.display(), hits.len());
             println!("{}", path.display());
             for (offset, length, message) in hits {
                 println!("  {offset}:{length} {message}");
             }
+        } else {
+            log::debug!("{} produced no reportable hits", path.display());
         }
     }
 

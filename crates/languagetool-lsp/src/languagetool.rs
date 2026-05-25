@@ -66,6 +66,8 @@ impl LanguageToolClient {
     ) -> Result<LanguageToolResponse, LanguageToolError> {
         let endpoint = options.endpoint();
         let api_base_url = options.api_base_url();
+        let payload_kind = payload.kind();
+        log::debug!("Sending LanguageTool {payload_kind} request to {endpoint}");
         let preferred_variants = join_parameter(&options.preferred_variants);
         let disabled_rules = join_parameter(&options.disabled_rules);
         let disabled_categories = join_parameter(&options.disabled_categories);
@@ -112,7 +114,7 @@ impl LanguageToolClient {
             ..api::apis::configuration::Configuration::default()
         };
 
-        api::apis::default_api::check_post(
+        let response = api::apis::default_api::check_post(
             &configuration,
             &options.language,
             text,
@@ -131,7 +133,12 @@ impl LanguageToolClient {
         )
         .await
         .map(LanguageToolResponse::from)
-        .map_err(|source| LanguageToolError::Api { endpoint, source })
+        .map_err(|source| LanguageToolError::Api { endpoint, source })?;
+        log::debug!(
+            "LanguageTool {payload_kind} request returned {} match(es)",
+            response.matches.len()
+        );
+        Ok(response)
     }
 }
 
@@ -153,6 +160,15 @@ impl From<api::models::CheckPost200Response> for LanguageToolResponse {
 enum CheckPayload<'a> {
     Text(&'a str),
     Data(&'a AnnotatedText),
+}
+
+impl CheckPayload<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::Data(_) => "annotated",
+        }
+    }
 }
 
 fn join_parameter(values: &[String]) -> String {

@@ -67,11 +67,20 @@ impl CheckableDocument<'_> {
 
 impl Document {
     pub fn new(uri: Url, version: Option<i32>, language_id: Option<String>, text: String) -> Self {
+        let text_len = text.len();
         let kind = match DocumentLanguage::from_lsp_or_uri(language_id.as_deref(), &uri) {
-            DocumentLanguage::Supported(language) => DocumentKind::Supported(Box::new(
-                SupportedDocument::new(uri, version, language, text),
-            )),
+            DocumentLanguage::Supported(language) => {
+                log::debug!(
+                    "Created supported document {uri} version={version:?} language={language:?} bytes={text_len}"
+                );
+                DocumentKind::Supported(Box::new(SupportedDocument::new(
+                    uri, version, language, text,
+                )))
+            }
             DocumentLanguage::Unsupported => {
+                log::debug!(
+                    "Created unsupported document {uri} version={version:?}; text will not be cached"
+                );
                 DocumentKind::Unsupported(UnsupportedDocument { uri, version })
             }
         };
@@ -96,21 +105,46 @@ impl Document {
         &self,
         language_enabled: impl FnOnce(SupportedLanguage) -> bool,
     ) -> Option<CheckableDocument<'_>> {
-        let document = self.supported()?;
+        let Some(document) = self.supported() else {
+            log::debug!(
+                "Skipping {} because the document language is unsupported",
+                self.uri()
+            );
+            return None;
+        };
         if !language_enabled(document.language) {
+            log::debug!(
+                "Skipping {} because language {:?} is disabled",
+                document.uri,
+                document.language
+            );
             return None;
         }
 
         let annotated = document.mask.annotated(&document.text);
         if !annotated.has_text() {
+            log::debug!(
+                "Skipping {} because language {:?} produced no checkable text",
+                document.uri,
+                document.language
+            );
             return None;
         }
 
+        let ignored_ranges = document
+            .mask
+            .ignored_ranges(&document.text, &document.index);
+        log::debug!(
+            "Prepared checkable document {} language={:?} annotations={} ignored_ranges={}",
+            document.uri,
+            document.language,
+            annotated.annotation.len(),
+            ignored_ranges.len()
+        );
+
         Some(CheckableDocument {
             document,
-            ignored_ranges: document
-                .mask
-                .ignored_ranges(&document.text, &document.index),
+            ignored_ranges,
             annotated,
         })
     }
@@ -123,15 +157,41 @@ impl Document {
     }
 
     fn set_version(&mut self, version: Option<i32>) {
+        let uri = self.uri().clone();
         match &mut self.kind {
-            DocumentKind::Supported(document) => document.version = version.or(document.version),
-            DocumentKind::Unsupported(document) => document.version = version.or(document.version),
+            DocumentKind::Supported(document) => {
+                let previous = document.version;
+                document.version = version.or(document.version);
+                log::debug!(
+                    "Updated supported document {uri} version {previous:?} -> {:?}",
+                    document.version
+                );
+            }
+            DocumentKind::Unsupported(document) => {
+                let previous = document.version;
+                document.version = version.or(document.version);
+                log::debug!(
+                    "Updated unsupported document {uri} version {previous:?} -> {:?}",
+                    document.version
+                );
+            }
         }
     }
 
     fn set_text(&mut self, text: String) {
         if let DocumentKind::Supported(document) = &mut self.kind {
+            log::debug!(
+                "Replacing full text for supported document {} bytes={} -> {}",
+                document.uri,
+                document.text.len(),
+                text.len()
+            );
             document.set_text(text);
+        } else {
+            log::debug!(
+                "Ignoring full text update for unsupported document {}",
+                self.uri()
+            );
         }
     }
 
@@ -142,7 +202,14 @@ impl Document {
     ) -> Result<bool, MaskError> {
         match &mut self.kind {
             DocumentKind::Supported(document) => document.apply_range_change(range, new_text),
-            DocumentKind::Unsupported(_) => Ok(true),
+            DocumentKind::Unsupported(document) => {
+                log::debug!(
+                    "Ignoring incremental text change for unsupported document {} version={:?}",
+                    document.uri,
+                    document.version
+                );
+                Ok(true)
+            }
         }
     }
 
@@ -183,8 +250,18 @@ impl SupportedDocument {
     ) -> Result<bool, MaskError> {
         let Some((byte_start, byte_end, utf16_start, utf16_end)) = self.index.edit_offsets(range)
         else {
+            log::debug!(
+                "Rejected incremental change for {} because range {:?} is outside valid UTF-16 boundaries",
+                self.uri,
+                range
+            );
             return Ok(false);
         };
+        log::debug!(
+            "Applying incremental change to {} bytes={byte_start}..{byte_end} utf16={utf16_start}..{utf16_end} replacement_bytes={}",
+            self.uri,
+            new_text.len()
+        );
         let old_text = self.text.clone();
         self.text.replace_range(byte_start..byte_end, new_text);
         self.index.apply_edit(
@@ -215,6 +292,11 @@ struct DocumentEntry {
 impl DocumentCache {
     pub fn insert(&self, document: &TextDocumentItem) {
         let document = Document::from_text_document(document);
+        log::debug!(
+            "Inserting document {} version={:?}",
+            document.uri(),
+            document.version()
+        );
         self.documents
             .write()
             .expect("document cache poisoned")
@@ -227,6 +309,10 @@ impl DocumentCache {
     }
 
     pub fn update(&self, uri: &Url, version: Option<i32>, text: String) {
+        log::debug!(
+            "Applying full document update for {uri} version={version:?} bytes={}",
+            text.len()
+        );
         let key = uri.to_string();
         let mut documents = self.documents.write().expect("document cache poisoned");
         if let Some(entry) = documents.get_mut(&key) {
@@ -250,13 +336,20 @@ impl DocumentCache {
         change: TextDocumentContentChangeEvent,
     ) -> Result<(), MaskError> {
         if let Some(range) = change.range {
+            log::debug!(
+                "Applying ranged document change for {uri} version={version:?} range={range:?} replacement_bytes={}",
+                change.text.len()
+            );
             let key = uri.to_string();
             let mut documents = self.documents.write().expect("document cache poisoned");
             if let Some(entry) = documents.get_mut(&key) {
                 if entry.document.apply_range_change(range, &change.text)? {
                     entry.document.set_version(version);
+                } else {
+                    log::debug!("Ranged document change for {uri} was ignored");
                 }
             } else {
+                log::debug!("Document {uri} was not cached; treating ranged change as full text");
                 documents.insert(
                     key,
                     DocumentEntry {
@@ -266,12 +359,17 @@ impl DocumentCache {
                 );
             }
         } else {
+            log::debug!(
+                "Applying full document change for {uri} version={version:?} bytes={}",
+                change.text.len()
+            );
             self.update(uri, version, change.text);
         }
         Ok(())
     }
 
     pub fn remove(&self, uri: &Url) {
+        log::debug!("Removing document {uri} from cache");
         self.documents
             .write()
             .expect("document cache poisoned")
