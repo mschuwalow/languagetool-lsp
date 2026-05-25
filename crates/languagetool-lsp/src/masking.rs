@@ -22,6 +22,7 @@ enum ParsedMask {
     Rust(Tree),
     Scala(Tree),
     Nix(Tree),
+    Html(Tree),
     Java(Tree),
     Python(Tree),
     Javascript(Tree),
@@ -95,6 +96,11 @@ impl Masker {
 
     fn ranges(&self, text: &str) -> Option<MaskRanges> {
         match &self.parsed {
+            ParsedMask::Html(tree) => {
+                let mut ranges = Vec::new();
+                collect_html_skip_ranges(tree.root_node(), &mut ranges);
+                Some(MaskRanges::Skip(ranges))
+            }
             ParsedMask::Markdown(tree) => {
                 let mut ranges = Vec::new();
                 collect_markdown_skip_ranges(tree.block_tree().root_node(), &mut ranges);
@@ -120,6 +126,7 @@ impl ParsedMask {
             Self::Rust(tree)
             | Self::Scala(tree)
             | Self::Nix(tree)
+            | Self::Html(tree)
             | Self::Java(tree)
             | Self::Python(tree)
             | Self::Javascript(tree)
@@ -144,6 +151,7 @@ impl ParsedMask {
                     Language::Rust => Self::Rust(tree),
                     Language::Scala => Self::Scala(tree),
                     Language::Nix => Self::Nix(tree),
+                    Language::Html => Self::Html(tree),
                     Language::Java => Self::Java(tree),
                     Language::Python => Self::Python(tree),
                     Language::Javascript => Self::Javascript(tree),
@@ -160,6 +168,7 @@ impl ParsedMask {
             Self::Rust(tree) => reparse_tree(Language::Rust, text, tree).map(Self::Rust),
             Self::Scala(tree) => reparse_tree(Language::Scala, text, tree).map(Self::Scala),
             Self::Nix(tree) => reparse_tree(Language::Nix, text, tree).map(Self::Nix),
+            Self::Html(tree) => reparse_tree(Language::Html, text, tree).map(Self::Html),
             Self::Java(tree) => reparse_tree(Language::Java, text, tree).map(Self::Java),
             Self::Python(tree) => reparse_tree(Language::Python, text, tree).map(Self::Python),
             Self::Javascript(tree) => {
@@ -184,6 +193,7 @@ impl ParsedMask {
             Self::Rust(_) => Self::parse(Language::Rust, text),
             Self::Scala(_) => Self::parse(Language::Scala, text),
             Self::Nix(_) => Self::parse(Language::Nix, text),
+            Self::Html(_) => Self::parse(Language::Html, text),
             Self::Java(_) => Self::parse(Language::Java, text),
             Self::Python(_) => Self::parse(Language::Python, text),
             Self::Javascript(_) => Self::parse(Language::Javascript, text),
@@ -199,6 +209,7 @@ impl ParsedMask {
             Self::Rust(_) => Some(Language::Rust),
             Self::Scala(_) => Some(Language::Scala),
             Self::Nix(_) => Some(Language::Nix),
+            Self::Html(_) => Some(Language::Html),
             Self::Java(_) => Some(Language::Java),
             Self::Python(_) => Some(Language::Python),
             Self::Javascript(_) => Some(Language::Javascript),
@@ -214,6 +225,7 @@ impl ParsedMask {
             Self::Rust(tree) => Some((Language::Rust, tree)),
             Self::Scala(tree) => Some((Language::Scala, tree)),
             Self::Nix(tree) => Some((Language::Nix, tree)),
+            Self::Html(_) => None,
             Self::Java(tree) => Some((Language::Java, tree)),
             Self::Python(tree) => Some((Language::Python, tree)),
             Self::Javascript(tree) => Some((Language::Javascript, tree)),
@@ -229,6 +241,7 @@ fn tree_sitter_language(language: Language) -> TreeSitterLanguage {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Scala => tree_sitter_scala::LANGUAGE.into(),
         Language::Nix => tree_sitter_nix::LANGUAGE.into(),
+        Language::Html => tree_sitter_html::LANGUAGE.into(),
         Language::Java => tree_sitter_java::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::Javascript => tree_sitter_javascript::LANGUAGE.into(),
@@ -288,7 +301,7 @@ fn strip_comment_markers(
         | Language::Typescript
         | Language::Tsx => strip_slash_comment(source, node, false),
         Language::Nix | Language::Python => strip_hash_comment(source, node),
-        Language::Markdown | Language::PlainText => None,
+        Language::Html | Language::Markdown | Language::PlainText => None,
     }
 }
 
@@ -383,6 +396,31 @@ fn collect_markdown_inline_skip_ranges(node: Node<'_>, ranges: &mut Vec<Range>) 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_markdown_inline_skip_ranges(child, ranges);
+    }
+}
+
+fn collect_html_skip_ranges(node: Node<'_>, ranges: &mut Vec<Range>) {
+    if matches!(node.kind(), "script_element" | "style_element") {
+        ranges.push(Range {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        });
+        return;
+    }
+
+    if matches!(
+        node.kind(),
+        "start_tag" | "end_tag" | "self_closing_tag" | "erroneous_end_tag" | "doctype"
+    ) {
+        ranges.push(Range {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_html_skip_ranges(child, ranges);
     }
 }
 
@@ -860,6 +898,30 @@ mod tests {
 
         assert!(!checked.contains("This are code"));
         assert!(checked.contains("This are a comment."));
+    }
+
+    #[test]
+    fn html_masks_script_contents_and_tags() {
+        let text = indoc! {"
+            <p>This are a tset.</p>
+            <script>This are code and should not be checked.</script>
+        "};
+        let data = annotated_for_test(text, "html");
+        let checked = data
+            .annotation
+            .iter()
+            .filter_map(|annotation| annotation.as_text())
+            .collect::<String>();
+        let markup = data
+            .annotation
+            .iter()
+            .filter_map(|annotation| annotation.as_markup())
+            .collect::<String>();
+
+        assert!(checked.contains("This are a tset."));
+        assert!(!checked.contains("This are code"));
+        assert!(!checked.contains("<p>"));
+        assert!(markup.contains("<script>This are code and should not be checked.</script>"));
     }
 
     fn complement_utf16_ranges(
