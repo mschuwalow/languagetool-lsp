@@ -2,10 +2,8 @@ use crate::config::{BackendConfig, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
     diagnostic_data, make_lsp_diagnostic, match_offsets, parse_diagnostic_data, SOURCE,
 };
-use crate::document_cache::{Document, DocumentCache};
-use crate::languagetool::{
-    AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
-};
+use crate::document_cache::{CheckableDocument, Document, DocumentCache};
+use crate::languagetool::{LanguageToolClient, LanguageToolError, LanguageToolMatch};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -69,36 +67,40 @@ impl Backend {
         self.check_uri(uri, generation).await;
     }
 
+    async fn clear_stale_diagnostics(&self, uri: &Url, version: Option<i32>) {
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), version)
+            .await;
+    }
+
     async fn check_uri(&self, uri: &Url, generation: u64) {
         let Some(document) = self.documents.get(uri) else {
             return;
         };
 
         let options = self.options();
-        if !options.language_enabled(&document.language) {
-            self.client
-                .publish_diagnostics(document.uri, Vec::new(), document.version)
+        let Some(checkable_document) =
+            document.checkable(|language| options.language_enabled(&language))
+        else {
+            self.clear_stale_diagnostics(document.uri(), document.version())
                 .await;
             return;
-        }
+        };
 
-        let data = annotated_for_document(&document);
-        let ignored_ranges = ignored_ranges_for_document(&document);
-        if !data.has_text() {
-            self.client
-                .publish_diagnostics(document.uri, Vec::new(), document.version)
-                .await;
-            return;
-        }
-
-        let response = match self.language_tool.check_annotated(&data, &options).await {
+        let response = match self
+            .language_tool
+            .check_annotated(checkable_document.annotated(), &options)
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 self.log_check_error(&options, err).await;
                 if self.document_is_current(&document, generation) {
-                    self.client
-                        .publish_diagnostics(document.uri, Vec::new(), document.version)
-                        .await;
+                    self.clear_stale_diagnostics(
+                        checkable_document.uri(),
+                        checkable_document.version(),
+                    )
+                    .await;
                 }
                 return;
             }
@@ -107,10 +109,13 @@ impl Backend {
         if !self.document_is_current(&document, generation) {
             return;
         }
-        let diagnostics =
-            diagnostics_for_document(&document, response.matches, &options, &ignored_ranges);
+        let diagnostics = diagnostics_for_document(&checkable_document, response.matches, &options);
         self.client
-            .publish_diagnostics(document.uri, diagnostics, document.version)
+            .publish_diagnostics(
+                checkable_document.uri().clone(),
+                diagnostics,
+                checkable_document.version(),
+            )
             .await;
     }
 
@@ -195,35 +200,35 @@ impl Backend {
     }
 
     fn document_is_current(&self, document: &Document, generation: u64) -> bool {
-        self.documents.generation(&document.uri) == generation
+        self.documents.generation(document.uri()) == generation
             && self
                 .documents
-                .get(&document.uri)
-                .is_some_and(|current| current.version == document.version)
+                .get(document.uri())
+                .is_some_and(|current| current.version() == document.version())
     }
 }
 
 fn diagnostics_for_document(
-    document: &Document,
+    document: &CheckableDocument<'_>,
     matches: Vec<LanguageToolMatch>,
     options: &ClientOptions,
-    ignored_ranges: &[(usize, usize)],
 ) -> Vec<Diagnostic> {
-    let index = &document.index;
+    let index = document.index();
+    let text = document.text();
     matches
         .iter()
         .filter_map(|item| match_offsets(item).map(|(offset, length)| (item, offset, length)))
         .filter(|(_, offset, length)| {
             !index
-                .text_for_utf16_range(&document.text, *offset, *offset + *length)
+                .text_for_utf16_range(text, *offset, *offset + *length)
                 .map(|s| s.trim().is_empty())
                 .unwrap_or(true)
         })
         .filter(|(_, offset, length)| {
-            !intersects_ignored_ranges(*offset, *offset + *length, ignored_ranges)
+            !intersects_ignored_ranges(*offset, *offset + *length, document.ignored_ranges())
         })
         .filter_map(|(item, _, _)| {
-            let data = diagnostic_data(&document.text, index, item, options, document.version);
+            let data = diagnostic_data(text, index, item, options, document.version());
             (!options.is_ignored_word(&data.matched_text))
                 .then(|| make_lsp_diagnostic(index, item, data, options))
         })
@@ -234,16 +239,6 @@ fn intersects_ignored_ranges(start: usize, end: usize, ignored_ranges: &[(usize,
     ignored_ranges
         .iter()
         .any(|(ignored_start, ignored_end)| start < *ignored_end && end > *ignored_start)
-}
-
-fn annotated_for_document(document: &Document) -> AnnotatedText {
-    document.mask.annotated(&document.text)
-}
-
-fn ignored_ranges_for_document(document: &Document) -> Vec<(usize, usize)> {
-    document
-        .mask
-        .ignored_ranges(&document.text, &document.index)
 }
 
 fn make_replacement_action(
@@ -397,8 +392,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
-        self.client
-            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+        self.clear_stale_diagnostics(&params.text_document.uri, None)
             .await;
     }
 
@@ -539,6 +533,7 @@ mod tests {
             Some("plaintext".to_string()),
             "This are a tset.".to_string(),
         );
+        let document = document.checkable(|_| true).unwrap();
         let options = ClientOptions::default();
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
@@ -563,7 +558,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);
+        let diagnostics = diagnostics_for_document(&document, vec![item], &options);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].range.start, Position::new(0, 11));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 15));
@@ -577,6 +572,7 @@ mod tests {
             Some("rust".to_string()),
             "let value = 1; // This are a comment.".to_string(),
         );
+        let document = document.checkable(|_| true).unwrap();
         let options = ClientOptions::default();
         let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),
@@ -596,7 +592,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);
+        let diagnostics = diagnostics_for_document(&document, vec![item], &options);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].range.start, Position::new(0, 18));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 22));
@@ -610,6 +606,7 @@ mod tests {
             Some("plaintext".to_string()),
             "😀 This are a tset.".to_string(),
         );
+        let document = document.checkable(|_| true).unwrap();
         let options = ClientOptions::default();
         let item = LanguageToolMatch {
             message: "The verb 'are' is plural.".to_string(),
@@ -632,7 +629,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_document(&document, vec![item], &options, &[]);
+        let diagnostics = diagnostics_for_document(&document, vec![item], &options);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].range.start, Position::new(0, 3));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 11));

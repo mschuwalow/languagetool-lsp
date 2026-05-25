@@ -3,7 +3,7 @@ use std::path::Path;
 use tower_lsp::lsp_types::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Language {
+pub enum SupportedLanguage {
     PlainText,
     Rust,
     Scala,
@@ -17,49 +17,39 @@ pub enum Language {
     Markdown,
 }
 
-impl Language {
-    pub fn from_language_id(language_id: Option<&str>) -> Self {
-        match language_id.unwrap_or_default() {
-            "rust" | "rs" => Self::Rust,
-            "scala" | "scala3" | "sc" => Self::Scala,
-            "nix" => Self::Nix,
-            "html" => Self::Html,
-            "java" => Self::Java,
-            "python" => Self::Python,
-            "javascript" | "javascriptreact" | "jsx" => Self::Javascript,
-            "typescript" => Self::Typescript,
-            "typescriptreact" | "tsx" => Self::Tsx,
-            "markdown" | "md" | "mdx" => Self::Markdown,
-            _ => Self::PlainText,
+impl SupportedLanguage {
+    pub fn from_language_id(language_id: &str) -> Option<Self> {
+        match language_id {
+            "plaintext" => Some(Self::PlainText),
+            "rust" | "rs" => Some(Self::Rust),
+            "scala" | "scala3" | "sc" => Some(Self::Scala),
+            "nix" => Some(Self::Nix),
+            "html" => Some(Self::Html),
+            "java" => Some(Self::Java),
+            "python" => Some(Self::Python),
+            "javascript" | "javascriptreact" | "jsx" => Some(Self::Javascript),
+            "typescript" => Some(Self::Typescript),
+            "typescriptreact" | "tsx" => Some(Self::Tsx),
+            "markdown" | "md" | "mdx" => Some(Self::Markdown),
+            _ => None,
         }
     }
 
-    pub fn from_path(path: &Path) -> Self {
+    pub fn from_path(path: &Path) -> Option<Self> {
         match path.extension().and_then(|extension| extension.to_str()) {
-            Some("java") => Self::Java,
-            Some("js") | Some("jsx") => Self::Javascript,
-            Some("md") | Some("markdown") | Some("mdx") => Self::Markdown,
-            Some("nix") => Self::Nix,
-            Some("html") | Some("htm") => Self::Html,
-            Some("py") => Self::Python,
-            Some("rs") => Self::Rust,
-            Some("scala") | Some("sc") => Self::Scala,
-            Some("ts") => Self::Typescript,
-            Some("tsx") => Self::Tsx,
-            _ => Self::PlainText,
+            Some("java") => Some(Self::Java),
+            Some("js") | Some("jsx") => Some(Self::Javascript),
+            Some("md") | Some("markdown") | Some("mdx") => Some(Self::Markdown),
+            Some("nix") => Some(Self::Nix),
+            Some("html") | Some("htm") => Some(Self::Html),
+            Some("py") => Some(Self::Python),
+            Some("rs") => Some(Self::Rust),
+            Some("scala") | Some("sc") => Some(Self::Scala),
+            Some("ts") => Some(Self::Typescript),
+            Some("tsx") => Some(Self::Tsx),
+            Some("txt") | Some("text") => Some(Self::PlainText),
+            _ => None,
         }
-    }
-
-    pub fn from_lsp_or_uri(language_id: Option<&str>, uri: &Url) -> Self {
-        let from_lsp = Self::from_language_id(language_id);
-        if from_lsp != Self::PlainText {
-            return from_lsp;
-        }
-        uri.to_file_path()
-            .ok()
-            .map(|path| Self::from_path(&path))
-            .filter(|language| *language != Self::PlainText)
-            .unwrap_or(from_lsp)
     }
 
     pub fn id(self) -> &'static str {
@@ -76,5 +66,82 @@ impl Language {
             Self::Tsx => "tsx",
             Self::Markdown => "markdown",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentLanguage {
+    Unsupported,
+    Supported(SupportedLanguage),
+}
+
+impl DocumentLanguage {
+    pub fn from_language_id(language_id: Option<&str>) -> Self {
+        let Some(language_id) = language_id.filter(|value| !value.trim().is_empty()) else {
+            return Self::Unsupported;
+        };
+        SupportedLanguage::from_language_id(language_id)
+            .map(Self::Supported)
+            .unwrap_or(Self::Unsupported)
+    }
+
+    pub fn from_path(path: &Path) -> Self {
+        SupportedLanguage::from_path(path)
+            .map(Self::Supported)
+            .unwrap_or(Self::Unsupported)
+    }
+
+    pub fn from_lsp_or_uri(language_id: Option<&str>, uri: &Url) -> Self {
+        if language_id.is_some_and(|value| !value.trim().is_empty()) {
+            return Self::from_language_id(language_id);
+        }
+
+        uri.to_file_path()
+            .ok()
+            .map(|path| Self::from_path(&path))
+            .unwrap_or(Self::Unsupported)
+    }
+
+    pub fn supported(self) -> Option<SupportedLanguage> {
+        match self {
+            Self::Unsupported => None,
+            Self::Supported(language) => Some(language),
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Supported(language) => language.id(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_language_ids_are_unsupported() {
+        assert_eq!(
+            DocumentLanguage::from_language_id(Some("ruby")),
+            DocumentLanguage::Unsupported
+        );
+        assert_eq!(
+            DocumentLanguage::from_language_id(None),
+            DocumentLanguage::Unsupported
+        );
+    }
+
+    #[test]
+    fn plaintext_is_explicitly_supported() {
+        assert_eq!(
+            DocumentLanguage::from_language_id(Some("plaintext")),
+            DocumentLanguage::Supported(SupportedLanguage::PlainText)
+        );
+        assert_eq!(
+            DocumentLanguage::from_path(Path::new("notes.txt")),
+            DocumentLanguage::Supported(SupportedLanguage::PlainText)
+        );
     }
 }

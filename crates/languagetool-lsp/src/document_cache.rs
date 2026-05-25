@@ -1,4 +1,5 @@
-use crate::language::Language;
+use crate::language::{DocumentLanguage, SupportedLanguage};
+use crate::languagetool::AnnotatedText;
 use crate::masking::{MaskError, Masker};
 use crate::text_index::TextIndex;
 use std::collections::HashMap;
@@ -7,18 +8,157 @@ use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Url
 
 #[derive(Debug, Clone)]
 pub struct Document {
-    pub uri: Url,
-    pub version: Option<i32>,
-    pub language: Language,
-    pub text: String,
-    pub index: TextIndex,
-    pub mask: Masker,
+    kind: DocumentKind,
+}
+
+#[derive(Debug, Clone)]
+enum DocumentKind {
+    Supported(Box<SupportedDocument>),
+    Unsupported(UnsupportedDocument),
+}
+
+#[derive(Debug, Clone)]
+struct SupportedDocument {
+    uri: Url,
+    version: Option<i32>,
+    language: SupportedLanguage,
+    text: String,
+    index: TextIndex,
+    mask: Masker,
+}
+
+#[derive(Debug, Clone)]
+struct UnsupportedDocument {
+    uri: Url,
+    version: Option<i32>,
+}
+
+pub struct CheckableDocument<'a> {
+    document: &'a SupportedDocument,
+    annotated: AnnotatedText,
+    ignored_ranges: Vec<(usize, usize)>,
+}
+
+impl CheckableDocument<'_> {
+    pub fn uri(&self) -> &Url {
+        &self.document.uri
+    }
+
+    pub fn version(&self) -> Option<i32> {
+        self.document.version
+    }
+
+    pub fn annotated(&self) -> &AnnotatedText {
+        &self.annotated
+    }
+
+    pub fn ignored_ranges(&self) -> &[(usize, usize)] {
+        &self.ignored_ranges
+    }
+
+    pub fn text(&self) -> &str {
+        &self.document.text
+    }
+
+    pub fn index(&self) -> &TextIndex {
+        &self.document.index
+    }
 }
 
 impl Document {
     pub fn new(uri: Url, version: Option<i32>, language_id: Option<String>, text: String) -> Self {
+        let kind = match DocumentLanguage::from_lsp_or_uri(language_id.as_deref(), &uri) {
+            DocumentLanguage::Supported(language) => DocumentKind::Supported(Box::new(
+                SupportedDocument::new(uri, version, language, text),
+            )),
+            DocumentLanguage::Unsupported => {
+                DocumentKind::Unsupported(UnsupportedDocument { uri, version })
+            }
+        };
+        Self { kind }
+    }
+
+    pub fn uri(&self) -> &Url {
+        match &self.kind {
+            DocumentKind::Supported(document) => &document.uri,
+            DocumentKind::Unsupported(document) => &document.uri,
+        }
+    }
+
+    pub fn version(&self) -> Option<i32> {
+        match &self.kind {
+            DocumentKind::Supported(document) => document.version,
+            DocumentKind::Unsupported(document) => document.version,
+        }
+    }
+
+    pub fn checkable(
+        &self,
+        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
+    ) -> Option<CheckableDocument<'_>> {
+        let document = self.supported()?;
+        if !language_enabled(document.language) {
+            return None;
+        }
+
+        let annotated = document.mask.annotated(&document.text);
+        if !annotated.has_text() {
+            return None;
+        }
+
+        Some(CheckableDocument {
+            document,
+            ignored_ranges: document
+                .mask
+                .ignored_ranges(&document.text, &document.index),
+            annotated,
+        })
+    }
+
+    fn supported(&self) -> Option<&SupportedDocument> {
+        match &self.kind {
+            DocumentKind::Supported(document) => Some(document.as_ref()),
+            DocumentKind::Unsupported(_) => None,
+        }
+    }
+
+    fn set_version(&mut self, version: Option<i32>) {
+        match &mut self.kind {
+            DocumentKind::Supported(document) => document.version = version.or(document.version),
+            DocumentKind::Unsupported(document) => document.version = version.or(document.version),
+        }
+    }
+
+    fn set_text(&mut self, text: String) {
+        if let DocumentKind::Supported(document) = &mut self.kind {
+            document.set_text(text);
+        }
+    }
+
+    fn apply_range_change(
+        &mut self,
+        range: tower_lsp::lsp_types::Range,
+        new_text: &str,
+    ) -> Result<bool, MaskError> {
+        match &mut self.kind {
+            DocumentKind::Supported(document) => document.apply_range_change(range, new_text),
+            DocumentKind::Unsupported(_) => Ok(true),
+        }
+    }
+
+    fn from_text_document(document: &TextDocumentItem) -> Self {
+        Self::new(
+            document.uri.clone(),
+            Some(document.version),
+            Some(document.language_id.clone()),
+            document.text.clone(),
+        )
+    }
+}
+
+impl SupportedDocument {
+    fn new(uri: Url, version: Option<i32>, language: SupportedLanguage, text: String) -> Self {
         let index = TextIndex::new(&text);
-        let language = Language::from_lsp_or_uri(language_id.as_deref(), &uri);
         let mask = Masker::new(&text, language);
         Self {
             uri,
@@ -59,15 +199,6 @@ impl Document {
             .apply_edit(&old_text, &self.text, byte_start, byte_end, new_text)?;
         Ok(true)
     }
-
-    fn from_text_document(document: &TextDocumentItem) -> Self {
-        Self::new(
-            document.uri.clone(),
-            Some(document.version),
-            Some(document.language_id.clone()),
-            document.text.clone(),
-        )
-    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -87,7 +218,7 @@ impl DocumentCache {
         self.documents
             .write()
             .expect("document cache poisoned")
-            .entry(document.uri.to_string())
+            .entry(document.uri().to_string())
             .and_modify(|entry| entry.document = document.clone())
             .or_insert(DocumentEntry {
                 document,
@@ -99,7 +230,7 @@ impl DocumentCache {
         let key = uri.to_string();
         let mut documents = self.documents.write().expect("document cache poisoned");
         if let Some(entry) = documents.get_mut(&key) {
-            entry.document.version = version.or(entry.document.version);
+            entry.document.set_version(version);
             entry.document.set_text(text);
         } else {
             documents.insert(
@@ -123,7 +254,7 @@ impl DocumentCache {
             let mut documents = self.documents.write().expect("document cache poisoned");
             if let Some(entry) = documents.get_mut(&key) {
                 if entry.document.apply_range_change(range, &change.text)? {
-                    entry.document.version = version.or(entry.document.version);
+                    entry.document.set_version(version);
                 }
             } else {
                 documents.insert(
@@ -177,7 +308,7 @@ impl DocumentCache {
             .read()
             .expect("document cache poisoned")
             .values()
-            .map(|entry| entry.document.uri.clone())
+            .map(|entry| entry.document.uri().clone())
             .collect()
     }
 }
@@ -187,6 +318,15 @@ mod tests {
     use super::*;
     use indoc::indoc;
     use tower_lsp::lsp_types::{Position, Range};
+
+    fn supported_document(cache: &DocumentCache, uri: &Url) -> SupportedDocument {
+        cache
+            .get(uri)
+            .unwrap()
+            .supported()
+            .expect("document should be supported")
+            .clone()
+    }
 
     #[test]
     fn applies_all_incremental_changes() {
@@ -216,7 +356,7 @@ mod tests {
             )
             .unwrap();
 
-        let document = cache.get(&uri).unwrap();
+        let document = supported_document(&cache, &uri);
         assert_eq!(document.text, "hi zed");
         assert_eq!(document.version, Some(3));
     }
@@ -237,7 +377,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(cache.get(&uri).unwrap().text, "axb");
+        assert_eq!(supported_document(&cache, &uri).text, "axb");
     }
 
     #[test]
@@ -256,7 +396,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let document = cache.get(&uri).unwrap();
+        let document = supported_document(&cache, &uri);
         assert_eq!(document.text, "a😀b");
         assert_eq!(document.version, Some(1));
     }
@@ -264,7 +404,7 @@ mod tests {
     // Verify that document.index always matches TextIndex::new(&document.text) after
     // a sequence of incremental changes.
     fn assert_index_consistent(cache: &DocumentCache, uri: &Url) {
-        let doc = cache.get(uri).unwrap();
+        let doc = supported_document(cache, uri);
         let expected = TextIndex::new(&doc.text);
         assert_eq!(
             doc.index, expected,
@@ -293,7 +433,7 @@ mod tests {
             )
             .unwrap();
         assert_index_consistent(&cache, &uri);
-        assert_eq!(cache.get(&uri).unwrap().text, "hello zed\nfoo bar");
+        assert_eq!(supported_document(&cache, &uri).text, "hello zed\nfoo bar");
 
         // Insert a newline in the middle of the second line.
         cache
@@ -308,7 +448,10 @@ mod tests {
             )
             .unwrap();
         assert_index_consistent(&cache, &uri);
-        assert_eq!(cache.get(&uri).unwrap().text, "hello zed\nfoo\n bar");
+        assert_eq!(
+            supported_document(&cache, &uri).text,
+            "hello zed\nfoo\n bar"
+        );
 
         // Delete the second newline, merging lines 1 and 2.
         cache
@@ -323,7 +466,7 @@ mod tests {
             )
             .unwrap();
         assert_index_consistent(&cache, &uri);
-        assert_eq!(cache.get(&uri).unwrap().text, "hello zed\nfoo bar");
+        assert_eq!(supported_document(&cache, &uri).text, "hello zed\nfoo bar");
     }
 
     #[test]
@@ -346,7 +489,7 @@ mod tests {
             )
             .unwrap();
         assert_index_consistent(&cache, &uri);
-        assert_eq!(cache.get(&uri).unwrap().text, "hi x there");
+        assert_eq!(supported_document(&cache, &uri).text, "hi x there");
 
         // Insert an emoji after existing ASCII — adds a new checkpoint at the right offset.
         cache
@@ -361,7 +504,7 @@ mod tests {
             )
             .unwrap();
         assert_index_consistent(&cache, &uri);
-        assert_eq!(cache.get(&uri).unwrap().text, "hi x😂 there");
+        assert_eq!(supported_document(&cache, &uri).text, "hi x😂 there");
     }
 
     #[test]
@@ -391,7 +534,7 @@ mod tests {
             )
             .unwrap();
 
-        let document = cache.get(&uri).unwrap();
+        let document = supported_document(&cache, &uri);
         let data = document.mask.annotated(&document.text);
         let checked = data
             .annotation
@@ -423,7 +566,44 @@ mod tests {
             )
             .unwrap();
         assert_index_consistent(&cache, &uri);
-        assert_eq!(cache.get(&uri).unwrap().text, "line one\r\nline three");
+        assert_eq!(
+            supported_document(&cache, &uri).text,
+            "line one\r\nline three"
+        );
+    }
+
+    #[test]
+    fn unsupported_document_is_noop_without_cached_text() {
+        let cache = DocumentCache::default();
+        let uri = Url::parse("file:///tmp/test.rb").unwrap();
+        cache.insert(&TextDocumentItem {
+            uri: uri.clone(),
+            language_id: "ruby".to_string(),
+            version: 1,
+            text: "This are a tset.".to_string(),
+        });
+
+        let document = cache.get(&uri).unwrap();
+        assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
+        assert!(document.checkable(|_| true).is_none());
+        assert_eq!(document.version(), Some(1));
+
+        cache
+            .apply_change(
+                &uri,
+                Some(2),
+                TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 0), Position::new(0, 4))),
+                    range_length: None,
+                    text: "That".to_string(),
+                },
+            )
+            .unwrap();
+
+        let document = cache.get(&uri).unwrap();
+        assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
+        assert!(document.checkable(|_| true).is_none());
+        assert_eq!(document.version(), Some(2));
     }
 
     #[test]

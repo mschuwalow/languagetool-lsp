@@ -1,11 +1,10 @@
+use crate::language::SupportedLanguage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tower_lsp::lsp_types::DiagnosticSeverity;
-
-use crate::language::Language;
 
 pub const CONFIG_DIR: &str = ".zed";
 pub const CONFIG_FILE: &str = "languagetool.json";
@@ -187,7 +186,7 @@ impl ClientOptions {
         self.diagnostic_severity.as_lsp()
     }
 
-    pub fn language_enabled(&self, language: &Language) -> bool {
+    pub fn language_enabled(&self, language: &SupportedLanguage) -> bool {
         let language_id = language.id();
 
         if self

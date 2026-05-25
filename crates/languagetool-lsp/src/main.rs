@@ -1,11 +1,10 @@
 use clap::{Parser, Subcommand};
 use languagetool_lsp::config::ClientOptions;
-use languagetool_lsp::language::Language;
+use languagetool_lsp::document_cache::Document;
 use languagetool_lsp::languagetool::LanguageToolClient;
 use languagetool_lsp::lsp::Backend;
-use languagetool_lsp::masking::Masker;
-use languagetool_lsp::text_index::TextIndex;
 use std::path::{Path, PathBuf};
+use tower_lsp::lsp_types::Url;
 use tower_lsp::{LspService, Server};
 
 #[derive(Parser)]
@@ -85,35 +84,50 @@ async fn check(files: Vec<PathBuf>) {
             }
         };
 
-        let language = Language::from_path(&path);
-        let mask = Masker::new(&text, language);
-        let data = mask.annotated(&text);
-        let index = TextIndex::new(&text);
-        let ignored_ranges = mask.ignored_ranges(&text, &index);
+        let uri = match file_uri(&path) {
+            Ok(uri) => uri,
+            Err(err) => {
+                eprintln!("{}: {err}", path.display());
+                had_errors = true;
+                continue;
+            }
+        };
+        let document = Document::new(uri, None, None, text);
+        let Some(checkable_document) =
+            document.checkable(|language| options.language_enabled(&language))
+        else {
+            continue;
+        };
         let mut hits = Vec::new();
 
-        if data.has_text() {
-            match client.check_annotated(&data, &options).await {
-                Ok(response) => {
-                    hits.extend(response.matches.into_iter().filter_map(|item| {
-                        let offset = usize::try_from(item.offset).ok()?;
-                        let length = usize::try_from(item.length).ok()?;
-                        if index
-                            .text_for_utf16_range(&text, offset, offset + length)
-                            .map(|s| s.trim().is_empty())
-                            .unwrap_or(true)
-                            || intersects_ignored_ranges(offset, offset + length, &ignored_ranges)
-                        {
-                            None
-                        } else {
-                            Some((offset, length, item.message))
-                        }
-                    }));
-                }
-                Err(err) => {
-                    eprintln!("{}: {err}", path.display());
-                    had_errors = true;
-                }
+        match client
+            .check_annotated(checkable_document.annotated(), &options)
+            .await
+        {
+            Ok(response) => {
+                hits.extend(response.matches.into_iter().filter_map(|item| {
+                    let offset = usize::try_from(item.offset).ok()?;
+                    let length = usize::try_from(item.length).ok()?;
+                    if checkable_document
+                        .index()
+                        .text_for_utf16_range(checkable_document.text(), offset, offset + length)
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true)
+                        || intersects_ignored_ranges(
+                            offset,
+                            offset + length,
+                            checkable_document.ignored_ranges(),
+                        )
+                    {
+                        None
+                    } else {
+                        Some((offset, length, item.message))
+                    }
+                }));
+            }
+            Err(err) => {
+                eprintln!("{}: {err}", path.display());
+                had_errors = true;
             }
         }
 
@@ -128,6 +142,18 @@ async fn check(files: Vec<PathBuf>) {
     if had_errors {
         std::process::exit(1);
     }
+}
+
+fn file_uri(path: &Path) -> Result<Url, String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?
+            .join(path)
+    };
+
+    Url::from_file_path(&path).map_err(|()| "failed to convert path to file URI".to_string())
 }
 
 fn intersects_ignored_ranges(start: usize, end: usize, ignored_ranges: &[(usize, usize)]) -> bool {
