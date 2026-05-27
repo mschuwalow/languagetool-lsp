@@ -1,8 +1,7 @@
 use crate::language::SupportedLanguage;
 use crate::languagetool::{AnnotatedText, Annotation};
 use crate::text_index::TextIndex;
-use thiserror::Error;
-use tree_sitter::{InputEdit, Language as TreeSitterLanguage, Node, Parser, Point, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 use tree_sitter_md_025::{MarkdownParser, MarkdownTree};
 
 /// Maintains parser-backed masking state for a document and produces checkable text ranges.
@@ -11,30 +10,9 @@ pub struct Masker {
     parsed: ParsedMask,
 }
 
-#[derive(Debug, Error)]
-pub enum MaskError {
-    #[error("failed to parse {language:?} mask after incremental edit and full reparse")]
-    ParseAfterEdit { language: SupportedLanguage },
-}
-
-#[derive(Debug, Clone)]
-enum ParsedMask {
-    Rust(Tree),
-    Scala(Tree),
-    Nix(Tree),
-    Html(Tree),
-    Java(Tree),
-    Python(Tree),
-    Javascript(Tree),
-    Typescript(Tree),
-    Tsx(Tree),
-    Markdown(MarkdownTree),
-    PlainText,
-}
-
 impl Masker {
     pub fn new(text: &str, language: SupportedLanguage) -> Self {
-        let parsed = ParsedMask::parse(language, text).unwrap_or(ParsedMask::PlainText);
+        let parsed = ParsedMask::parse(language, text);
         Self { parsed }
     }
 
@@ -45,7 +23,7 @@ impl Masker {
         byte_start: usize,
         byte_end: usize,
         new_text: &str,
-    ) -> Result<(), MaskError> {
+    ) {
         let start_position = point_for_byte(old_text, byte_start);
         let old_end_position = point_for_byte(old_text, byte_end);
         let new_end_byte = byte_start + new_text.len();
@@ -59,19 +37,7 @@ impl Masker {
             new_end_position,
         };
 
-        self.parsed.edit(&edit);
-        if let Some(parsed) = self.parsed.reparse_incremental(text) {
-            self.parsed = parsed;
-            return Ok(());
-        } else if let Some(parsed) = self.parsed.parse_fresh(text) {
-            self.parsed = parsed;
-            return Ok(());
-        }
-        if let Some(language) = self.parsed.language() {
-            Err(MaskError::ParseAfterEdit { language })
-        } else {
-            Ok(())
-        }
+        self.parsed.apply_edit(&edit, text);
     }
 
     pub fn annotated(&self, text: &str) -> AnnotatedText {
@@ -81,7 +47,7 @@ impl Masker {
                 MaskRanges::Keep(mut ranges) => annotations_from_keep_ranges(text, &mut ranges),
                 MaskRanges::Skip(mut ranges) => annotations_from_skip_ranges(text, &mut ranges),
             })
-            .unwrap_or_else(|| match self.parsed {
+            .unwrap_or_else(|| match &self.parsed {
                 ParsedMask::PlainText => vec![Annotation::text(text.to_string())],
                 _ => Vec::new(),
             });
@@ -104,6 +70,11 @@ impl Masker {
                 collect_html_skip_ranges(tree.root_node(), &mut ranges);
                 Some(MaskRanges::Skip(ranges))
             }
+            ParsedMask::CommentTree { language, tree } => {
+                let mut ranges = Vec::new();
+                collect_comment_nodes(text, *language, tree.root_node(), &mut ranges);
+                Some(MaskRanges::Keep(ranges))
+            }
             ParsedMask::Markdown(tree) => {
                 let mut ranges = Vec::new();
                 collect_markdown_skip_ranges(tree.block_tree().root_node(), &mut ranges);
@@ -113,161 +84,145 @@ impl Masker {
                 Some(MaskRanges::Skip(ranges))
             }
             ParsedMask::PlainText => None,
-            parsed => {
-                let mut ranges = Vec::new();
-                let (language, tree) = parsed.comment_tree()?;
-                collect_comment_nodes(text, language, tree.root_node(), &mut ranges);
-                Some(MaskRanges::Keep(ranges))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentTreeLanguage {
+    Rust,
+    Scala,
+    Nix,
+    Java,
+    Python,
+    Javascript,
+    Typescript,
+    Tsx,
+}
+
+impl From<CommentTreeLanguage> for tree_sitter::Language {
+    fn from(value: CommentTreeLanguage) -> Self {
+        match value {
+            CommentTreeLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
+            CommentTreeLanguage::Scala => tree_sitter_scala::LANGUAGE.into(),
+            CommentTreeLanguage::Nix => tree_sitter_nix::LANGUAGE.into(),
+            CommentTreeLanguage::Java => tree_sitter_java::LANGUAGE.into(),
+            CommentTreeLanguage::Python => tree_sitter_python::LANGUAGE.into(),
+            CommentTreeLanguage::Javascript => tree_sitter_javascript::LANGUAGE.into(),
+            CommentTreeLanguage::Typescript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            CommentTreeLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        }
+    }
+}
+
+impl CommentTreeLanguage {
+    fn from_supported_language(value: SupportedLanguage) -> Self {
+        match value {
+            SupportedLanguage::Rust => Self::Rust,
+            SupportedLanguage::Scala => Self::Scala,
+            SupportedLanguage::Nix => Self::Nix,
+            SupportedLanguage::Java => Self::Java,
+            SupportedLanguage::Python => Self::Python,
+            SupportedLanguage::Javascript => Self::Javascript,
+            SupportedLanguage::Typescript => Self::Typescript,
+            SupportedLanguage::Tsx => Self::Tsx,
+            SupportedLanguage::PlainText
+            | SupportedLanguage::Markdown
+            | SupportedLanguage::Html => {
+                unreachable!("language is not comment-masked with Tree-sitter")
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum ParsedMask {
+    CommentTree {
+        language: CommentTreeLanguage,
+        tree: Tree,
+    },
+    Html(Tree),
+    Markdown(MarkdownTree),
+    PlainText,
 }
 
 impl ParsedMask {
-    fn edit(&mut self, edit: &InputEdit) {
+    fn parse(language: SupportedLanguage, text: &str) -> Self {
+        match language {
+            SupportedLanguage::PlainText => Self::PlainText,
+            SupportedLanguage::Markdown => {
+                let mut parser = MarkdownParser::default();
+                Self::Markdown(parse_markdown_tree(&mut parser, text, None))
+            }
+            SupportedLanguage::Html => {
+                let mut parser = html_parser();
+                Self::Html(parse_tree_sitter_tree(&mut parser, text, None))
+            }
+            tree_sitter_compatible_language => {
+                let comment_language =
+                    CommentTreeLanguage::from_supported_language(tree_sitter_compatible_language);
+                let mut parser = comment_tree_parser(comment_language);
+                let tree = parse_tree_sitter_tree(&mut parser, text, None);
+                Self::CommentTree {
+                    tree,
+                    language: comment_language,
+                }
+            }
+        }
+    }
+
+    fn apply_edit(&mut self, edit: &InputEdit, text: &str) {
         match self {
-            Self::Rust(tree)
-            | Self::Scala(tree)
-            | Self::Nix(tree)
-            | Self::Html(tree)
-            | Self::Java(tree)
-            | Self::Python(tree)
-            | Self::Javascript(tree)
-            | Self::Typescript(tree)
-            | Self::Tsx(tree) => tree.edit(edit),
-            Self::Markdown(tree) => tree.edit(edit),
+            Self::Markdown(tree) => {
+                tree.edit(edit);
+                let mut parser = MarkdownParser::default();
+                *tree = parse_markdown_tree(&mut parser, text, Some(tree));
+            }
+            Self::Html(tree) => {
+                tree.edit(edit);
+                let mut parser = html_parser();
+                *tree = parse_tree_sitter_tree(&mut parser, text, Some(tree));
+            }
+            Self::CommentTree { tree, language } => {
+                tree.edit(edit);
+                let mut parser = comment_tree_parser(*language);
+                *tree = parse_tree_sitter_tree(&mut parser, text, Some(tree));
+            }
             Self::PlainText => {}
         }
     }
-
-    fn parse(language: SupportedLanguage, text: &str) -> Option<Self> {
-        match language {
-            SupportedLanguage::PlainText => Some(Self::PlainText),
-            SupportedLanguage::Markdown => {
-                let mut parser = MarkdownParser::default();
-                parser.parse(text.as_bytes(), None).map(Self::Markdown)
-            }
-            _ => {
-                let mut parser = parser(language);
-                let tree = parser.parse(text, None)?;
-                Some(match language {
-                    SupportedLanguage::Rust => Self::Rust(tree),
-                    SupportedLanguage::Scala => Self::Scala(tree),
-                    SupportedLanguage::Nix => Self::Nix(tree),
-                    SupportedLanguage::Html => Self::Html(tree),
-                    SupportedLanguage::Java => Self::Java(tree),
-                    SupportedLanguage::Python => Self::Python(tree),
-                    SupportedLanguage::Javascript => Self::Javascript(tree),
-                    SupportedLanguage::Typescript => Self::Typescript(tree),
-                    SupportedLanguage::Tsx => Self::Tsx(tree),
-                    SupportedLanguage::Markdown | SupportedLanguage::PlainText => unreachable!(),
-                })
-            }
-        }
-    }
-
-    fn reparse_incremental(&self, text: &str) -> Option<Self> {
-        match self {
-            Self::Rust(tree) => reparse_tree(SupportedLanguage::Rust, text, tree).map(Self::Rust),
-            Self::Scala(tree) => {
-                reparse_tree(SupportedLanguage::Scala, text, tree).map(Self::Scala)
-            }
-            Self::Nix(tree) => reparse_tree(SupportedLanguage::Nix, text, tree).map(Self::Nix),
-            Self::Html(tree) => reparse_tree(SupportedLanguage::Html, text, tree).map(Self::Html),
-            Self::Java(tree) => reparse_tree(SupportedLanguage::Java, text, tree).map(Self::Java),
-            Self::Python(tree) => {
-                reparse_tree(SupportedLanguage::Python, text, tree).map(Self::Python)
-            }
-            Self::Javascript(tree) => {
-                reparse_tree(SupportedLanguage::Javascript, text, tree).map(Self::Javascript)
-            }
-            Self::Typescript(tree) => {
-                reparse_tree(SupportedLanguage::Typescript, text, tree).map(Self::Typescript)
-            }
-            Self::Tsx(tree) => reparse_tree(SupportedLanguage::Tsx, text, tree).map(Self::Tsx),
-            Self::Markdown(tree) => {
-                let mut parser = MarkdownParser::default();
-                parser
-                    .parse(text.as_bytes(), Some(tree))
-                    .map(Self::Markdown)
-            }
-            Self::PlainText => None,
-        }
-    }
-
-    fn parse_fresh(&self, text: &str) -> Option<Self> {
-        match self {
-            Self::Rust(_) => Self::parse(SupportedLanguage::Rust, text),
-            Self::Scala(_) => Self::parse(SupportedLanguage::Scala, text),
-            Self::Nix(_) => Self::parse(SupportedLanguage::Nix, text),
-            Self::Html(_) => Self::parse(SupportedLanguage::Html, text),
-            Self::Java(_) => Self::parse(SupportedLanguage::Java, text),
-            Self::Python(_) => Self::parse(SupportedLanguage::Python, text),
-            Self::Javascript(_) => Self::parse(SupportedLanguage::Javascript, text),
-            Self::Typescript(_) => Self::parse(SupportedLanguage::Typescript, text),
-            Self::Tsx(_) => Self::parse(SupportedLanguage::Tsx, text),
-            Self::Markdown(_) => Self::parse(SupportedLanguage::Markdown, text),
-            Self::PlainText => None,
-        }
-    }
-
-    fn language(&self) -> Option<SupportedLanguage> {
-        match self {
-            Self::Rust(_) => Some(SupportedLanguage::Rust),
-            Self::Scala(_) => Some(SupportedLanguage::Scala),
-            Self::Nix(_) => Some(SupportedLanguage::Nix),
-            Self::Html(_) => Some(SupportedLanguage::Html),
-            Self::Java(_) => Some(SupportedLanguage::Java),
-            Self::Python(_) => Some(SupportedLanguage::Python),
-            Self::Javascript(_) => Some(SupportedLanguage::Javascript),
-            Self::Typescript(_) => Some(SupportedLanguage::Typescript),
-            Self::Tsx(_) => Some(SupportedLanguage::Tsx),
-            Self::Markdown(_) => Some(SupportedLanguage::Markdown),
-            Self::PlainText => None,
-        }
-    }
-
-    fn comment_tree(&self) -> Option<(SupportedLanguage, &Tree)> {
-        match self {
-            Self::Rust(tree) => Some((SupportedLanguage::Rust, tree)),
-            Self::Scala(tree) => Some((SupportedLanguage::Scala, tree)),
-            Self::Nix(tree) => Some((SupportedLanguage::Nix, tree)),
-            Self::Html(_) => None,
-            Self::Java(tree) => Some((SupportedLanguage::Java, tree)),
-            Self::Python(tree) => Some((SupportedLanguage::Python, tree)),
-            Self::Javascript(tree) => Some((SupportedLanguage::Javascript, tree)),
-            Self::Typescript(tree) => Some((SupportedLanguage::Typescript, tree)),
-            Self::Tsx(tree) => Some((SupportedLanguage::Tsx, tree)),
-            Self::Markdown(_) | Self::PlainText => None,
-        }
-    }
 }
 
-fn tree_sitter_language(language: SupportedLanguage) -> TreeSitterLanguage {
-    match language {
-        SupportedLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
-        SupportedLanguage::Scala => tree_sitter_scala::LANGUAGE.into(),
-        SupportedLanguage::Nix => tree_sitter_nix::LANGUAGE.into(),
-        SupportedLanguage::Html => tree_sitter_html::LANGUAGE.into(),
-        SupportedLanguage::Java => tree_sitter_java::LANGUAGE.into(),
-        SupportedLanguage::Python => tree_sitter_python::LANGUAGE.into(),
-        SupportedLanguage::Javascript => tree_sitter_javascript::LANGUAGE.into(),
-        SupportedLanguage::Typescript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        SupportedLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        SupportedLanguage::Markdown | SupportedLanguage::PlainText => unreachable!(),
-    }
+fn parse_markdown_tree(
+    parser: &mut MarkdownParser,
+    text: &str,
+    old_tree: Option<&MarkdownTree>,
+) -> MarkdownTree {
+    parser
+        .parse(text.as_bytes(), old_tree)
+        .expect("Tree-sitter parsing should not fail without timeout or cancellation")
 }
 
-fn parser(language: SupportedLanguage) -> Parser {
+fn parse_tree_sitter_tree(parser: &mut Parser, text: &str, old_tree: Option<&Tree>) -> Tree {
+    parser
+        .parse(text, old_tree)
+        .expect("Tree-sitter parsing should not fail without timeout or cancellation")
+}
+
+fn comment_tree_parser(language: CommentTreeLanguage) -> Parser {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_language(language))
+        .set_language(&language.into())
         .expect("bundled Tree-sitter grammar should load");
     parser
 }
 
-fn reparse_tree(language: SupportedLanguage, text: &str, old_tree: &Tree) -> Option<Tree> {
-    parser(language).parse(text, Some(old_tree))
+fn html_parser() -> Parser {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_html::LANGUAGE.into())
+        .expect("bundled Tree-sitter grammar should load");
+    parser
 }
 
 fn strip_slash_comment(
@@ -295,21 +250,18 @@ fn strip_slash_comment(
 }
 
 fn strip_comment_markers(
-    language: SupportedLanguage,
+    language: CommentTreeLanguage,
     source: &str,
     node: Node<'_>,
 ) -> Option<(usize, usize)> {
     match language {
-        SupportedLanguage::Rust => strip_slash_comment(source, node, true),
-        SupportedLanguage::Scala
-        | SupportedLanguage::Java
-        | SupportedLanguage::Javascript
-        | SupportedLanguage::Typescript
-        | SupportedLanguage::Tsx => strip_slash_comment(source, node, false),
-        SupportedLanguage::Nix | SupportedLanguage::Python => strip_hash_comment(source, node),
-        SupportedLanguage::Html | SupportedLanguage::Markdown | SupportedLanguage::PlainText => {
-            None
-        }
+        CommentTreeLanguage::Rust => strip_slash_comment(source, node, true),
+        CommentTreeLanguage::Scala
+        | CommentTreeLanguage::Java
+        | CommentTreeLanguage::Javascript
+        | CommentTreeLanguage::Typescript
+        | CommentTreeLanguage::Tsx => strip_slash_comment(source, node, false),
+        CommentTreeLanguage::Nix | CommentTreeLanguage::Python => strip_hash_comment(source, node),
     }
 }
 
@@ -333,7 +285,7 @@ enum MaskRanges {
 
 fn collect_comment_nodes(
     text: &str,
-    language: SupportedLanguage,
+    language: CommentTreeLanguage,
     node: Node<'_>,
     keep_ranges: &mut Vec<Range>,
 ) {
@@ -356,7 +308,7 @@ fn is_comment_node(node: Node<'_>) -> bool {
 
 fn comment_content_range(
     source: &str,
-    language: SupportedLanguage,
+    language: CommentTreeLanguage,
     node: Node<'_>,
 ) -> Option<Range> {
     if let Some(doc) = node.child_by_field_name("doc") {
@@ -739,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_sitter_comment_masking_supports_explicit_languages() {
+    fn comment_tree_masking_supports_explicit_languages() {
         let cases = [
             (
                 "scala",

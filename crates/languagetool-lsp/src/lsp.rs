@@ -433,12 +433,8 @@ impl LanguageServer for Backend {
             params.text_document.version
         );
         for change in params.content_changes {
-            if let Err(err) =
-                self.documents
-                    .apply_change(&uri, Some(params.text_document.version), change)
-            {
-                log::warn!("Failed to update document mask for {uri}: {err}");
-            }
+            self.documents
+                .apply_change(&uri, Some(params.text_document.version), change);
         }
         if had_changes && self.options().check_while_typing {
             self.schedule_check(uri);

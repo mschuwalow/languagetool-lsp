@@ -1,6 +1,6 @@
 use crate::language::{DocumentLanguage, SupportedLanguage};
 use crate::languagetool::AnnotatedText;
-use crate::masking::{MaskError, Masker};
+use crate::masking::Masker;
 use crate::text_index::TextIndex;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -195,11 +195,7 @@ impl Document {
         }
     }
 
-    fn apply_range_change(
-        &mut self,
-        range: tower_lsp::lsp_types::Range,
-        new_text: &str,
-    ) -> Result<bool, MaskError> {
+    fn apply_range_change(&mut self, range: tower_lsp::lsp_types::Range, new_text: &str) -> bool {
         match &mut self.kind {
             DocumentKind::Supported(document) => document.apply_range_change(range, new_text),
             DocumentKind::Unsupported(document) => {
@@ -208,7 +204,7 @@ impl Document {
                     document.uri,
                     document.version
                 );
-                Ok(true)
+                true
             }
         }
     }
@@ -243,11 +239,7 @@ impl SupportedDocument {
         self.text = text;
     }
 
-    fn apply_range_change(
-        &mut self,
-        range: tower_lsp::lsp_types::Range,
-        new_text: &str,
-    ) -> Result<bool, MaskError> {
+    fn apply_range_change(&mut self, range: tower_lsp::lsp_types::Range, new_text: &str) -> bool {
         let Some((byte_start, byte_end, utf16_start, utf16_end)) = self.index.edit_offsets(range)
         else {
             log::debug!(
@@ -255,7 +247,7 @@ impl SupportedDocument {
                 self.uri,
                 range
             );
-            return Ok(false);
+            return false;
         };
         log::debug!(
             "Applying incremental change to {} bytes={byte_start}..{byte_end} utf16={utf16_start}..{utf16_end} replacement_bytes={}",
@@ -273,8 +265,8 @@ impl SupportedDocument {
             new_text,
         );
         self.mask
-            .apply_edit(&old_text, &self.text, byte_start, byte_end, new_text)?;
-        Ok(true)
+            .apply_edit(&old_text, &self.text, byte_start, byte_end, new_text);
+        true
     }
 }
 
@@ -334,7 +326,7 @@ impl DocumentCache {
         uri: &Url,
         version: Option<i32>,
         change: TextDocumentContentChangeEvent,
-    ) -> Result<(), MaskError> {
+    ) {
         if let Some(range) = change.range {
             log::debug!(
                 "Applying ranged document change for {uri} version={version:?} range={range:?} replacement_bytes={}",
@@ -343,7 +335,7 @@ impl DocumentCache {
             let key = uri.to_string();
             let mut documents = self.documents.write().expect("document cache poisoned");
             if let Some(entry) = documents.get_mut(&key) {
-                if entry.document.apply_range_change(range, &change.text)? {
+                if entry.document.apply_range_change(range, &change.text) {
                     entry.document.set_version(version);
                 } else {
                     log::debug!("Ranged document change for {uri} was ignored");
@@ -365,7 +357,6 @@ impl DocumentCache {
             );
             self.update(uri, version, change.text);
         }
-        Ok(())
     }
 
     pub fn remove(&self, uri: &Url) {
@@ -431,28 +422,24 @@ mod tests {
         let cache = DocumentCache::default();
         let uri = Url::parse("file:///tmp/test.txt").unwrap();
         cache.update(&uri, Some(1), "hello world".to_string());
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 6), Position::new(0, 11))),
-                    range_length: None,
-                    text: "zed".to_string(),
-                },
-            )
-            .unwrap();
-        cache
-            .apply_change(
-                &uri,
-                Some(3),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 0), Position::new(0, 5))),
-                    range_length: None,
-                    text: "hi".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 6), Position::new(0, 11))),
+                range_length: None,
+                text: "zed".to_string(),
+            },
+        );
+        cache.apply_change(
+            &uri,
+            Some(3),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 5))),
+                range_length: None,
+                text: "hi".to_string(),
+            },
+        );
 
         let document = supported_document(&cache, &uri);
         assert_eq!(document.text, "hi zed");
@@ -464,17 +451,15 @@ mod tests {
         let cache = DocumentCache::default();
         let uri = Url::parse("file:///tmp/test.txt").unwrap();
         cache.update(&uri, Some(1), "a😀b".to_string());
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 1), Position::new(0, 3))),
-                    range_length: None,
-                    text: "x".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 1), Position::new(0, 3))),
+                range_length: None,
+                text: "x".to_string(),
+            },
+        );
         assert_eq!(supported_document(&cache, &uri).text, "axb");
     }
 
@@ -483,17 +468,15 @@ mod tests {
         let cache = DocumentCache::default();
         let uri = Url::parse("file:///tmp/test.txt").unwrap();
         cache.update(&uri, Some(1), "a😀b".to_string());
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 2), Position::new(0, 2))),
-                    range_length: None,
-                    text: "x".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 2), Position::new(0, 2))),
+                range_length: None,
+                text: "x".to_string(),
+            },
+        );
         let document = supported_document(&cache, &uri);
         assert_eq!(document.text, "a😀b");
         assert_eq!(document.version, Some(1));
@@ -519,32 +502,28 @@ mod tests {
         assert_index_consistent(&cache, &uri);
 
         // Replace word on first line.
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 6), Position::new(0, 11))),
-                    range_length: None,
-                    text: "zed".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 6), Position::new(0, 11))),
+                range_length: None,
+                text: "zed".to_string(),
+            },
+        );
         assert_index_consistent(&cache, &uri);
         assert_eq!(supported_document(&cache, &uri).text, "hello zed\nfoo bar");
 
         // Insert a newline in the middle of the second line.
-        cache
-            .apply_change(
-                &uri,
-                Some(3),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(1, 3), Position::new(1, 3))),
-                    range_length: None,
-                    text: "\n".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(3),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 3), Position::new(1, 3))),
+                range_length: None,
+                text: "\n".to_string(),
+            },
+        );
         assert_index_consistent(&cache, &uri);
         assert_eq!(
             supported_document(&cache, &uri).text,
@@ -552,17 +531,15 @@ mod tests {
         );
 
         // Delete the second newline, merging lines 1 and 2.
-        cache
-            .apply_change(
-                &uri,
-                Some(4),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(1, 3), Position::new(2, 0))),
-                    range_length: None,
-                    text: String::new(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(4),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 3), Position::new(2, 0))),
+                range_length: None,
+                text: String::new(),
+            },
+        );
         assert_index_consistent(&cache, &uri);
         assert_eq!(supported_document(&cache, &uri).text, "hello zed\nfoo bar");
     }
@@ -575,32 +552,28 @@ mod tests {
         assert_index_consistent(&cache, &uri);
 
         // Replace the emoji with ASCII — removes the checkpoint.
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 3), Position::new(0, 5))),
-                    range_length: None,
-                    text: "x".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 3), Position::new(0, 5))),
+                range_length: None,
+                text: "x".to_string(),
+            },
+        );
         assert_index_consistent(&cache, &uri);
         assert_eq!(supported_document(&cache, &uri).text, "hi x there");
 
         // Insert an emoji after existing ASCII — adds a new checkpoint at the right offset.
-        cache
-            .apply_change(
-                &uri,
-                Some(3),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 4), Position::new(0, 4))),
-                    range_length: None,
-                    text: "😂".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(3),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 4), Position::new(0, 4))),
+                range_length: None,
+                text: "😂".to_string(),
+            },
+        );
         assert_index_consistent(&cache, &uri);
         assert_eq!(supported_document(&cache, &uri).text, "hi x😂 there");
     }
@@ -620,17 +593,15 @@ mod tests {
             .to_string(),
         });
 
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(1, 12), Position::new(1, 15))),
-                    range_length: None,
-                    text: "new".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 12), Position::new(1, 15))),
+                range_length: None,
+                text: "new".to_string(),
+            },
+        );
 
         let document = supported_document(&cache, &uri);
         let data = document.mask.annotated(&document.text);
@@ -652,17 +623,15 @@ mod tests {
         assert_index_consistent(&cache, &uri);
 
         // Edit on the second line using positions from the CRLF-aware index.
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(1, 5), Position::new(1, 8))),
-                    range_length: None,
-                    text: "three".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 5), Position::new(1, 8))),
+                range_length: None,
+                text: "three".to_string(),
+            },
+        );
         assert_index_consistent(&cache, &uri);
         assert_eq!(
             supported_document(&cache, &uri).text,
@@ -686,17 +655,15 @@ mod tests {
         assert!(document.checkable(|_| true).is_none());
         assert_eq!(document.version(), Some(1));
 
-        cache
-            .apply_change(
-                &uri,
-                Some(2),
-                TextDocumentContentChangeEvent {
-                    range: Some(Range::new(Position::new(0, 0), Position::new(0, 4))),
-                    range_length: None,
-                    text: "That".to_string(),
-                },
-            )
-            .unwrap();
+        cache.apply_change(
+            &uri,
+            Some(2),
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 4))),
+                range_length: None,
+                text: "That".to_string(),
+            },
+        );
 
         let document = cache.get(&uri).unwrap();
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
