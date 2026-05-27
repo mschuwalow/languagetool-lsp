@@ -70,7 +70,8 @@ impl TestContext {
     async fn initialize_with_options(&mut self, extra_options: Value) -> Value {
         let root_uri = self.root_uri();
         let mut initialization_options = json!({
-            "backend": { "type": "local", "url": "http://localhost:8081" },
+            "backend": "local",
+            "backendUrl": "http://localhost:8081",
             "language": "en-US",
             "checkOnOpen": true,
             "checkOnSave": true,
@@ -665,7 +666,8 @@ async fn check_failure_clears_stale_diagnostics() {
     });
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
-        "backend": { "type": "local", "url": server.base_url() }
+        "backend": "local",
+        "backendUrl": server.base_url()
     }))
     .await;
     let uri = ctx.doc_uri("document.txt");
@@ -681,7 +683,8 @@ async fn check_failure_clears_stale_diagnostics() {
         "workspace/didChangeConfiguration",
         json!({
             "settings": {
-                "backend": { "type": "local", "url": format!("{}/missing", server.base_url()) },
+                "backend": "local",
+                "backendUrl": format!("{}/missing", server.base_url()),
                 "language": "en-US",
                 "checkOnOpen": true,
                 "checkOnSave": true,
@@ -745,6 +748,70 @@ async fn execute_command_uses_configured_project_config_path() {
         .expect("ignore command should write configured project config");
     let config: Value = serde_json::from_str(&config).expect("project config should be JSON");
     assert_eq!(config["ignored_words"], json!(["tset"]));
+}
+
+#[tokio::test]
+async fn partial_configuration_change_preserves_existing_options() {
+    let mut ctx = TestContext::new();
+    ctx.initialize_with_options(json!({
+        "projectConfigPath": ".idea/languagetool.json"
+    }))
+    .await;
+
+    ctx.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "debounceMs": 100 } }),
+    )
+    .await;
+    let result = ctx
+        .request(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+
+    assert_eq!(result, Value::Null);
+    assert!(!ctx.project_config_path().exists());
+    assert!(ctx
+        .workspace
+        .path()
+        .join(".idea/languagetool.json")
+        .exists());
+}
+
+#[tokio::test]
+async fn invalid_configuration_change_keeps_previous_options() {
+    let mut ctx = TestContext::new();
+    ctx.initialize_with_options(json!({
+        "projectConfigPath": ".idea/languagetool.json"
+    }))
+    .await;
+
+    ctx.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "checkOnSave": "not a bool" } }),
+    )
+    .await;
+    let result = ctx
+        .request(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+
+    assert_eq!(result, Value::Null);
+    assert!(!ctx.project_config_path().exists());
+    assert!(ctx
+        .workspace
+        .path()
+        .join(".idea/languagetool.json")
+        .exists());
 }
 
 #[tokio::test]

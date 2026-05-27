@@ -210,27 +210,23 @@ impl TextIndex {
     pub fn edit_offsets(&self, range: Range) -> Option<(usize, usize, usize, usize)> {
         let utf16_start = self.utf16_offset_for_lsp_position(range.start)?;
         let utf16_end = self.utf16_offset_for_lsp_position(range.end)?;
-        let (utf16_lo, utf16_hi) = if utf16_start <= utf16_end {
-            (utf16_start, utf16_end)
-        } else {
-            (utf16_end, utf16_start)
-        };
-        let byte_lo = self.byte_offset_for_utf16(utf16_lo)?;
-        let byte_hi = self.byte_offset_for_utf16(utf16_hi)?;
-        Some((byte_lo, byte_hi, utf16_lo, utf16_hi))
+        if utf16_start > utf16_end {
+            return None;
+        }
+        let byte_start = self.byte_offset_for_utf16(utf16_start)?;
+        let byte_end = self.byte_offset_for_utf16(utf16_end)?;
+        Some((byte_start, byte_end, utf16_start, utf16_end))
     }
 
     fn utf16_offset_for_lsp_position(&self, position: Position) -> Option<usize> {
         let line = position.line as usize;
         if line >= self.line_starts_utf16.len() {
-            if line == self.line_starts_utf16.len() && position.character == 0 {
-                return Some(self.total_utf16);
-            }
             return None;
         }
         let line_start = self.line_starts_utf16[line];
         let line_end = self.line_ends_utf16[line];
-        Some((line_start + position.character as usize).min(line_end))
+        let offset = line_start + position.character as usize;
+        (offset <= line_end).then_some(offset)
     }
 
     fn line_for_utf16_offset(&self, utf16_offset: usize) -> usize {
@@ -403,15 +399,24 @@ mod tests {
     }
 
     #[test]
-    fn clamps_lsp_positions_to_line_end() {
+    fn rejects_lsp_positions_past_line_end() {
         let index = TextIndex::new("a\nb");
         assert_eq!(
             index.edit_offsets(Range::new(Position::new(0, 2), Position::new(0, 2))),
-            Some((1, 1, 1, 1))
+            None
         );
         assert_eq!(
             index.edit_offsets(Range::new(Position::new(1, 99), Position::new(1, 99))),
-            Some((3, 3, 3, 3))
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_reversed_lsp_ranges() {
+        let index = TextIndex::new("abc");
+        assert_eq!(
+            index.edit_offsets(Range::new(Position::new(0, 2), Position::new(0, 1))),
+            None
         );
     }
 
@@ -624,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn lsp_positions_clamp_to_each_line_end_across_line_endings() {
+    fn lsp_positions_past_line_end_are_invalid_across_line_endings() {
         for text in boundary_corpus() {
             let index = TextIndex::new(text);
             for line in 0..index.line_starts_utf16.len() {
@@ -633,9 +638,7 @@ mod tests {
                 let overlong = Position::new(line as u32, (line_end - line_start + 100) as u32);
                 assert_eq!(
                     index.edit_offsets(Range::new(overlong, overlong)),
-                    index
-                        .byte_offset_for_utf16(line_end)
-                        .map(|byte| (byte, byte, line_end, line_end)),
+                    None,
                     "text={text:?} line={line}"
                 );
             }

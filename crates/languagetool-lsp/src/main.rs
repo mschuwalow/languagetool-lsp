@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use languagetool_lsp::config::ClientOptions;
+use languagetool_lsp::config::{ClientOptions, ProjectConfig};
 use languagetool_lsp::document::Document;
 use languagetool_lsp::languagetool::LanguageToolClient;
 use languagetool_lsp::lsp::Backend;
@@ -37,8 +37,8 @@ async fn main() {
 
     match cli.command {
         Commands::Serve => serve(root).await,
-        Commands::Health => health().await,
-        Commands::Check { files } => check(files).await,
+        Commands::Health => health(root).await,
+        Commands::Check { files } => check(root, files).await,
     }
 }
 
@@ -50,9 +50,14 @@ async fn serve(root: &Path) {
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
-async fn health() {
-    log::info!("Checking LanguageTool health");
+fn cli_options(root: &Path) -> ClientOptions {
     let options = ClientOptions::default();
+    ProjectConfig::load(&options.project_config_path(root)).merged_options(&options)
+}
+
+async fn health(root: &Path) {
+    log::info!("Checking LanguageTool health");
+    let options = cli_options(root);
     let client = LanguageToolClient::new();
     match client.check("This are a tset.", &options).await {
         Ok(response) => {
@@ -70,8 +75,8 @@ async fn health() {
     }
 }
 
-async fn check(files: Vec<PathBuf>) {
-    let options = ClientOptions::default();
+async fn check(root: &Path, files: Vec<PathBuf>) {
+    let options = cli_options(root);
     let client = LanguageToolClient::new();
     let mut had_errors = false;
     log::info!("Checking {} file(s) with LanguageTool", files.len());
@@ -130,11 +135,13 @@ async fn check(files: Vec<PathBuf>) {
                 hits.extend(response.matches.into_iter().filter_map(|item| {
                     let offset = usize::try_from(item.offset).ok()?;
                     let length = usize::try_from(item.length).ok()?;
-                    if checkable_document
-                        .index()
-                        .text_for_utf16_range(checkable_document.text(), offset, offset + length)
-                        .map(|s| s.trim().is_empty())
-                        .unwrap_or(true)
+                    let matched_text = checkable_document.index().text_for_utf16_range(
+                        checkable_document.text(),
+                        offset,
+                        offset + length,
+                    )?;
+                    if matched_text.trim().is_empty()
+                        || options.is_ignored_word(matched_text)
                         || intersects_ignored_ranges(
                             offset,
                             offset + length,

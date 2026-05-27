@@ -6,4 +6,5 @@ pub mod language;
 pub mod languagetool;
 pub mod lsp;
 pub mod masking;
+pub(crate) mod runtime_config;
 pub mod text_index;

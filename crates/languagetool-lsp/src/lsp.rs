@@ -1,12 +1,16 @@
-use crate::config::{BackendConfig, ClientOptions, ProjectConfig};
+use crate::config::{BackendKind, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
     diagnostic_data, make_lsp_diagnostic, match_offsets, parse_diagnostic_data, SOURCE,
 };
-use crate::document::{ChangeStatus, CheckableDocument, Document};
-use crate::document_cache::DocumentCache;
-use crate::languagetool::{LanguageToolClient, LanguageToolError, LanguageToolMatch};
+use crate::document::ChangeStatus;
+use crate::document_cache::{DocumentCache, DocumentEntry, DocumentToken};
+use crate::languagetool::{
+    AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
+};
+use crate::runtime_config::RuntimeConfig;
+use crate::text_index::TextIndex;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tower_lsp::jsonrpc::{Error as RpcError, Result as RpcResult};
@@ -22,9 +26,24 @@ pub struct Backend {
     client: Client,
     root: Arc<RwLock<PathBuf>>,
     documents: DocumentCache,
-    initialization_options: Arc<RwLock<ClientOptions>>,
-    project_config: Arc<RwLock<ProjectConfig>>,
+    config: RuntimeConfig,
     language_tool: LanguageToolClient,
+}
+
+struct CheckRequest {
+    uri: Url,
+    version: i32,
+    token: DocumentToken,
+    text: String,
+    index: TextIndex,
+    annotated: AnnotatedText,
+    ignored_ranges: Vec<(usize, usize)>,
+    options: ClientOptions,
+}
+
+enum PreparedCheck {
+    Check(Box<CheckRequest>),
+    Clear { uri: Url, version: i32 },
 }
 
 impl Backend {
@@ -33,44 +52,51 @@ impl Backend {
             client,
             root: Arc::new(RwLock::new(root)),
             documents: DocumentCache::default(),
-            initialization_options: Arc::new(RwLock::new(ClientOptions::default())),
-            project_config: Arc::new(RwLock::new(ProjectConfig::default())),
+            config: RuntimeConfig::default(),
             language_tool: LanguageToolClient::new(),
         }
     }
 
     fn options(&self) -> ClientOptions {
-        let initialization_options = self
-            .initialization_options
-            .read()
-            .expect("initialization options poisoned")
-            .clone();
-        self.project_config
-            .read()
-            .expect("project config poisoned")
-            .merged_options(&initialization_options)
+        self.config.options()
     }
 
     fn schedule_check(&self, uri: Url) {
-        let generation = self.documents.bump_generation(&uri);
+        let Some(token) = self.documents.token(&uri) else {
+            log::debug!("Skipping check schedule for {uri}: document not cached");
+            return;
+        };
         let debounce = self.options().debounce_ms;
-        log::debug!("Scheduling check for {uri} generation={generation} debounce_ms={debounce}");
+        log::debug!("Scheduling check for {uri} token={token:?} debounce_ms={debounce}");
         let backend = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
-            if backend.documents.generation(&uri) == generation {
-                log::debug!("Running debounced check for {uri} generation={generation}");
-                backend.check_uri(&uri, generation).await;
+            let prepared = {
+                backend
+                    .documents
+                    .with_bumped_entry_if_current(&uri, token, |entry| {
+                        backend.prepare_check_entry(entry)
+                    })
+            };
+            if let Some(prepared) = prepared {
+                log::debug!("Running debounced check for {uri} token={token:?}");
+                backend.run_prepared_check(prepared).await;
             } else {
-                log::debug!("Skipping stale debounced check for {uri} generation={generation}");
+                log::debug!("Skipping stale debounced check for {uri} token={token:?}");
             }
         });
     }
 
     async fn check_uri_now(&self, uri: &Url) {
-        let generation = self.documents.bump_generation(uri);
-        log::debug!("Running immediate check for {uri} generation={generation}");
-        self.check_uri(uri, generation).await;
+        let Some(prepared) = self
+            .documents
+            .with_bumped_entry(uri, |entry| self.prepare_check_entry(entry))
+        else {
+            log::debug!("Skipping immediate check for {uri}: document not cached");
+            return;
+        };
+        log::debug!("Running immediate check for {uri}");
+        self.run_prepared_check(prepared).await;
     }
 
     async fn clear_stale_diagnostics(&self, uri: &Url, version: Option<i32>) {
@@ -80,79 +106,87 @@ impl Backend {
             .await;
     }
 
-    async fn check_uri(&self, uri: &Url, generation: u64) {
-        let Some(document) = self.documents.get(uri) else {
-            log::debug!("Skipping check for {uri} generation={generation}: document not cached");
-            return;
+    async fn run_prepared_check(&self, prepared: PreparedCheck) {
+        let request = match prepared {
+            PreparedCheck::Check(request) => request,
+            PreparedCheck::Clear { uri, version } => {
+                log::debug!("Document {uri} is not checkable; clearing diagnostics");
+                self.clear_stale_diagnostics(&uri, Some(version)).await;
+                return;
+            }
         };
+        let uri = &request.uri;
+        let token = request.token;
 
         log::debug!(
-            "Starting check for {uri} generation={generation} version={:?}",
-            document.version()
+            "Starting check for {uri} token={token:?} version={:?}",
+            request.version
         );
-        let options = self.options();
-        let Some(checkable_document) =
-            document.checkable(|language| options.language_enabled(&language))
-        else {
-            log::debug!("Document {uri} is not checkable; clearing diagnostics");
-            self.clear_stale_diagnostics(document.uri(), Some(document.version()))
-                .await;
-            return;
-        };
-
         log::debug!(
-            "Sending LanguageTool request for {uri} generation={generation} annotations={} ignored_ranges={}",
-            checkable_document.annotated().annotation.len(),
-            checkable_document.ignored_ranges().len()
+            "Sending LanguageTool request for {uri} token={token:?} annotations={} ignored_ranges={}",
+            request.annotated.annotation.len(),
+            request.ignored_ranges.len()
         );
         let response = match self
             .language_tool
-            .check_annotated(checkable_document.annotated(), &options)
+            .check_annotated(&request.annotated, &request.options)
             .await
         {
             Ok(response) => {
                 log::debug!(
-                    "LanguageTool returned {} match(es) for {uri} generation={generation}",
+                    "LanguageTool returned {} match(es) for {uri} token={token:?}",
                     response.matches.len()
                 );
                 response
             }
             Err(err) => {
-                self.log_check_error(&options, err).await;
-                if self.document_is_current(&document, generation) {
-                    self.clear_stale_diagnostics(
-                        checkable_document.uri(),
-                        Some(checkable_document.version()),
-                    )
+                self.log_check_error(&request.options, err).await;
+                self.clear_stale_diagnostics(&request.uri, Some(request.version))
                     .await;
-                }
                 return;
             }
         };
 
-        if !self.document_is_current(&document, generation) {
-            log::debug!("Discarding stale check result for {uri} generation={generation}");
-            return;
-        }
-        let diagnostics = diagnostics_for_document(&checkable_document, response.matches, &options);
+        let diagnostics = diagnostics_for_request(&request, response.matches);
         let diagnostic_count = diagnostics.len();
         log::debug!(
-            "Publishing {diagnostic_count} diagnostic(s) for {uri} generation={generation} version={:?}",
-            checkable_document.version()
+            "Publishing {diagnostic_count} diagnostic(s) for {uri} token={token:?} version={:?}",
+            request.version
         );
         self.client
-            .publish_diagnostics(
-                checkable_document.uri().clone(),
-                diagnostics,
-                Some(checkable_document.version()),
-            )
+            .publish_diagnostics(request.uri.clone(), diagnostics, Some(request.version))
             .await;
+    }
+
+    fn prepare_check_entry(&self, entry: &DocumentEntry) -> PreparedCheck {
+        let document = entry.document();
+        let token = entry.token();
+        let options = self.options();
+        let Some(checkable_document) =
+            document.checkable(|language| options.language_enabled(&language))
+        else {
+            return PreparedCheck::Clear {
+                uri: document.uri().clone(),
+                version: document.version(),
+            };
+        };
+
+        PreparedCheck::Check(Box::new(CheckRequest {
+            uri: checkable_document.uri().clone(),
+            version: checkable_document.version(),
+            token,
+            text: checkable_document.text().to_string(),
+            index: checkable_document.index().clone(),
+            annotated: checkable_document.annotated().clone(),
+            ignored_ranges: checkable_document.ignored_ranges().to_vec(),
+            options,
+        }))
     }
 
     async fn log_check_error(&self, options: &ClientOptions, err: LanguageToolError) {
         let message = match &err {
             LanguageToolError::Api { .. } | LanguageToolError::Request { .. }
-                if matches!(options.backend, BackendConfig::Local { .. }) =>
+                if matches!(options.backend, BackendKind::Local) =>
             {
                 format!(
                     "LanguageTool is not reachable at {}. Is the local server running? {err}",
@@ -176,21 +210,11 @@ impl Backend {
 
     fn project_config_path(&self) -> PathBuf {
         let root = self.root.read().expect("workspace root poisoned");
-        self.options().project_config_path(&root)
+        self.config.project_config_path(&root)
     }
 
     fn project_config_display_path(&self) -> String {
-        self.options().project_config_display_path()
-    }
-
-    fn save_project_config(
-        &self,
-        project_config: &ProjectConfig,
-        path: &Path,
-    ) -> Result<(), String> {
-        project_config
-            .save(path)
-            .map_err(|err| format!("Failed to save project config: {err}"))
+        self.config.project_config_display_path()
     }
 
     fn update_project_config(
@@ -198,12 +222,9 @@ impl Backend {
         update: impl FnOnce(&mut ProjectConfig) -> bool,
     ) -> Result<bool, String> {
         let project_config_path = self.project_config_path();
-        let (updated, next_config) = {
-            let project_config = self.project_config.read().expect("project config poisoned");
-            let mut next_config = project_config.clone();
-            let updated = update(&mut next_config);
-            (updated, next_config)
-        };
+        let updated = self
+            .config
+            .update_project_config(&project_config_path, update)?;
 
         if !updated {
             log::debug!("Project config update made no changes");
@@ -211,14 +232,9 @@ impl Backend {
         }
 
         log::info!(
-            "Saving LanguageTool project config to {}",
+            "Saved LanguageTool project config to {}",
             project_config_path.display()
         );
-        self.save_project_config(&next_config, &project_config_path)?;
-        *self
-            .project_config
-            .write()
-            .expect("project config poisoned") = next_config;
         Ok(true)
     }
 
@@ -235,53 +251,41 @@ impl Backend {
             project_config.add_disabled_category(category_id)
         })
     }
-
-    fn document_is_current(&self, document: &Document, generation: u64) -> bool {
-        let current = self.documents.generation(document.uri()) == generation
-            && self
-                .documents
-                .get(document.uri())
-                .is_some_and(|current| current.version() == document.version());
-        if !current {
-            log::debug!(
-                "Document {} is stale for generation={generation} version={:?}",
-                document.uri(),
-                document.version()
-            );
-        }
-        current
-    }
 }
 
-fn diagnostics_for_document(
-    document: &CheckableDocument<'_>,
+fn diagnostics_for_request(
+    request: &CheckRequest,
     matches: Vec<LanguageToolMatch>,
-    options: &ClientOptions,
 ) -> Vec<Diagnostic> {
-    let index = document.index();
-    let text = document.text();
     let diagnostics = matches
         .iter()
         .filter_map(|item| match_offsets(item).map(|(offset, length)| (item, offset, length)))
         .filter(|(_, offset, length)| {
-            !index
-                .text_for_utf16_range(text, *offset, *offset + *length)
+            !request
+                .index
+                .text_for_utf16_range(&request.text, *offset, *offset + *length)
                 .map(|s| s.trim().is_empty())
                 .unwrap_or(true)
         })
         .filter(|(_, offset, length)| {
-            !intersects_ignored_ranges(*offset, *offset + *length, document.ignored_ranges())
+            !intersects_ignored_ranges(*offset, *offset + *length, &request.ignored_ranges)
         })
         .filter_map(|(item, _, _)| {
-            let data = diagnostic_data(text, index, item, options, Some(document.version()));
-            (!options.is_ignored_word(&data.matched_text))
-                .then(|| make_lsp_diagnostic(index, item, data, options))
+            let data = diagnostic_data(
+                &request.text,
+                &request.index,
+                item,
+                &request.options,
+                Some(request.version),
+            );
+            (!request.options.is_ignored_word(&data.matched_text))
+                .then(|| make_lsp_diagnostic(&request.index, item, data, &request.options))
         })
         .collect::<Vec<_>>();
     log::debug!(
         "Mapped LanguageTool matches to {} diagnostic(s) for {}",
         diagnostics.len(),
-        document.uri()
+        request.uri
     );
     diagnostics
 }
@@ -339,22 +343,15 @@ impl LanguageServer for Backend {
         if let Some(root) = workspace_root(&params) {
             *self.root.write().expect("workspace root poisoned") = root;
         }
-        let options = ClientOptions::from_value(params.initialization_options);
+        let client_options = ClientOptions::from_value(params.initialization_options);
         let root = self.root.read().expect("workspace root poisoned").clone();
-        let project_config = ProjectConfig::load(&options.project_config_path(&root));
+        self.config.set_client_options(client_options, &root);
+        let options = self.options();
         log::info!(
             "LanguageTool LSP initialized for {} using {}",
             root.display(),
             options.endpoint()
         );
-        *self
-            .initialization_options
-            .write()
-            .expect("initialization options poisoned") = options;
-        *self
-            .project_config
-            .write()
-            .expect("project config poisoned") = project_config;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -433,15 +430,13 @@ impl LanguageServer for Backend {
             params.content_changes.len(),
             params.text_document.version
         );
-        for change in params.content_changes {
-            if self
-                .documents
-                .apply_change(&uri, params.text_document.version, change)
-                == ChangeStatus::OutOfSync
-            {
-                self.clear_stale_diagnostics(&uri, Some(params.text_document.version))
-                    .await;
-            }
+        if self
+            .documents
+            .apply_changes(&uri, params.text_document.version, params.content_changes)
+            == ChangeStatus::OutOfSync
+        {
+            self.clear_stale_diagnostics(&uri, Some(params.text_document.version))
+                .await;
         }
         if had_changes && self.options().check_while_typing {
             self.schedule_check(uri);
@@ -540,17 +535,15 @@ impl LanguageServer for Backend {
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if params.settings != Value::Null {
             log::info!("LanguageTool configuration changed; reloading options and project config");
-            let options = ClientOptions::from_value(Some(params.settings));
             let root = self.root.read().expect("workspace root poisoned").clone();
-            let project_config = ProjectConfig::load(&options.project_config_path(&root));
-            *self
-                .initialization_options
-                .write()
-                .expect("initialization options poisoned") = options;
-            *self
-                .project_config
-                .write()
-                .expect("project config poisoned") = project_config;
+            if let Err(err) = self.config.update_client_options(params.settings, &root) {
+                let message = format!(
+                    "Ignoring invalid LanguageTool configuration change; keeping previous options: {err}"
+                );
+                log::error!("{message}");
+                self.client.log_message(MessageType::ERROR, message).await;
+                return;
+            }
             self.recheck_all().await;
         } else {
             log::debug!("Ignoring null configuration change notification");
@@ -606,9 +599,26 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::Document;
     use crate::languagetool::{
         LanguageToolCategory, LanguageToolMatch, LanguageToolReplacement, LanguageToolRule,
     };
+
+    fn check_request_for_test(document: &Document, options: ClientOptions) -> CheckRequest {
+        let document = document
+            .checkable(|language| options.language_enabled(&language))
+            .unwrap();
+        CheckRequest {
+            uri: document.uri().clone(),
+            version: document.version(),
+            token: DocumentToken::new_for_test(0, document.version(), 0),
+            text: document.text().to_string(),
+            index: document.index().clone(),
+            annotated: document.annotated().clone(),
+            ignored_ranges: document.ignored_ranges().to_vec(),
+            options,
+        }
+    }
 
     #[test]
     fn builds_diagnostics_for_document() {
@@ -618,8 +628,8 @@ mod tests {
             Some("plaintext".to_string()),
             "This are a tset.".to_string(),
         );
-        let document = document.checkable(|_| true).unwrap();
         let options = ClientOptions::default();
+        let request = check_request_for_test(&document, options);
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
             short_message: None,
@@ -643,7 +653,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_document(&document, vec![item], &options);
+        let diagnostics = diagnostics_for_request(&request, vec![item]);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].range.start, Position::new(0, 11));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 15));
@@ -657,8 +667,8 @@ mod tests {
             Some("rust".to_string()),
             "let value = 1; // This are a comment.".to_string(),
         );
-        let document = document.checkable(|_| true).unwrap();
         let options = ClientOptions::default();
+        let request = check_request_for_test(&document, options);
         let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),
             short_message: None,
@@ -677,7 +687,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_document(&document, vec![item], &options);
+        let diagnostics = diagnostics_for_request(&request, vec![item]);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].range.start, Position::new(0, 18));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 22));
@@ -691,8 +701,8 @@ mod tests {
             Some("plaintext".to_string()),
             "😀 This are a tset.".to_string(),
         );
-        let document = document.checkable(|_| true).unwrap();
         let options = ClientOptions::default();
+        let request = check_request_for_test(&document, options);
         let item = LanguageToolMatch {
             message: "The verb 'are' is plural.".to_string(),
             short_message: None,
@@ -714,7 +724,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_document(&document, vec![item], &options);
+        let diagnostics = diagnostics_for_request(&request, vec![item]);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].range.start, Position::new(0, 3));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 11));

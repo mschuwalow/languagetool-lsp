@@ -92,8 +92,10 @@ impl DocumentLanguage {
     }
 
     pub fn from_lsp_or_uri(language_id: Option<&str>, uri: &Url) -> Self {
-        if language_id.is_some_and(|value| !value.trim().is_empty()) {
-            return Self::from_language_id(language_id);
+        if let Some(language_id) = language_id.filter(|value| !value.trim().is_empty()) {
+            if let Some(language) = SupportedLanguage::from_language_id(language_id) {
+                return Self::Supported(language);
+            }
         }
 
         uri.to_file_path()
@@ -141,6 +143,15 @@ mod tests {
         );
         assert_eq!(
             DocumentLanguage::from_path(Path::new("notes.txt")),
+            DocumentLanguage::Supported(SupportedLanguage::PlainText)
+        );
+    }
+
+    #[test]
+    fn unknown_lsp_language_ids_fall_back_to_uri() {
+        let uri = Url::parse("file:///tmp/notes.txt").unwrap();
+        assert_eq!(
+            DocumentLanguage::from_lsp_or_uri(Some("unknown-client-language"), &uri),
             DocumentLanguage::Supported(SupportedLanguage::PlainText)
         );
     }

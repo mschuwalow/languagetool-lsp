@@ -21,25 +21,12 @@ fn default_cloud_url() -> String {
     "https://api.languagetool.org".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum BackendConfig {
-    Local {
-        #[serde(default = "default_local_url")]
-        url: String,
-    },
-    Cloud {
-        #[serde(default = "default_cloud_url")]
-        url: String,
-    },
-}
-
-impl Default for BackendConfig {
-    fn default() -> Self {
-        Self::Local {
-            url: default_local_url(),
-        }
-    }
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendKind {
+    #[default]
+    Local,
+    Cloud,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -83,7 +70,8 @@ impl CheckingLevel {
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct ClientOptions {
-    pub backend: BackendConfig,
+    pub backend: BackendKind,
+    pub backend_url: Option<String>,
     pub username: Option<String>,
     pub api_key: Option<String>,
     pub language: String,
@@ -110,7 +98,8 @@ pub struct ClientOptions {
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
-            backend: BackendConfig::default(),
+            backend: BackendKind::default(),
+            backend_url: None,
             username: None,
             api_key: None,
             language: "en-US".to_string(),
@@ -139,7 +128,7 @@ impl Default for ClientOptions {
 impl ClientOptions {
     pub fn from_value(value: Option<Value>) -> Self {
         match value {
-            Some(value) => serde_json::from_value(value).unwrap_or_else(|err| {
+            Some(value) => Self::parse_value(value).unwrap_or_else(|err| {
                 log::error!("Failed to parse initialization options, using defaults: {err}");
                 Self::default()
             }),
@@ -147,9 +136,26 @@ impl ClientOptions {
         }
     }
 
+    pub fn parse_value(value: Value) -> serde_json::Result<Self> {
+        serde_json::from_value(value)
+    }
+
+    pub fn merged_with_value(&self, value: Value) -> serde_json::Result<Self> {
+        let mut merged = serde_json::to_value(self)?;
+        merge_json_value(&mut merged, value);
+        Self::parse_value(merged)
+    }
+
     pub fn base_url(&self) -> String {
-        let url = match &self.backend {
-            BackendConfig::Local { url } | BackendConfig::Cloud { url } => url.as_str(),
+        let default_url;
+        let url = if let Some(url) = self.backend_url.as_deref() {
+            url
+        } else {
+            default_url = match self.backend {
+                BackendKind::Local => default_local_url(),
+                BackendKind::Cloud => default_cloud_url(),
+            };
+            default_url.as_str()
         };
         url.trim().trim_end_matches('/').to_string()
     }
@@ -177,8 +183,8 @@ impl ClientOptions {
 
     pub fn timeout(&self) -> Duration {
         match self.backend {
-            BackendConfig::Local { .. } => Duration::from_secs(10),
-            BackendConfig::Cloud { .. } => Duration::from_secs(20),
+            BackendKind::Local => Duration::from_secs(10),
+            BackendKind::Cloud => Duration::from_secs(20),
         }
     }
 
@@ -208,6 +214,22 @@ impl ClientOptions {
         self.ignored_words
             .iter()
             .any(|ignored| ignored.eq_ignore_ascii_case(word))
+    }
+}
+
+fn merge_json_value(base: &mut Value, update: Value) {
+    match (base, update) {
+        (Value::Object(base), Value::Object(update)) => {
+            for (key, value) in update {
+                match base.get_mut(&key) {
+                    Some(base_value) => merge_json_value(base_value, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, update) => *base = update,
     }
 }
 
@@ -325,9 +347,8 @@ mod tests {
         assert_eq!(options.endpoint(), "http://localhost:8081/v2/check");
 
         let options = ClientOptions {
-            backend: BackendConfig::Cloud {
-                url: " https://api.languagetool.org/ ".to_string(),
-            },
+            backend: BackendKind::Cloud,
+            backend_url: Some(" https://api.languagetool.org/ ".to_string()),
             ..ClientOptions::default()
         };
         assert_eq!(options.base_url(), "https://api.languagetool.org");
@@ -338,7 +359,7 @@ mod tests {
     #[test]
     fn parses_camel_case_options() {
         let options = ClientOptions::from_value(Some(serde_json::json!({
-            "backend": { "type": "cloud" },
+            "backend": "cloud",
             "enabledRules": ["WHITESPACE_RULE"],
             "enabledCategories": ["TYPOGRAPHY"],
             "preferredVariants": ["en-US"],
@@ -347,12 +368,9 @@ mod tests {
             "projectConfigPath": ".config/languagetool/project.json",
             "diagnosticSeverity": "warning"
         })));
-        assert_eq!(
-            options.backend,
-            BackendConfig::Cloud {
-                url: default_cloud_url()
-            }
-        );
+        assert_eq!(options.backend, BackendKind::Cloud);
+        assert_eq!(options.backend_url, None);
+        assert_eq!(options.base_url(), default_cloud_url());
         assert_eq!(options.enabled_rules, vec!["WHITESPACE_RULE"]);
         assert_eq!(options.enabled_categories, vec!["TYPOGRAPHY"]);
         assert_eq!(options.preferred_variants, vec!["en-US"]);
@@ -363,6 +381,59 @@ mod tests {
             ".config/languagetool/project.json"
         );
         assert_eq!(options.configured_severity(), DiagnosticSeverity::WARNING);
+    }
+
+    #[test]
+    fn merges_partial_option_updates() {
+        let options = ClientOptions {
+            backend: BackendKind::Cloud,
+            backend_url: Some("https://example.test".to_string()),
+            language: "de-DE".to_string(),
+            debounce_ms: 750,
+            check_on_save: false,
+            ..Default::default()
+        };
+
+        let options = options
+            .merged_with_value(serde_json::json!({ "debounceMs": 100 }))
+            .unwrap();
+
+        assert_eq!(options.backend, BackendKind::Cloud);
+        assert_eq!(options.backend_url.as_deref(), Some("https://example.test"));
+        assert_eq!(options.language, "de-DE");
+        assert_eq!(options.debounce_ms, 100);
+        assert!(!options.check_on_save);
+    }
+
+    #[test]
+    fn merges_flat_backend_option_updates() {
+        let options = ClientOptions {
+            backend: BackendKind::Cloud,
+            backend_url: Some("https://old.example.test".to_string()),
+            ..Default::default()
+        };
+
+        let options = options
+            .merged_with_value(serde_json::json!({
+                "backendUrl": "https://new.example.test"
+            }))
+            .unwrap();
+        assert_eq!(options.backend, BackendKind::Cloud);
+        assert_eq!(
+            options.backend_url.as_deref(),
+            Some("https://new.example.test")
+        );
+
+        let options = options
+            .merged_with_value(serde_json::json!({
+                "backend": "local"
+            }))
+            .unwrap();
+        assert_eq!(options.backend, BackendKind::Local);
+        assert_eq!(
+            options.backend_url.as_deref(),
+            Some("https://new.example.test")
+        );
     }
 
     #[test]

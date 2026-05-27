@@ -43,6 +43,7 @@ struct OutOfSyncDocument {
 pub enum ChangeStatus {
     Applied,
     OutOfSync,
+    Stale,
 }
 
 pub struct CheckableDocument<'a> {
@@ -193,7 +194,8 @@ impl Document {
                 };
             }
             DocumentKind::Unsupported(document) => {
-                document.version = version;
+                let uri = document.uri.clone();
+                *self = Self::new(uri, version, None, text);
             }
         }
     }
@@ -208,6 +210,7 @@ impl Document {
             DocumentKind::Supported(document) => {
                 match document.incremental_update(version, range, new_text) {
                     ChangeStatus::Applied => ChangeStatus::Applied,
+                    ChangeStatus::Stale => ChangeStatus::Stale,
                     ChangeStatus::OutOfSync => {
                         let uri = document.uri.clone();
                         let language = document.language;
@@ -354,6 +357,20 @@ mod tests {
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
         assert!(document.checkable(|_| true).is_none());
+    }
+
+    #[test]
+    fn reversed_incremental_change_marks_document_out_of_sync() {
+        let mut document = plaintext_document("abc");
+        let status = document.incremental_update(
+            2,
+            Range::new(Position::new(0, 2), Position::new(0, 1)),
+            "x",
+        );
+
+        assert_eq!(status, ChangeStatus::OutOfSync);
+        assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
+        assert_eq!(document.version(), 2);
     }
 
     #[test]
@@ -514,5 +531,33 @@ mod tests {
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
         assert!(document.checkable(|_| true).is_none());
         assert_eq!(document.version(), 2);
+    }
+
+    #[test]
+    fn unsupported_full_update_remains_unsupported_without_supported_uri() {
+        let mut document = Document::new(
+            Url::parse("untitled:notes").unwrap(),
+            1,
+            Some("unknown".to_string()),
+            "This are ignored.".to_string(),
+        );
+
+        assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
+        document.full_update(2, "This are checked.".to_string());
+        assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
+    }
+
+    #[test]
+    fn unknown_lsp_language_id_falls_back_to_supported_uri() {
+        let document = Document::new(
+            Url::parse("file:///tmp/notes.txt").unwrap(),
+            1,
+            Some("unknown".to_string()),
+            "This are checked.".to_string(),
+        );
+
+        let document = supported_document(&document);
+        assert_eq!(document.text, "This are checked.");
+        assert_eq!(document.version, 1);
     }
 }
