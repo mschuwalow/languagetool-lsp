@@ -2,7 +2,8 @@ use crate::config::{BackendConfig, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
     diagnostic_data, make_lsp_diagnostic, match_offsets, parse_diagnostic_data, SOURCE,
 };
-use crate::document_cache::{CheckableDocument, Document, DocumentCache};
+use crate::document::{ChangeStatus, CheckableDocument, Document};
+use crate::document_cache::DocumentCache;
 use crate::languagetool::{LanguageToolClient, LanguageToolError, LanguageToolMatch};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -94,7 +95,7 @@ impl Backend {
             document.checkable(|language| options.language_enabled(&language))
         else {
             log::debug!("Document {uri} is not checkable; clearing diagnostics");
-            self.clear_stale_diagnostics(document.uri(), document.version())
+            self.clear_stale_diagnostics(document.uri(), Some(document.version()))
                 .await;
             return;
         };
@@ -121,7 +122,7 @@ impl Backend {
                 if self.document_is_current(&document, generation) {
                     self.clear_stale_diagnostics(
                         checkable_document.uri(),
-                        checkable_document.version(),
+                        Some(checkable_document.version()),
                     )
                     .await;
                 }
@@ -143,7 +144,7 @@ impl Backend {
             .publish_diagnostics(
                 checkable_document.uri().clone(),
                 diagnostics,
-                checkable_document.version(),
+                Some(checkable_document.version()),
             )
             .await;
     }
@@ -272,7 +273,7 @@ fn diagnostics_for_document(
             !intersects_ignored_ranges(*offset, *offset + *length, document.ignored_ranges())
         })
         .filter_map(|(item, _, _)| {
-            let data = diagnostic_data(text, index, item, options, document.version());
+            let data = diagnostic_data(text, index, item, options, Some(document.version()));
             (!options.is_ignored_word(&data.matched_text))
                 .then(|| make_lsp_diagnostic(index, item, data, options))
         })
@@ -363,7 +364,7 @@ impl LanguageServer for Backend {
                         open_close: Some(true),
                         change: Some(TextDocumentSyncKind::INCREMENTAL),
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(true),
+                            include_text: Some(false),
                         })),
                         ..TextDocumentSyncOptions::default()
                     },
@@ -433,8 +434,14 @@ impl LanguageServer for Backend {
             params.text_document.version
         );
         for change in params.content_changes {
-            self.documents
-                .apply_change(&uri, Some(params.text_document.version), change);
+            if self
+                .documents
+                .apply_change(&uri, params.text_document.version, change)
+                == ChangeStatus::OutOfSync
+            {
+                self.clear_stale_diagnostics(&uri, Some(params.text_document.version))
+                    .await;
+            }
         }
         if had_changes && self.options().check_while_typing {
             self.schedule_check(uri);
@@ -446,10 +453,6 @@ impl LanguageServer for Backend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         log::info!("Saved document {uri}");
-        if let Some(text) = params.text {
-            log::debug!("Save included full text for {uri} bytes={}", text.len());
-            self.documents.update(&uri, None, text);
-        }
         if self.options().check_on_save {
             self.check_uri_now(&uri).await;
         } else {
@@ -611,7 +614,7 @@ mod tests {
     fn builds_diagnostics_for_document() {
         let document = Document::new(
             Url::parse("file:///tmp/test.txt").unwrap(),
-            Some(1),
+            1,
             Some("plaintext".to_string()),
             "This are a tset.".to_string(),
         );
@@ -650,7 +653,7 @@ mod tests {
     fn diagnostics_use_original_document_offsets() {
         let document = Document::new(
             Url::parse("file:///tmp/test.rs").unwrap(),
-            Some(1),
+            1,
             Some("rust".to_string()),
             "let value = 1; // This are a comment.".to_string(),
         );
@@ -684,7 +687,7 @@ mod tests {
     fn diagnostics_use_languagetool_utf16_offsets() {
         let document = Document::new(
             Url::parse("file:///tmp/test.txt").unwrap(),
-            Some(1),
+            1,
             Some("plaintext".to_string()),
             "😀 This are a tset.".to_string(),
         );

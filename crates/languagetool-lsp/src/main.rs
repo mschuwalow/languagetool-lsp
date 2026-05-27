@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use languagetool_lsp::config::ClientOptions;
-use languagetool_lsp::document_cache::Document;
+use languagetool_lsp::document::Document;
 use languagetool_lsp::languagetool::LanguageToolClient;
 use languagetool_lsp::lsp::Backend;
 use std::path::{Path, PathBuf};
@@ -102,7 +102,7 @@ async fn check(files: Vec<PathBuf>) {
             path.display(),
             text.len()
         );
-        let document = Document::new(uri, None, None, text);
+        let document = Document::new(uri, 0, None, text);
         let Some(checkable_document) =
             document.checkable(|language| options.language_enabled(&language))
         else {

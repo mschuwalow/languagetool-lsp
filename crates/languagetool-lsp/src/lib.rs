@@ -1,5 +1,6 @@
 pub mod config;
 pub mod diagnostics;
+pub mod document;
 pub mod document_cache;
 pub mod language;
 pub mod languagetool;

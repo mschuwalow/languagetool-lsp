@@ -251,21 +251,18 @@ impl TestContext {
         .await;
     }
 
-    async fn save_document(&mut self, uri: &Url, text: &str) {
+    async fn save_document(&mut self, uri: &Url) {
         self.notify(
             "textDocument/didSave",
             json!({
-                "textDocument": { "uri": uri },
-                "text": text
+                "textDocument": { "uri": uri }
             }),
         )
         .await;
     }
 }
 
-/// Sends a sequence of incremental didChange edits and then a didSave with the
-/// expected final text.  The server cross-checks its in-memory text against the
-/// saved text, so any index/text corruption would produce divergent diagnostics.
+/// Sends a sequence of incremental didChange edits and then a didSave trigger.
 /// This test does not require a LanguageTool server; it only validates that the
 /// incremental-edit machinery in DocumentCache doesn't corrupt state.
 #[tokio::test]
@@ -341,13 +338,8 @@ async fn incremental_did_change_keeps_document_consistent() {
     )
     .await;
 
-    // Send a full-replace didSave with the text we expect the server to hold.
-    // If the server's accumulated text diverges from this it will re-check against
-    // the wrong content (observable in production but not easily here without LT).
-    // What we assert here is that the server accepts all the above without crashing
-    // and that a final full-replace aligns the content back to a known state without
-    // the server emitting a JSON-RPC error.
-    ctx.save_document(&uri, "hello zed\nfoo baz").await;
+    // Save should only trigger checking; document state comes from didOpen/didChange.
+    ctx.save_document(&uri).await;
 
     // Perform one more incremental edit on top of the saved text to confirm the
     // index is still usable.  If the index is corrupt, replace_range will panic
@@ -480,6 +472,11 @@ async fn initialize_reports_expected_capabilities() {
         "the server should report UTF-16 positions"
     );
     assert_eq!(
+        capabilities["textDocumentSync"]["save"]["includeText"],
+        json!(false),
+        "save should be a check trigger, not a full-text sync path"
+    );
+    assert_eq!(
         capabilities["codeActionProvider"]["codeActionKinds"],
         json!(["quickfix"])
     );
@@ -564,6 +561,39 @@ async fn code_action_returns_replacement_and_workspace_commands() {
         action["command"] == "languagetool.ignoreWordInWorkspace"
             && action["arguments"] == json!(["tset"])
     }));
+}
+
+#[tokio::test]
+async fn malformed_incremental_change_clears_diagnostics() {
+    let mut ctx = TestContext::new();
+    ctx.initialize_with_options(json!({
+        "checkOnOpen": false,
+        "checkOnSave": false,
+        "checkWhileTyping": false,
+    }))
+    .await;
+    let uri = ctx.doc_uri("emoji.txt");
+
+    ctx.open_document(&uri, "plaintext", "a😀b").await;
+    ctx.change_document(
+        &uri,
+        2,
+        json!([{
+            "range": {
+                "start": { "line": 0, "character": 2 },
+                "end":   { "line": 0, "character": 2 }
+            },
+            "text": "x"
+        }]),
+    )
+    .await;
+
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    assert_eq!(params["uri"], uri.as_str());
+    assert_eq!(params["version"], json!(2));
+    assert_eq!(params["diagnostics"], json!([]));
 }
 
 #[tokio::test]
