@@ -40,10 +40,9 @@ struct OutOfSyncDocument {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeStatus {
+pub(crate) enum DocumentChangeStatus {
     Applied,
     OutOfSync,
-    Stale,
 }
 
 pub struct CheckableDocument<'a> {
@@ -205,13 +204,12 @@ impl Document {
         version: i32,
         range: tower_lsp::lsp_types::Range,
         new_text: &str,
-    ) -> ChangeStatus {
+    ) -> DocumentChangeStatus {
         match &mut self.kind {
             DocumentKind::Supported(document) => {
                 match document.incremental_update(version, range, new_text) {
-                    ChangeStatus::Applied => ChangeStatus::Applied,
-                    ChangeStatus::Stale => ChangeStatus::Stale,
-                    ChangeStatus::OutOfSync => {
+                    DocumentChangeStatus::Applied => DocumentChangeStatus::Applied,
+                    DocumentChangeStatus::OutOfSync => {
                         let uri = document.uri.clone();
                         let language = document.language;
                         self.kind = DocumentKind::OutOfSync(OutOfSyncDocument {
@@ -219,17 +217,17 @@ impl Document {
                             version,
                             language: Some(language),
                         });
-                        ChangeStatus::OutOfSync
+                        DocumentChangeStatus::OutOfSync
                     }
                 }
             }
             DocumentKind::Unsupported(document) => {
                 document.version = version;
-                ChangeStatus::Applied
+                DocumentChangeStatus::Applied
             }
             DocumentKind::OutOfSync(document) => {
                 document.version = version;
-                ChangeStatus::OutOfSync
+                DocumentChangeStatus::OutOfSync
             }
         }
     }
@@ -267,7 +265,7 @@ impl SupportedDocument {
         version: i32,
         range: tower_lsp::lsp_types::Range,
         new_text: &str,
-    ) -> ChangeStatus {
+    ) -> DocumentChangeStatus {
         let Some((byte_start, byte_end, utf16_start, utf16_end)) = self.index.edit_offsets(range)
         else {
             log::error!(
@@ -276,7 +274,7 @@ impl SupportedDocument {
                 range
             );
             self.version = version;
-            return ChangeStatus::OutOfSync;
+            return DocumentChangeStatus::OutOfSync;
         };
 
         let old_text = self.text.clone();
@@ -292,7 +290,7 @@ impl SupportedDocument {
         self.mask
             .apply_edit(&old_text, &self.text, byte_start, byte_end, new_text);
         self.version = version;
-        ChangeStatus::Applied
+        DocumentChangeStatus::Applied
     }
 }
 
@@ -353,7 +351,7 @@ mod tests {
             "x",
         );
 
-        assert_eq!(status, ChangeStatus::OutOfSync);
+        assert_eq!(status, DocumentChangeStatus::OutOfSync);
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
         assert!(document.checkable(|_| true).is_none());
@@ -368,7 +366,7 @@ mod tests {
             "x",
         );
 
-        assert_eq!(status, ChangeStatus::OutOfSync);
+        assert_eq!(status, DocumentChangeStatus::OutOfSync);
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
     }

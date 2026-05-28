@@ -2,8 +2,7 @@ use crate::config::{BackendKind, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
     diagnostic_data, make_lsp_diagnostic, match_offsets, parse_diagnostic_data, SOURCE,
 };
-use crate::document::ChangeStatus;
-use crate::document_cache::{DocumentCache, DocumentEntry, DocumentToken};
+use crate::document_cache::{ChangeStatus, DocumentCache, DocumentEntry, DocumentToken};
 use crate::languagetool::{
     AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
 };
@@ -43,11 +42,7 @@ struct CheckRequest {
 
 enum PreparedCheck {
     Check(Box<CheckRequest>),
-    Clear {
-        uri: Url,
-        version: i32,
-        token: DocumentToken,
-    },
+    Clear { uri: Url, version: i32 },
 }
 
 impl Backend {
@@ -115,17 +110,9 @@ impl Backend {
     async fn run_prepared_check(&self, prepared: PreparedCheck) {
         let request = match prepared {
             PreparedCheck::Check(request) => request,
-            PreparedCheck::Clear {
-                uri,
-                version,
-                token,
-            } => {
+            PreparedCheck::Clear { uri, version } => {
                 log::debug!("Document {uri} is not checkable; clearing diagnostics");
-                if self.documents.is_current(&uri, token) {
-                    self.clear_stale_diagnostics(&uri, Some(version)).await;
-                } else {
-                    log::debug!("Skipping stale diagnostic clear for {uri} token={token:?}");
-                }
+                self.clear_stale_diagnostics(&uri, Some(version)).await;
                 return;
             }
         };
@@ -197,7 +184,6 @@ impl Backend {
             return PreparedCheck::Clear {
                 uri: document.uri().clone(),
                 version: document.version(),
-                token,
             };
         };
 
@@ -470,14 +456,11 @@ impl LanguageServer for Backend {
             params.content_changes,
         );
         if change_status == ChangeStatus::OutOfSync {
-            if let Some(token) = self.documents.token(&uri) {
-                self.run_prepared_check(PreparedCheck::Clear {
-                    uri: uri.clone(),
-                    version: params.text_document.version,
-                    token,
-                })
-                .await;
-            }
+            self.run_prepared_check(PreparedCheck::Clear {
+                uri: uri.clone(),
+                version: params.text_document.version,
+            })
+            .await;
         }
         if had_changes && self.options().await.check_while_typing {
             self.schedule_check(uri).await;

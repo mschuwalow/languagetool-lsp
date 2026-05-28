@@ -1,4 +1,4 @@
-use crate::document::{ChangeStatus, Document};
+use crate::document::{Document, DocumentChangeStatus};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -30,6 +30,14 @@ pub struct DocumentToken {
 }
 
 impl DocumentToken {
+    fn new(document_id: u64, version: i32, generation: u64) -> Self {
+        Self {
+            document_id,
+            version,
+            generation,
+        }
+    }
+
     pub fn document_id(self) -> u64 {
         self.document_id
     }
@@ -40,12 +48,15 @@ impl DocumentToken {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(document_id: u64, version: i32, generation: u64) -> Self {
-        Self {
-            document_id,
-            version,
-            generation,
-        }
+        Self::new(document_id, version, generation)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStatus {
+    Applied,
+    OutOfSync,
+    Stale,
 }
 
 impl DocumentEntry {
@@ -54,11 +65,7 @@ impl DocumentEntry {
     }
 
     pub fn token(&self) -> DocumentToken {
-        DocumentToken {
-            document_id: self.document_id,
-            version: self.document.version(),
-            generation: self.generation,
-        }
+        DocumentToken::new(self.document_id, self.document.version(), self.generation)
     }
 }
 
@@ -110,7 +117,7 @@ impl DocumentCache {
         version: i32,
         range: tower_lsp::lsp_types::Range,
         new_text: &str,
-    ) -> ChangeStatus {
+    ) -> DocumentChangeStatus {
         log::debug!(
             "Applying ranged document change for {uri} version={version:?} range={range:?} replacement_bytes={}",
             new_text.len()
@@ -129,7 +136,7 @@ impl DocumentCache {
                 generation: 0,
             },
         );
-        ChangeStatus::OutOfSync
+        DocumentChangeStatus::OutOfSync
     }
 
     pub fn apply_changes(
@@ -157,9 +164,9 @@ impl DocumentCache {
                 Self::incremental_update_locked(&mut documents, uri, version, range, &change.text)
             } else {
                 Self::full_update_locked(&mut documents, uri, version, change.text);
-                ChangeStatus::Applied
+                DocumentChangeStatus::Applied
             };
-            if change_status == ChangeStatus::OutOfSync {
+            if change_status == DocumentChangeStatus::OutOfSync {
                 status = ChangeStatus::OutOfSync;
             }
         }
@@ -259,10 +266,10 @@ mod tests {
         );
 
         let token = cache.token(&uri).unwrap();
+        assert_eq!(status, ChangeStatus::OutOfSync);
         cache
             .with_bumped_entry_if_current(&uri, token, |entry| {
                 let document = entry.document();
-                assert_eq!(status, ChangeStatus::OutOfSync);
                 assert_eq!(document.version(), 1);
                 assert!(document.checkable(|_| true).is_none());
             })
