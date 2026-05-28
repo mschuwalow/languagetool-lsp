@@ -464,13 +464,20 @@ impl LanguageServer for Backend {
             params.content_changes.len(),
             params.text_document.version
         );
-        if self
-            .documents
-            .apply_changes(&uri, params.text_document.version, params.content_changes)
-            == ChangeStatus::OutOfSync
-        {
-            self.clear_stale_diagnostics(&uri, Some(params.text_document.version))
+        let change_status = self.documents.apply_changes(
+            &uri,
+            params.text_document.version,
+            params.content_changes,
+        );
+        if change_status == ChangeStatus::OutOfSync {
+            if let Some(token) = self.documents.token(&uri) {
+                self.run_prepared_check(PreparedCheck::Clear {
+                    uri: uri.clone(),
+                    version: params.text_document.version,
+                    token,
+                })
                 .await;
+            }
         }
         if had_changes && self.options().await.check_while_typing {
             self.schedule_check(uri).await;
