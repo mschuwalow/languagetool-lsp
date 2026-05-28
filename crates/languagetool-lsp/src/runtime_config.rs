@@ -1,13 +1,18 @@
 use crate::config::{ClientOptions, ProjectConfig};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeConfig {
-    client_options: Arc<RwLock<ClientOptions>>,
-    project_config: Arc<RwLock<ProjectConfig>>,
-    options: Arc<RwLock<ClientOptions>>,
+    state: Arc<Mutex<RuntimeConfigState>>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConfigState {
+    client_options: ClientOptions,
+    project_config: ProjectConfig,
+    options: ClientOptions,
 }
 
 impl Default for RuntimeConfig {
@@ -16,16 +21,22 @@ impl Default for RuntimeConfig {
         let project_config = ProjectConfig::default();
         let options = project_config.merged_options(&client_options);
         Self {
-            client_options: Arc::new(RwLock::new(client_options)),
-            project_config: Arc::new(RwLock::new(project_config)),
-            options: Arc::new(RwLock::new(options)),
+            state: Arc::new(Mutex::new(RuntimeConfigState {
+                client_options,
+                project_config,
+                options,
+            })),
         }
     }
 }
 
 impl RuntimeConfig {
     pub(crate) fn options(&self) -> ClientOptions {
-        self.options.read().expect("options poisoned").clone()
+        self.state
+            .lock()
+            .expect("runtime config poisoned")
+            .options
+            .clone()
     }
 
     pub(crate) fn project_config_path(&self, root: &Path) -> PathBuf {
@@ -57,42 +68,39 @@ impl RuntimeConfig {
         path: &Path,
         update: impl FnOnce(&mut ProjectConfig) -> bool,
     ) -> Result<bool, String> {
-        let (updated, next_config) = {
-            let project_config = self.project_config.read().expect("project config poisoned");
-            let mut next_config = project_config.clone();
+        let next_config = {
+            let mut state = self.state.lock().expect("runtime config poisoned");
+            let mut next_config = state.project_config.clone();
             let updated = update(&mut next_config);
-            (updated, next_config)
-        };
+            if !updated {
+                return Ok(false);
+            }
 
-        if !updated {
-            return Ok(false);
-        }
+            state.options = next_config.merged_options(&state.client_options);
+            state.project_config = next_config.clone();
+            next_config
+        };
 
         next_config
             .save(path)
             .map_err(|err| format!("Failed to save project config: {err}"))?;
-        let client_options = self.client_options();
-        self.replace(client_options, next_config);
         Ok(true)
     }
 
     fn replace(&self, client_options: ClientOptions, project_config: ProjectConfig) {
         let options = project_config.merged_options(&client_options);
-        *self
-            .client_options
-            .write()
-            .expect("client options poisoned") = client_options;
-        *self
-            .project_config
-            .write()
-            .expect("project config poisoned") = project_config;
-        *self.options.write().expect("options poisoned") = options;
+        *self.state.lock().expect("runtime config poisoned") = RuntimeConfigState {
+            client_options,
+            project_config,
+            options,
+        };
     }
 
     fn client_options(&self) -> ClientOptions {
-        self.client_options
-            .read()
-            .expect("client options poisoned")
+        self.state
+            .lock()
+            .expect("runtime config poisoned")
+            .client_options
             .clone()
     }
 }
