@@ -141,12 +141,28 @@ impl Backend {
             }
             Err(err) => {
                 self.log_check_error(&request.options, err).await;
-                self.clear_stale_diagnostics(&request.uri, Some(request.version))
-                    .await;
+                if self.documents.is_current(&request.uri, request.token) {
+                    self.clear_stale_diagnostics(&request.uri, Some(request.version))
+                        .await;
+                } else {
+                    log::debug!(
+                        "Skipping stale diagnostic clear for {} token={:?}",
+                        request.uri,
+                        request.token
+                    );
+                }
                 return;
             }
         };
 
+        if !self.documents.is_current(&request.uri, request.token) {
+            log::debug!(
+                "Discarding stale check result for {} token={:?}",
+                request.uri,
+                request.token
+            );
+            return;
+        }
         let diagnostics = diagnostics_for_request(&request, response.matches);
         let diagnostic_count = diagnostics.len();
         log::debug!(
@@ -186,10 +202,10 @@ impl Backend {
     async fn log_check_error(&self, options: &ClientOptions, err: LanguageToolError) {
         let message = match &err {
             LanguageToolError::Api { .. } | LanguageToolError::Request { .. }
-                if matches!(options.backend, BackendKind::Local) =>
+                if matches!(options.backend, BackendKind::Custom) =>
             {
                 format!(
-                    "LanguageTool is not reachable at {}. Is the local server running? {err}",
+                    "LanguageTool is not reachable at {}. Is the custom server running? {err}",
                     options.endpoint()
                 )
             }

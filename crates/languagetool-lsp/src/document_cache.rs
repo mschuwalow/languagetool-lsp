@@ -217,6 +217,10 @@ impl DocumentCache {
         Some(f(entry))
     }
 
+    pub fn is_current(&self, uri: &Url, token: DocumentToken) -> bool {
+        self.token(uri) == Some(token)
+    }
+
     pub fn urls(&self) -> Vec<Url> {
         self.documents
             .read()

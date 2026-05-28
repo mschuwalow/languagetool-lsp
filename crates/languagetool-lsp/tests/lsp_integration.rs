@@ -70,8 +70,8 @@ impl TestContext {
     async fn initialize_with_options(&mut self, extra_options: Value) -> Value {
         let root_uri = self.root_uri();
         let mut initialization_options = json!({
-            "backend": "local",
-            "backendUrl": "http://localhost:8081",
+            "backend": "custom",
+            "customBackendUrl": "http://localhost:8081",
             "language": "en-US",
             "checkOnOpen": true,
             "checkOnSave": true,
@@ -666,8 +666,8 @@ async fn check_failure_clears_stale_diagnostics() {
     });
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
-        "backend": "local",
-        "backendUrl": server.base_url()
+        "backend": "custom",
+        "customBackendUrl": server.base_url()
     }))
     .await;
     let uri = ctx.doc_uri("document.txt");
@@ -683,8 +683,8 @@ async fn check_failure_clears_stale_diagnostics() {
         "workspace/didChangeConfiguration",
         json!({
             "settings": {
-                "backend": "local",
-                "backendUrl": format!("{}/missing", server.base_url()),
+                "backend": "custom",
+                "customBackendUrl": format!("{}/missing", server.base_url()),
                 "language": "en-US",
                 "checkOnOpen": true,
                 "checkOnSave": true,

@@ -13,7 +13,7 @@ fn default_project_config_path() -> String {
     format!("{CONFIG_DIR}/{CONFIG_FILE}")
 }
 
-fn default_local_url() -> String {
+fn default_custom_url() -> String {
     "http://localhost:8081".to_string()
 }
 
@@ -25,7 +25,7 @@ fn default_cloud_url() -> String {
 #[serde(rename_all = "camelCase")]
 pub enum BackendKind {
     #[default]
-    Local,
+    Custom,
     Cloud,
 }
 
@@ -71,7 +71,7 @@ impl CheckingLevel {
 #[serde(default)]
 pub struct ClientOptions {
     pub backend: BackendKind,
-    pub backend_url: Option<String>,
+    pub custom_backend_url: String,
     pub username: Option<String>,
     pub api_key: Option<String>,
     pub language: String,
@@ -99,7 +99,7 @@ impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             backend: BackendKind::default(),
-            backend_url: None,
+            custom_backend_url: default_custom_url(),
             username: None,
             api_key: None,
             language: "en-US".to_string(),
@@ -147,15 +147,12 @@ impl ClientOptions {
     }
 
     pub fn base_url(&self) -> String {
-        let default_url;
-        let url = if let Some(url) = self.backend_url.as_deref() {
-            url
-        } else {
-            default_url = match self.backend {
-                BackendKind::Local => default_local_url(),
-                BackendKind::Cloud => default_cloud_url(),
-            };
-            default_url.as_str()
+        let url = match self.backend {
+            BackendKind::Custom => self.custom_backend_url.as_str(),
+            BackendKind::Cloud => {
+                let default_url = default_cloud_url();
+                return default_url.trim().trim_end_matches('/').to_string();
+            }
         };
         url.trim().trim_end_matches('/').to_string()
     }
@@ -183,7 +180,7 @@ impl ClientOptions {
 
     pub fn timeout(&self) -> Duration {
         match self.backend {
-            BackendKind::Local => Duration::from_secs(10),
+            BackendKind::Custom => Duration::from_secs(10),
             BackendKind::Cloud => Duration::from_secs(20),
         }
     }
@@ -348,7 +345,7 @@ mod tests {
 
         let options = ClientOptions {
             backend: BackendKind::Cloud,
-            backend_url: Some(" https://api.languagetool.org/ ".to_string()),
+            custom_backend_url: " https://custom.example.test/ ".to_string(),
             ..ClientOptions::default()
         };
         assert_eq!(options.base_url(), "https://api.languagetool.org");
@@ -369,7 +366,7 @@ mod tests {
             "diagnosticSeverity": "warning"
         })));
         assert_eq!(options.backend, BackendKind::Cloud);
-        assert_eq!(options.backend_url, None);
+        assert_eq!(options.custom_backend_url, default_custom_url());
         assert_eq!(options.base_url(), default_cloud_url());
         assert_eq!(options.enabled_rules, vec!["WHITESPACE_RULE"]);
         assert_eq!(options.enabled_categories, vec!["TYPOGRAPHY"]);
@@ -387,7 +384,7 @@ mod tests {
     fn merges_partial_option_updates() {
         let options = ClientOptions {
             backend: BackendKind::Cloud,
-            backend_url: Some("https://example.test".to_string()),
+            custom_backend_url: "https://example.test".to_string(),
             language: "de-DE".to_string(),
             debounce_ms: 750,
             check_on_save: false,
@@ -399,7 +396,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(options.backend, BackendKind::Cloud);
-        assert_eq!(options.backend_url.as_deref(), Some("https://example.test"));
+        assert_eq!(options.custom_backend_url, "https://example.test");
         assert_eq!(options.language, "de-DE");
         assert_eq!(options.debounce_ms, 100);
         assert!(!options.check_on_save);
@@ -409,31 +406,26 @@ mod tests {
     fn merges_flat_backend_option_updates() {
         let options = ClientOptions {
             backend: BackendKind::Cloud,
-            backend_url: Some("https://old.example.test".to_string()),
+            custom_backend_url: "https://old.example.test".to_string(),
             ..Default::default()
         };
 
         let options = options
             .merged_with_value(serde_json::json!({
-                "backendUrl": "https://new.example.test"
+                "customBackendUrl": "https://new.example.test"
             }))
             .unwrap();
         assert_eq!(options.backend, BackendKind::Cloud);
-        assert_eq!(
-            options.backend_url.as_deref(),
-            Some("https://new.example.test")
-        );
+        assert_eq!(options.custom_backend_url, "https://new.example.test");
+        assert_eq!(options.base_url(), default_cloud_url());
 
         let options = options
             .merged_with_value(serde_json::json!({
-                "backend": "local"
+                "backend": "custom"
             }))
             .unwrap();
-        assert_eq!(options.backend, BackendKind::Local);
-        assert_eq!(
-            options.backend_url.as_deref(),
-            Some("https://new.example.test")
-        );
+        assert_eq!(options.backend, BackendKind::Custom);
+        assert_eq!(options.base_url(), "https://new.example.test");
     }
 
     #[test]
