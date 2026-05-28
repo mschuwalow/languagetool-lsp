@@ -242,8 +242,12 @@ pub struct ProjectConfig {
 
 impl ProjectConfig {
     pub async fn load(path: &Path) -> Self {
-        let Ok(text) = tokio::fs::read_to_string(path).await else {
-            return Self::default();
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(err) => {
+                log::debug!("Failed to read {}: {err}", path.display());
+                return Self::default();
+            }
         };
 
         serde_json::from_str(&text).unwrap_or_else(|err| {

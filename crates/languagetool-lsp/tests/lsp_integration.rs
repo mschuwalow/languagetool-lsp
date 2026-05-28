@@ -622,7 +622,8 @@ async fn initialize_workspace_root_controls_project_config_location() {
 async fn execute_command_reports_project_config_save_failure() {
     let mut ctx = TestContext::new();
     ctx.initialize().await;
-    std::fs::create_dir_all(ctx.project_config_path())
+    tokio::fs::create_dir_all(ctx.project_config_path())
+        .await
         .expect("directory at config path should be created");
 
     let error = ctx
@@ -717,7 +718,8 @@ async fn execute_ignore_word_command_writes_project_config() {
         .await;
 
     assert_eq!(result, Value::Null);
-    let config = std::fs::read_to_string(ctx.project_config_path())
+    let config = tokio::fs::read_to_string(ctx.project_config_path())
+        .await
         .expect("ignore command should write project config");
     let config: Value = serde_json::from_str(&config).expect("project config should be JSON");
     assert_eq!(config["ignored_words"], json!(["tset"]));
@@ -744,7 +746,8 @@ async fn execute_command_uses_configured_project_config_path() {
     assert_eq!(result, Value::Null);
     assert!(!ctx.project_config_path().exists());
     let config_path = ctx.workspace.path().join(".idea/languagetool.json");
-    let config = std::fs::read_to_string(config_path)
+    let config = tokio::fs::read_to_string(config_path)
+        .await
         .expect("ignore command should write configured project config");
     let config: Value = serde_json::from_str(&config).expect("project config should be JSON");
     assert_eq!(config["ignored_words"], json!(["tset"]));
@@ -818,12 +821,14 @@ async fn invalid_configuration_change_keeps_previous_options() {
 async fn existing_project_config_is_loaded_on_initialize() {
     let mut ctx = TestContext::new();
     let config_path = ctx.workspace.path().join(".idea/languagetool.json");
-    std::fs::create_dir_all(config_path.parent().unwrap())
+    tokio::fs::create_dir_all(config_path.parent().unwrap())
+        .await
         .expect("project config directory should be created");
-    std::fs::write(
+    tokio::fs::write(
         &config_path,
         serde_json::to_string_pretty(&json!({ "ignored_words": ["tset"] })).unwrap(),
     )
+    .await
     .expect("project config should be written");
 
     ctx.initialize_with_options(json!({

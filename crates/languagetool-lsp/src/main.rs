@@ -85,7 +85,7 @@ async fn check(root: &Path, files: Vec<PathBuf>) {
 
     for path in files {
         log::debug!("Reading {}", path.display());
-        let text = match std::fs::read_to_string(&path) {
+        let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
             Err(err) => {
                 log::debug!("Failed to read {}: {err}", path.display());
