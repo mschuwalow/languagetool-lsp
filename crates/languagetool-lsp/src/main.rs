@@ -50,14 +50,16 @@ async fn serve(root: &Path) {
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
-fn cli_options(root: &Path) -> ClientOptions {
+async fn cli_options(root: &Path) -> ClientOptions {
     let options = ClientOptions::default();
-    ProjectConfig::load(&options.project_config_path(root)).merged_options(&options)
+    ProjectConfig::load(&options.project_config_path(root))
+        .await
+        .merged_options(&options)
 }
 
 async fn health(root: &Path) {
     log::info!("Checking LanguageTool health");
-    let options = cli_options(root);
+    let options = cli_options(root).await;
     let client = LanguageToolClient::new();
     match client.check("This are a tset.", &options).await {
         Ok(response) => {
@@ -76,7 +78,7 @@ async fn health(root: &Path) {
 }
 
 async fn check(root: &Path, files: Vec<PathBuf>) {
-    let options = cli_options(root);
+    let options = cli_options(root).await;
     let client = LanguageToolClient::new();
     let mut had_errors = false;
     log::info!("Checking {} file(s) with LanguageTool", files.len());

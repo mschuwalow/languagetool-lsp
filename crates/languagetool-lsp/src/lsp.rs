@@ -43,7 +43,11 @@ struct CheckRequest {
 
 enum PreparedCheck {
     Check(Box<CheckRequest>),
-    Clear { uri: Url, version: i32 },
+    Clear {
+        uri: Url,
+        version: i32,
+        token: DocumentToken,
+    },
 }
 
 impl Backend {
@@ -57,25 +61,26 @@ impl Backend {
         }
     }
 
-    fn options(&self) -> ClientOptions {
-        self.config.options()
+    async fn options(&self) -> ClientOptions {
+        self.config.options().await
     }
 
-    fn schedule_check(&self, uri: Url) {
+    async fn schedule_check(&self, uri: Url) {
         let Some(token) = self.documents.token(&uri) else {
             log::debug!("Skipping check schedule for {uri}: document not cached");
             return;
         };
-        let debounce = self.options().debounce_ms;
+        let debounce = self.options().await.debounce_ms;
         log::debug!("Scheduling check for {uri} token={token:?} debounce_ms={debounce}");
         let backend = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
+            let options = backend.options().await;
             let prepared = {
                 backend
                     .documents
                     .with_bumped_entry_if_current(&uri, token, |entry| {
-                        backend.prepare_check_entry(entry)
+                        backend.prepare_check_entry(entry, options)
                     })
             };
             if let Some(prepared) = prepared {
@@ -88,9 +93,10 @@ impl Backend {
     }
 
     async fn check_uri_now(&self, uri: &Url) {
+        let options = self.options().await;
         let Some(prepared) = self
             .documents
-            .with_bumped_entry(uri, |entry| self.prepare_check_entry(entry))
+            .with_bumped_entry(uri, |entry| self.prepare_check_entry(entry, options))
         else {
             log::debug!("Skipping immediate check for {uri}: document not cached");
             return;
@@ -109,9 +115,17 @@ impl Backend {
     async fn run_prepared_check(&self, prepared: PreparedCheck) {
         let request = match prepared {
             PreparedCheck::Check(request) => request,
-            PreparedCheck::Clear { uri, version } => {
+            PreparedCheck::Clear {
+                uri,
+                version,
+                token,
+            } => {
                 log::debug!("Document {uri} is not checkable; clearing diagnostics");
-                self.clear_stale_diagnostics(&uri, Some(version)).await;
+                if self.documents.is_current(&uri, token) {
+                    self.clear_stale_diagnostics(&uri, Some(version)).await;
+                } else {
+                    log::debug!("Skipping stale diagnostic clear for {uri} token={token:?}");
+                }
                 return;
             }
         };
@@ -174,16 +188,16 @@ impl Backend {
             .await;
     }
 
-    fn prepare_check_entry(&self, entry: &DocumentEntry) -> PreparedCheck {
+    fn prepare_check_entry(&self, entry: &DocumentEntry, options: ClientOptions) -> PreparedCheck {
         let document = entry.document();
         let token = entry.token();
-        let options = self.options();
         let Some(checkable_document) =
             document.checkable(|language| options.language_enabled(&language))
         else {
             return PreparedCheck::Clear {
                 uri: document.uri().clone(),
                 version: document.version(),
+                token,
             };
         };
 
@@ -224,23 +238,24 @@ impl Backend {
         }
     }
 
-    fn project_config_path(&self) -> PathBuf {
-        let root = self.root.read().expect("workspace root poisoned");
-        self.config.project_config_path(&root)
+    async fn project_config_path(&self) -> PathBuf {
+        let root = self.root.read().expect("workspace root poisoned").clone();
+        self.config.project_config_path(&root).await
     }
 
-    fn project_config_display_path(&self) -> String {
-        self.config.project_config_display_path()
+    async fn project_config_display_path(&self) -> String {
+        self.config.project_config_display_path().await
     }
 
-    fn update_project_config(
+    async fn update_project_config(
         &self,
         update: impl FnOnce(&mut ProjectConfig) -> bool,
     ) -> Result<bool, String> {
-        let project_config_path = self.project_config_path();
+        let project_config_path = self.project_config_path().await;
         let updated = self
             .config
-            .update_project_config(&project_config_path, update)?;
+            .update_project_config(&project_config_path, update)
+            .await?;
 
         if !updated {
             log::debug!("Project config update made no changes");
@@ -256,16 +271,19 @@ impl Backend {
 
     async fn add_ignored_word(&self, word: &str) -> Result<bool, String> {
         self.update_project_config(|project_config| project_config.add_ignored_word(word))
+            .await
     }
 
     async fn add_disabled_rule(&self, rule_id: &str) -> Result<bool, String> {
         self.update_project_config(|project_config| project_config.add_disabled_rule(rule_id))
+            .await
     }
 
     async fn add_disabled_category(&self, category_id: &str) -> Result<bool, String> {
         self.update_project_config(|project_config| {
             project_config.add_disabled_category(category_id)
         })
+        .await
     }
 }
 
@@ -361,8 +379,8 @@ impl LanguageServer for Backend {
         }
         let client_options = ClientOptions::from_value(params.initialization_options);
         let root = self.root.read().expect("workspace root poisoned").clone();
-        self.config.set_client_options(client_options, &root);
-        let options = self.options();
+        self.config.set_client_options(client_options, &root).await;
+        let options = self.options().await;
         log::info!(
             "LanguageTool LSP initialized for {} using {}",
             root.display(),
@@ -407,7 +425,7 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        let options = self.options();
+        let options = self.options().await;
         log::info!("LanguageTool LSP ready: {}", options.endpoint());
         self.client
             .log_message(
@@ -431,7 +449,7 @@ impl LanguageServer for Backend {
             params.text_document.text.len()
         );
         self.documents.insert(&params.text_document);
-        if self.options().check_on_open {
+        if self.options().await.check_on_open {
             self.check_uri_now(&uri).await;
         } else {
             log::debug!("Skipping open check for {uri}: check_on_open=false");
@@ -454,8 +472,8 @@ impl LanguageServer for Backend {
             self.clear_stale_diagnostics(&uri, Some(params.text_document.version))
                 .await;
         }
-        if had_changes && self.options().check_while_typing {
-            self.schedule_check(uri);
+        if had_changes && self.options().await.check_while_typing {
+            self.schedule_check(uri).await;
         } else if had_changes {
             log::debug!("Skipping typing check for {uri}: check_while_typing=false");
         }
@@ -464,7 +482,7 @@ impl LanguageServer for Backend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         log::info!("Saved document {uri}");
-        if self.options().check_on_save {
+        if self.options().await.check_on_save {
             self.check_uri_now(&uri).await;
         } else {
             log::debug!("Skipping save check for {uri}: check_on_save=false");
@@ -481,7 +499,7 @@ impl LanguageServer for Backend {
     async fn code_action(&self, params: CodeActionParams) -> RpcResult<Option<CodeActionResponse>> {
         let mut actions = Vec::new();
         let uri = params.text_document.uri;
-        let project_config_display_path = self.project_config_display_path();
+        let project_config_display_path = self.project_config_display_path().await;
         let diagnostic_count = params.context.diagnostics.len();
         log::debug!("Building code actions for {uri} diagnostics={diagnostic_count}");
 
@@ -552,7 +570,11 @@ impl LanguageServer for Backend {
         if params.settings != Value::Null {
             log::info!("LanguageTool configuration changed; reloading options and project config");
             let root = self.root.read().expect("workspace root poisoned").clone();
-            if let Err(err) = self.config.update_client_options(params.settings, &root) {
+            if let Err(err) = self
+                .config
+                .update_client_options(params.settings, &root)
+                .await
+            {
                 let message = format!(
                     "Ignoring invalid LanguageTool configuration change; keeping previous options: {err}"
                 );

@@ -241,8 +241,8 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    pub fn load(path: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
+    pub async fn load(path: &Path) -> Self {
+        let Ok(text) = tokio::fs::read_to_string(path).await else {
             return Self::default();
         };
 
@@ -252,12 +252,12 @@ impl ProjectConfig {
         })
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    pub async fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         let text = self.to_json_string();
-        std::fs::write(path, text)
+        tokio::fs::write(path, text).await
     }
 
     pub fn to_json_string(&self) -> String {
