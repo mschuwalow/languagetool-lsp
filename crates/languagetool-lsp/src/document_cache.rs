@@ -1,4 +1,4 @@
-pub use crate::document::{CompletedCheckBlock, PreparedCheck, PreparedCheckData};
+pub use crate::document::{CompletedCheckBlock, PreparedCheck};
 use crate::document::{Document, DocumentChangeStatus};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,10 +6,6 @@ use std::sync::{Arc, RwLock};
 use tower_lsp::lsp_types::{Diagnostic, TextDocumentContentChangeEvent, TextDocumentItem, Url};
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(0);
-
-fn next_document_id() -> u64 {
-    NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed)
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct DocumentCache {
@@ -28,6 +24,17 @@ pub struct DocumentToken {
     document_id: u64,
     version: i32,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStatus {
+    Applied,
+    OutOfSync,
+    Stale,
+}
+
+fn next_document_id() -> u64 {
+    NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl DocumentToken {
@@ -53,13 +60,6 @@ impl DocumentToken {
     pub(crate) fn new_for_test(document_id: u64, version: i32, generation: u64) -> Self {
         Self::new(document_id, version, generation)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeStatus {
-    Applied,
-    OutOfSync,
-    Stale,
 }
 
 impl DocumentEntry {

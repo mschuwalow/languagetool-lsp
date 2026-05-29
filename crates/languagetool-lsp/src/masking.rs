@@ -227,6 +227,24 @@ impl ParsedMask {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Range {
+    start: usize,
+    end: usize,
+}
+
+/// Full span of a comment node (including markers) and its content range
+/// (with markers and surrounding whitespace stripped).
+#[derive(Debug, Clone, Copy)]
+struct CommentInfo {
+    /// Full byte span of the comment node, including `//`, `/*`, `*/`, etc.
+    node_range: Range,
+    /// Byte span of the comment content after stripping markers and leading/trailing whitespace.
+    content_range: Range,
+    /// True if the comment starts with `/*` (block comment).
+    is_block: bool,
+}
+
 fn parse_markdown_tree(
     parser: &mut MarkdownParser,
     text: &str,
@@ -304,24 +322,6 @@ fn strip_hash_comment(source: &str, node: Node<'_>) -> Option<(usize, usize)> {
     let node_end = node.end_byte();
     let text = source.get(node_start..node_end)?;
     text.starts_with('#').then_some((node_start + 1, node_end))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Range {
-    start: usize,
-    end: usize,
-}
-
-/// Full span of a comment node (including markers) and its content range
-/// (with markers and surrounding whitespace stripped).
-#[derive(Debug, Clone, Copy)]
-struct CommentInfo {
-    /// Full byte span of the comment node, including `//`, `/*`, `*/`, etc.
-    node_range: Range,
-    /// Byte span of the comment content after stripping markers and leading/trailing whitespace.
-    content_range: Range,
-    /// True if the comment starts with `/*` (block comment).
-    is_block: bool,
 }
 
 fn collect_comment_infos(

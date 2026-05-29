@@ -28,6 +28,15 @@ pub enum BackendKind {
     Cloud,
 }
 
+impl BackendKind {
+    pub fn timeout(self) -> Duration {
+        match self {
+            BackendKind::Custom => Duration::from_secs(10),
+            BackendKind::Cloud => Duration::from_secs(20),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DiagnosticSeverityConfig {
@@ -171,13 +180,6 @@ impl ClientOptions {
 
     pub fn project_config_display_path(&self) -> String {
         self.project_config_path.trim().to_string()
-    }
-
-    pub fn timeout(&self) -> Duration {
-        match self.backend {
-            BackendKind::Custom => Duration::from_secs(10),
-            BackendKind::Cloud => Duration::from_secs(20),
-        }
     }
 
     pub fn configured_severity(&self) -> DiagnosticSeverity {

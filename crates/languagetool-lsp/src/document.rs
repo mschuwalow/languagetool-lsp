@@ -308,7 +308,7 @@ impl SupportedDocument {
                 .store_checked_block(checked.byte_range, checked.diagnostics);
         }
 
-        self.diagnostics_cache.diagnostics()
+        self.diagnostics_cache.diagnostics(self.version)
     }
 }
 

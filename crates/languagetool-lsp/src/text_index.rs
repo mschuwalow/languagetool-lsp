@@ -96,16 +96,6 @@ pub struct TextIndex {
     total_bytes: usize,
 }
 
-struct LineEditWindow {
-    line_first: usize,
-    line_replace_end: usize,
-    byte_start: usize,
-    byte_end: usize,
-    utf16_start: usize,
-    include_trailing_line: bool,
-    utf16_delta: isize,
-}
-
 impl TextIndex {
     pub fn new(text: &str) -> Self {
         let mut line_starts_utf16 = vec![0usize];
@@ -402,6 +392,16 @@ impl TextIndex {
         self.line_ends_utf16
             .splice(window.line_first..window.line_replace_end, new_ends);
     }
+}
+
+struct LineEditWindow {
+    line_first: usize,
+    line_replace_end: usize,
+    byte_start: usize,
+    byte_end: usize,
+    utf16_start: usize,
+    include_trailing_line: bool,
+    utf16_delta: isize,
 }
 
 fn line_tables_for_segment(

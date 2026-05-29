@@ -1,4 +1,4 @@
-use crate::config::ClientOptions;
+use crate::config::{BackendKind, ClientOptions};
 use languagetool_client as api;
 use serde::Serialize;
 use thiserror::Error;
@@ -16,12 +16,6 @@ pub type LanguageToolCategory =
 #[derive(Debug, Error)]
 pub enum LanguageToolError {
     #[error("LanguageTool request to {endpoint} failed: {source}")]
-    Request {
-        endpoint: String,
-        #[source]
-        source: reqwest::Error,
-    },
-    #[error("LanguageTool request to {endpoint} failed: {source}")]
     Api {
         endpoint: String,
         #[source]
@@ -30,7 +24,10 @@ pub enum LanguageToolError {
 }
 
 #[derive(Debug, Clone)]
-pub struct LanguageToolClient;
+pub struct LanguageToolClient {
+    custom_client: reqwest::Client,
+    cloud_client: reqwest::Client,
+}
 
 impl Default for LanguageToolClient {
     fn default() -> Self {
@@ -40,7 +37,10 @@ impl Default for LanguageToolClient {
 
 impl LanguageToolClient {
     pub fn new() -> Self {
-        Self
+        Self {
+            custom_client: http_client(BackendKind::Custom),
+            cloud_client: http_client(BackendKind::Cloud),
+        }
     }
 
     pub async fn check_annotated(
@@ -77,16 +77,9 @@ impl LanguageToolClient {
             _ => (None, None),
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(options.timeout())
-            .build()
-            .map_err(|source| LanguageToolError::Request {
-                endpoint: endpoint.clone(),
-                source,
-            })?;
         let configuration = api::apis::configuration::Configuration {
             base_path: api_base_url,
-            client,
+            client: self.client_for(options).clone(),
             ..api::apis::configuration::Configuration::default()
         };
 
@@ -116,6 +109,13 @@ impl LanguageToolClient {
         );
         Ok(response)
     }
+
+    fn client_for(&self, options: &ClientOptions) -> &reqwest::Client {
+        match options.backend {
+            BackendKind::Custom => &self.custom_client,
+            BackendKind::Cloud => &self.cloud_client,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +129,11 @@ impl From<api::models::CheckPost200Response> for LanguageToolResponse {
             matches: response.matches.unwrap_or_default().into_iter().collect(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnotatedText {
+    pub annotation: Vec<Annotation>,
 }
 
 fn join_parameter(values: &[String]) -> String {
@@ -146,11 +151,6 @@ fn none_if_empty(value: &str) -> Option<&str> {
     } else {
         Some(value)
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AnnotatedText {
-    pub annotation: Vec<Annotation>,
 }
 
 impl AnnotatedText {
@@ -210,6 +210,13 @@ impl Annotation {
             Annotation::Markup { interpret_as, .. } => interpret_as.as_deref(),
         }
     }
+}
+
+fn http_client(backend: BackendKind) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(backend.timeout())
+        .build()
+        .expect("LanguageTool HTTP client should build")
 }
 
 #[cfg(test)]

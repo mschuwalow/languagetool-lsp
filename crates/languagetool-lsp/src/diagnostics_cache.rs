@@ -1,3 +1,4 @@
+use crate::diagnostics::DiagnosticData;
 use crate::text_index::{ByteRange, TextIndex};
 use tower_lsp::lsp_types::{Diagnostic, Range};
 
@@ -36,11 +37,11 @@ impl DiagnosticsCache {
         let delta = new_len as isize - old_len as isize;
 
         self.blocks.retain_mut(|block| {
-            if ranges_overlap(&block.byte_range, edit) {
+            if edit_invalidates_block(&block.byte_range, edit) {
                 return false;
             }
 
-            if block.byte_range.start.0 >= edit.end.0 {
+            if block.byte_range.start.0 >= edit.end.0 && block.byte_range.start.0 != edit.start.0 {
                 shift_range(&mut block.byte_range, delta);
                 for diagnostic in &mut block.diagnostics {
                     shift_range(&mut diagnostic.doc_byte_range, delta);
@@ -75,14 +76,14 @@ impl DiagnosticsCache {
         );
     }
 
-    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+    pub fn diagnostics(&mut self, document_version: i32) -> Vec<Diagnostic> {
         self.blocks
-            .iter()
+            .iter_mut()
             .flat_map(|block| {
-                block
-                    .diagnostics
-                    .iter()
-                    .map(|diagnostic| diagnostic.diagnostic.clone())
+                block.diagnostics.iter_mut().map(|diagnostic| {
+                    update_diagnostic_document_version(diagnostic, document_version);
+                    diagnostic.diagnostic.clone()
+                })
             })
             .collect()
     }
@@ -91,6 +92,25 @@ impl DiagnosticsCache {
         self.blocks
             .binary_search_by_key(&range_key(byte_range), |block| range_key(&block.byte_range))
     }
+}
+
+fn edit_invalidates_block(block: &ByteRange, edit: &ByteRange) -> bool {
+    if edit.start == edit.end {
+        return block.start <= edit.start && edit.start <= block.end;
+    }
+
+    ranges_overlap(block, edit)
+}
+
+fn update_diagnostic_document_version(diagnostic: &mut CachedDiagnostic, document_version: i32) {
+    let Some(data) = diagnostic.diagnostic.data.clone() else {
+        return;
+    };
+    let Ok(mut data) = serde_json::from_value::<DiagnosticData>(data) else {
+        return;
+    };
+    data.document_version = Some(document_version);
+    diagnostic.diagnostic.data = serde_json::to_value(data).ok();
 }
 
 fn range_key(range: &ByteRange) -> (usize, usize) {
@@ -155,7 +175,7 @@ mod tests {
         let index = TextIndex::new("abcxxxxx0123456789012345");
         cache.apply_edit(&ByteRange::new(3, 3), 5, &index);
         assert!(cache.contains_block(&ByteRange::new(15, 25)));
-        let diagnostics = cache.diagnostics();
+        let diagnostics = cache.diagnostics(1);
 
         assert_eq!(diagnostics[0].range.start, Position::new(0, 17));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 21));
@@ -170,6 +190,39 @@ mod tests {
         cache.apply_edit(&ByteRange::new(12, 15), 5, &index);
 
         assert!(!cache.contains_block(&ByteRange::new(10, 22)));
+    }
+
+    #[test]
+    fn insertion_at_block_boundary_drops_block() {
+        let mut cache = DiagnosticsCache::default();
+        cache.store_checked_block(ByteRange::new(0, 10), vec![cached_diagnostic(2, 5)]);
+
+        let index = TextIndex::new("0123456789x");
+        cache.apply_edit(&ByteRange::new(10, 10), 1, &index);
+
+        assert!(!cache.contains_block(&ByteRange::new(0, 10)));
+    }
+
+    #[test]
+    fn diagnostics_refresh_embedded_document_version() {
+        let mut cache = DiagnosticsCache::default();
+        let mut diagnostic = cached_diagnostic(0, 4);
+        diagnostic.diagnostic.data = serde_json::to_value(DiagnosticData {
+            rule_id: "RULE".to_string(),
+            category_id: None,
+            issue_type: None,
+            replacements: Vec::new(),
+            matched_text: "test".to_string(),
+            document_version: Some(1),
+        })
+        .ok();
+        cache.store_checked_block(ByteRange::new(0, 4), vec![diagnostic]);
+
+        let diagnostics = cache.diagnostics(2);
+        let data: DiagnosticData =
+            serde_json::from_value(diagnostics[0].data.clone().unwrap()).unwrap();
+
+        assert_eq!(data.document_version, Some(2));
     }
 
     #[test]
