@@ -32,9 +32,18 @@ pub fn make_lsp_diagnostic(
     };
     let start = index.position(offset);
     let end = index.position(end);
+    make_lsp_diagnostic_for_range(Range { start, end }, item, data, options)
+}
+
+pub fn make_lsp_diagnostic_for_range(
+    range: Range,
+    item: &LanguageToolMatch,
+    data: DiagnosticData,
+    options: &ClientOptions,
+) -> Diagnostic {
     let rule_id = item.rule.as_ref().map(|rule| rule.id.as_str());
     Diagnostic {
-        range: Range { start, end },
+        range,
         severity: Some(severity_for(item, options)),
         code: rule_id.map(|rule_id| NumberOrString::String(rule_id.to_string())),
         code_description: rule_id.and_then(|rule_id| code_description(rule_id, &options.language)),
@@ -58,6 +67,15 @@ pub fn diagnostic_data(
         .text_for_utf16_range(text, range)
         .unwrap_or_default()
         .to_string();
+    diagnostic_data_for_text(matched_text, item, options, document_version)
+}
+
+pub fn diagnostic_data_for_text(
+    matched_text: String,
+    item: &LanguageToolMatch,
+    options: &ClientOptions,
+    document_version: Option<i32>,
+) -> DiagnosticData {
     let rule = item.rule.as_deref();
     let category_id = rule.and_then(|rule| rule.category.id.clone());
     let replacements = item

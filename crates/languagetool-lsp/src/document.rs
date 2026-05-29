@@ -1,6 +1,5 @@
 use crate::language::{DocumentLanguage, SupportedLanguage};
-use crate::languagetool::AnnotatedText;
-use crate::masking::Masker;
+use crate::masking::{CheckBlock, Masker};
 use crate::text_index::{ByteRange, TextIndex};
 use tower_lsp::lsp_types::{TextDocumentItem, Url};
 
@@ -39,42 +38,25 @@ struct OutOfSyncDocument {
     language: Option<SupportedLanguage>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DocumentChangeStatus {
-    Applied,
+    Incremental(AppliedEdit),
+    FullReplace,
     OutOfSync,
 }
 
-pub struct CheckableDocument<'a> {
-    document: &'a SupportedDocument,
-    annotated: AnnotatedText,
-    ignored_byte_ranges: Vec<ByteRange>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedEdit {
+    pub byte_range: ByteRange,
+    pub new_len: usize,
 }
 
-impl CheckableDocument<'_> {
-    pub fn uri(&self) -> &Url {
-        &self.document.uri
-    }
-
-    pub fn version(&self) -> i32 {
-        self.document.version
-    }
-
-    pub fn annotated(&self) -> &AnnotatedText {
-        &self.annotated
-    }
-
-    pub fn ignored_byte_ranges(&self) -> &[ByteRange] {
-        &self.ignored_byte_ranges
-    }
-
-    pub fn text(&self) -> &str {
-        &self.document.text
-    }
-
-    pub fn index(&self) -> &TextIndex {
-        &self.document.index
-    }
+pub struct CheckableDocument<'a> {
+    pub uri: &'a Url,
+    pub version: i32,
+    pub text: &'a str,
+    pub index: &'a TextIndex,
+    pub check_blocks: Vec<CheckBlock>,
 }
 
 impl Document {
@@ -134,6 +116,10 @@ impl Document {
         }
     }
 
+    pub(crate) fn index(&self) -> Option<&TextIndex> {
+        self.supported().map(|document| &document.index)
+    }
+
     pub fn checkable(
         &self,
         language_enabled: impl FnOnce(SupportedLanguage) -> bool,
@@ -154,21 +140,21 @@ impl Document {
             return None;
         }
 
-        let annotated = document.mask.annotated(&document.text);
-        if !annotated.has_text() {
+        let check_blocks = document.mask.check_blocks(&document.text);
+        if check_blocks.is_empty() {
             log::debug!(
-                "Skipping {} because language {:?} produced no checkable text",
+                "Skipping {} because language {:?} produced no checkable blocks",
                 document.uri,
                 document.language
             );
             return None;
         }
-
-        let ignored_byte_ranges = document.mask.ignored_byte_ranges(&document.text);
         Some(CheckableDocument {
-            document,
-            ignored_byte_ranges,
-            annotated,
+            uri: &document.uri,
+            version: document.version,
+            text: &document.text,
+            index: &document.index,
+            check_blocks,
         })
     }
 
@@ -202,30 +188,28 @@ impl Document {
         version: i32,
         range: tower_lsp::lsp_types::Range,
         new_text: &str,
-    ) -> DocumentChangeStatus {
+    ) -> Option<DocumentChangeStatus> {
         match &mut self.kind {
             DocumentKind::Supported(document) => {
-                match document.incremental_update(version, range, new_text) {
-                    DocumentChangeStatus::Applied => DocumentChangeStatus::Applied,
-                    DocumentChangeStatus::OutOfSync => {
-                        let uri = document.uri.clone();
-                        let language = document.language;
-                        self.kind = DocumentKind::OutOfSync(OutOfSyncDocument {
-                            uri,
-                            version,
-                            language: Some(language),
-                        });
-                        DocumentChangeStatus::OutOfSync
-                    }
+                let status = document.incremental_update(version, range, new_text);
+                if status == DocumentChangeStatus::OutOfSync {
+                    let uri = document.uri.clone();
+                    let language = document.language;
+                    self.kind = DocumentKind::OutOfSync(OutOfSyncDocument {
+                        uri,
+                        version,
+                        language: Some(language),
+                    });
                 }
+                Some(status)
             }
             DocumentKind::Unsupported(document) => {
                 document.version = version;
-                DocumentChangeStatus::Applied
+                None
             }
             DocumentKind::OutOfSync(document) => {
                 document.version = version;
-                DocumentChangeStatus::OutOfSync
+                Some(DocumentChangeStatus::OutOfSync)
             }
         }
     }
@@ -281,7 +265,10 @@ impl SupportedDocument {
         self.mask
             .apply_edit(&old_text, &self.text, &bytes, new_text);
         self.version = version;
-        DocumentChangeStatus::Applied
+        DocumentChangeStatus::Incremental(AppliedEdit {
+            byte_range: bytes,
+            new_len: new_text.len(),
+        })
     }
 }
 
@@ -342,7 +329,7 @@ mod tests {
             "x",
         );
 
-        assert_eq!(status, DocumentChangeStatus::OutOfSync);
+        assert_eq!(status, Some(DocumentChangeStatus::OutOfSync));
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
         assert!(document.checkable(|_| true).is_none());
@@ -357,7 +344,7 @@ mod tests {
             "x",
         );
 
-        assert_eq!(status, DocumentChangeStatus::OutOfSync);
+        assert_eq!(status, Some(DocumentChangeStatus::OutOfSync));
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
     }
@@ -389,12 +376,12 @@ mod tests {
         document.full_update(3, "let code = 1; // This are new docs.".to_string());
 
         let document = supported_document(&document);
-        let data = document.mask.annotated(&document.text);
-        let checked = data
-            .annotation
+        let blocks = document.mask.check_blocks(&document.text);
+        let checked: String = blocks
             .iter()
+            .flat_map(|b| b.annotated.annotation.iter())
             .filter_map(|annotation| annotation.as_text())
-            .collect::<String>();
+            .collect();
 
         assert_eq!(checked, "This are new docs.");
     }
@@ -473,12 +460,12 @@ mod tests {
         );
 
         let document = supported_document(&document);
-        let data = document.mask.annotated(&document.text);
-        let checked = data
-            .annotation
+        let blocks = document.mask.check_blocks(&document.text);
+        let checked: String = blocks
             .iter()
+            .flat_map(|b| b.annotated.annotation.iter())
             .filter_map(|annotation| annotation.as_text())
-            .collect::<String>();
+            .collect();
 
         assert_eq!(checked, "This are new docs.");
         assert!(!checked.contains("This are code"));
@@ -511,12 +498,13 @@ mod tests {
         assert!(document.checkable(|_| true).is_none());
         assert_eq!(document.version(), 1);
 
-        document.incremental_update(
+        let status = document.incremental_update(
             2,
             Range::new(Position::new(0, 0), Position::new(0, 4)),
             "That",
         );
 
+        assert_eq!(status, None);
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
         assert!(document.checkable(|_| true).is_none());
         assert_eq!(document.version(), 2);

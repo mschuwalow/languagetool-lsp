@@ -703,6 +703,75 @@ async fn check_failure_clears_stale_diagnostics() {
 }
 
 #[tokio::test]
+async fn cached_block_diagnostics_are_republished_without_rechecking() {
+    let server = MockServer::start();
+    let check = server.mock(|when, then| {
+        when.method(POST).path("/v2/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{
+                    "matches": [{
+                        "message": "Possible issue found.",
+                        "offset": 3,
+                        "length": 5,
+                        "replacements": [],
+                        "context": {"text": "dummy", "offset": 3, "length": 5},
+                        "sentence": "dummy",
+                        "rule": {
+                            "id": "TEST_RULE",
+                            "description": "Test rule",
+                            "issueType": "grammar",
+                            "category": {"id": "GRAMMAR", "name": "Grammar"}
+                        }
+                    }]
+                }"#,
+            );
+    });
+    let mut ctx = TestContext::new();
+    ctx.initialize_with_options(json!({
+        "backend": "custom",
+        "customBackendUrl": server.base_url(),
+        "checkWhileTyping": false,
+        "checkOnSave": true
+    }))
+    .await;
+    let uri = ctx.doc_uri("document.rs");
+
+    ctx.open_document(&uri, "rust", "// First are bad.\n\n// Second are bad.\n")
+        .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(check.calls(), 2);
+
+    ctx.change_document(
+        &uri,
+        2,
+        json!([{
+            "range": {
+                "start": { "line": 2, "character": 3 },
+                "end":   { "line": 2, "character": 9 }
+            },
+            "text": "Third!"
+        }]),
+    )
+    .await;
+    ctx.save_document(&uri).await;
+
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0]["range"]["start"]["line"], json!(0));
+    assert_eq!(diagnostics[1]["range"]["start"]["line"], json!(2));
+    assert_eq!(check.calls(), 3);
+}
+
+#[tokio::test]
 async fn execute_ignore_word_command_writes_project_config() {
     let mut ctx = TestContext::new();
     ctx.initialize().await;

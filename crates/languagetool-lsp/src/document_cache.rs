@@ -1,8 +1,12 @@
+use crate::diagnostics_cache::{CachedDiagnostic, DiagnosticsCache};
 use crate::document::{Document, DocumentChangeStatus};
+use crate::language::SupportedLanguage;
+use crate::masking::CheckBlock;
+use crate::text_index::{ByteRange, TextIndex};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Url};
+use tower_lsp::lsp_types::{Diagnostic, TextDocumentContentChangeEvent, TextDocumentItem, Url};
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -20,6 +24,34 @@ pub struct DocumentEntry {
     document: Document,
     document_id: u64,
     generation: u64,
+    diagnostics_cache: DiagnosticsCache,
+}
+
+#[derive(Debug)]
+pub enum PreparedDocumentCheck {
+    Check(PreparedCheckData),
+    Clear { uri: Url, version: i32 },
+}
+
+#[derive(Debug)]
+pub struct PreparedCheckData {
+    pub uri: Url,
+    pub version: i32,
+    pub token: DocumentToken,
+    pub text: String,
+    pub index: TextIndex,
+    pub blocks: Vec<PreparedCheckBlock>,
+}
+
+#[derive(Debug)]
+pub struct PreparedCheckBlock {
+    pub block: CheckBlock,
+}
+
+#[derive(Debug)]
+pub struct CompletedCheckBlock {
+    pub byte_range: ByteRange,
+    pub diagnostics: Vec<CachedDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +92,73 @@ pub enum ChangeStatus {
 }
 
 impl DocumentEntry {
+    fn new(document: Document) -> Self {
+        Self {
+            document,
+            document_id: next_document_id(),
+            generation: 0,
+            diagnostics_cache: DiagnosticsCache::default(),
+        }
+    }
+
     pub fn document(&self) -> &Document {
         &self.document
     }
 
     pub fn token(&self) -> DocumentToken {
         DocumentToken::new(self.document_id, self.document.version(), self.generation)
+    }
+
+    fn prepare_check(
+        &mut self,
+        options_key: String,
+        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
+    ) -> PreparedDocumentCheck {
+        let Some(checkable_document) = self.document.checkable(language_enabled) else {
+            self.clear_diagnostics_cache();
+            return PreparedDocumentCheck::Clear {
+                uri: self.document.uri().clone(),
+                version: self.document.version(),
+            };
+        };
+
+        let uri = checkable_document.uri.clone();
+        let version = checkable_document.version;
+        let text = checkable_document.text.to_string();
+        let index = checkable_document.index.clone();
+        let check_blocks = checkable_document.check_blocks;
+
+        self.diagnostics_cache.reset_if_options_changed(options_key);
+
+        let blocks = check_blocks
+            .into_iter()
+            .filter_map(|block| {
+                (!self.diagnostics_cache.contains_block(&block.byte_range))
+                    .then_some(PreparedCheckBlock { block })
+            })
+            .collect();
+
+        PreparedDocumentCheck::Check(PreparedCheckData {
+            uri,
+            version,
+            token: self.token(),
+            text,
+            index,
+            blocks,
+        })
+    }
+
+    pub fn clear_diagnostics_cache(&mut self) {
+        self.diagnostics_cache.clear();
+    }
+
+    fn complete_check(&mut self, checked_blocks: Vec<CompletedCheckBlock>) -> Vec<Diagnostic> {
+        for checked in checked_blocks {
+            self.diagnostics_cache
+                .store_checked_block(checked.byte_range, checked.diagnostics);
+        }
+
+        self.diagnostics_cache.diagnostics()
     }
 }
 
@@ -78,11 +171,7 @@ impl DocumentCache {
             document.version()
         );
         let mut documents = self.documents.write().expect("document cache poisoned");
-        let entry = DocumentEntry {
-            document,
-            document_id: next_document_id(),
-            generation: 0,
-        };
+        let entry = DocumentEntry::new(document);
         documents.insert(entry.document.uri().to_string(), entry);
     }
 
@@ -99,14 +188,11 @@ impl DocumentCache {
         let key = uri.to_string();
         if let Some(entry) = documents.get_mut(&key) {
             entry.document.full_update(version, text);
+            entry.clear_diagnostics_cache();
         } else {
             documents.insert(
                 key,
-                DocumentEntry {
-                    document: Document::new(uri.clone(), version, None, text),
-                    document_id: next_document_id(),
-                    generation: 0,
-                },
+                DocumentEntry::new(Document::new(uri.clone(), version, None, text)),
             );
         }
     }
@@ -117,26 +203,38 @@ impl DocumentCache {
         version: i32,
         range: tower_lsp::lsp_types::Range,
         new_text: &str,
-    ) -> DocumentChangeStatus {
+    ) -> Option<DocumentChangeStatus> {
         log::debug!(
             "Applying ranged document change for {uri} version={version:?} range={range:?} replacement_bytes={}",
             new_text.len()
         );
         let key = uri.to_string();
         if let Some(entry) = documents.get_mut(&key) {
-            return entry.document.incremental_update(version, range, new_text);
+            let status = entry.document.incremental_update(version, range, new_text);
+            match &status {
+                Some(DocumentChangeStatus::Incremental(edit)) => {
+                    if let Some(index) = entry.document.index() {
+                        entry
+                            .diagnostics_cache
+                            .apply_edit(&edit.byte_range, edit.new_len, index);
+                    } else {
+                        entry.clear_diagnostics_cache();
+                    }
+                }
+                Some(DocumentChangeStatus::FullReplace | DocumentChangeStatus::OutOfSync)
+                | None => {
+                    entry.clear_diagnostics_cache();
+                }
+            }
+            return status;
         }
 
         log::error!("Received ranged change for uncached document {uri}; marking out of sync");
         documents.insert(
             key,
-            DocumentEntry {
-                document: Document::out_of_sync(uri.clone(), version),
-                document_id: next_document_id(),
-                generation: 0,
-            },
+            DocumentEntry::new(Document::out_of_sync(uri.clone(), version)),
         );
-        DocumentChangeStatus::OutOfSync
+        Some(DocumentChangeStatus::OutOfSync)
     }
 
     pub fn apply_changes(
@@ -164,9 +262,9 @@ impl DocumentCache {
                 Self::incremental_update_locked(&mut documents, uri, version, range, &change.text)
             } else {
                 Self::full_update_locked(&mut documents, uri, version, change.text);
-                DocumentChangeStatus::Applied
+                Some(DocumentChangeStatus::FullReplace)
             };
-            if change_status == DocumentChangeStatus::OutOfSync {
+            if change_status == Some(DocumentChangeStatus::OutOfSync) {
                 status = ChangeStatus::OutOfSync;
             }
         }
@@ -201,7 +299,7 @@ impl DocumentCache {
     pub fn with_bumped_entry<R>(
         &self,
         uri: &Url,
-        f: impl FnOnce(&DocumentEntry) -> R,
+        f: impl FnOnce(&mut DocumentEntry) -> R,
     ) -> Option<R> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
@@ -209,11 +307,39 @@ impl DocumentCache {
         Some(f(entry))
     }
 
+    pub fn prepare_check(
+        &self,
+        uri: &Url,
+        options_key: String,
+        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
+    ) -> Option<PreparedDocumentCheck> {
+        let mut documents = self.documents.write().expect("document cache poisoned");
+        let entry = documents.get_mut(uri.as_str())?;
+        entry.generation += 1;
+        Some(entry.prepare_check(options_key, language_enabled))
+    }
+
+    pub fn prepare_check_if_current(
+        &self,
+        uri: &Url,
+        token: DocumentToken,
+        options_key: String,
+        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
+    ) -> Option<PreparedDocumentCheck> {
+        let mut documents = self.documents.write().expect("document cache poisoned");
+        let entry = documents.get_mut(uri.as_str())?;
+        if entry.token() != token {
+            return None;
+        }
+        entry.generation += 1;
+        Some(entry.prepare_check(options_key, language_enabled))
+    }
+
     pub fn with_bumped_entry_if_current<R>(
         &self,
         uri: &Url,
         token: DocumentToken,
-        f: impl FnOnce(&DocumentEntry) -> R,
+        f: impl FnOnce(&mut DocumentEntry) -> R,
     ) -> Option<R> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
@@ -224,8 +350,18 @@ impl DocumentCache {
         Some(f(entry))
     }
 
-    pub fn is_current(&self, uri: &Url, token: DocumentToken) -> bool {
-        self.token(uri) == Some(token)
+    pub fn complete_check_if_current(
+        &self,
+        uri: &Url,
+        token: DocumentToken,
+        checked_blocks: Vec<CompletedCheckBlock>,
+    ) -> Option<Vec<Diagnostic>> {
+        let mut documents = self.documents.write().expect("document cache poisoned");
+        let entry = documents.get_mut(uri.as_str())?;
+        if entry.token() != token {
+            return None;
+        }
+        Some(entry.complete_check(checked_blocks))
     }
 
     pub fn urls(&self) -> Vec<Url> {
@@ -291,7 +427,7 @@ mod tests {
                 let checkable = document.checkable(|_| true).unwrap();
                 assert_eq!(status, ChangeStatus::Stale);
                 assert_eq!(document.version(), 3);
-                assert_eq!(checkable.text(), "new text");
+                assert_eq!(checkable.text, "new text");
             })
             .unwrap();
     }
@@ -326,7 +462,7 @@ mod tests {
                 let checkable = document.checkable(|_| true).unwrap();
                 assert_eq!(status, ChangeStatus::Applied);
                 assert_eq!(document.version(), 2);
-                assert_eq!(checkable.text(), "hi world!");
+                assert_eq!(checkable.text, "hi world!");
             })
             .unwrap();
     }

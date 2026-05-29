@@ -1,11 +1,15 @@
 use crate::config::{BackendKind, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
-    diagnostic_data, make_lsp_diagnostic, match_utf16_range, parse_diagnostic_data, SOURCE,
+    diagnostic_data_for_text, make_lsp_diagnostic_for_range, match_utf16_range,
+    parse_diagnostic_data, SOURCE,
 };
-use crate::document_cache::{ChangeStatus, DocumentCache, DocumentEntry, DocumentToken};
-use crate::languagetool::{
-    AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
+use crate::diagnostics_cache::CachedDiagnostic;
+use crate::document_cache::{
+    ChangeStatus, CompletedCheckBlock, DocumentCache, DocumentToken, PreparedCheckData,
+    PreparedDocumentCheck,
 };
+use crate::languagetool::{Annotation, LanguageToolClient, LanguageToolError, LanguageToolMatch};
+use crate::masking::CheckBlock;
 use crate::runtime_config::RuntimeConfig;
 use crate::text_index::{ByteRange, TextIndex, Utf16Range};
 use serde_json::Value;
@@ -35,14 +39,21 @@ struct CheckRequest {
     token: DocumentToken,
     text: String,
     index: TextIndex,
-    annotated: AnnotatedText,
-    ignored_byte_ranges: Vec<ByteRange>,
+    block: CheckBlock,
     options: ClientOptions,
 }
 
 enum PreparedCheck {
-    Check(Box<CheckRequest>),
-    Clear { uri: Url, version: i32 },
+    Check {
+        requests: Vec<CheckRequest>,
+        uri: Url,
+        version: i32,
+        token: DocumentToken,
+    },
+    Clear {
+        uri: Url,
+        version: i32,
+    },
 }
 
 impl Backend {
@@ -71,13 +82,13 @@ impl Backend {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
             let options = backend.options().await;
-            let prepared = {
-                backend
-                    .documents
-                    .with_bumped_entry_if_current(&uri, token, |entry| {
-                        backend.prepare_check_entry(entry, options)
-                    })
-            };
+            let options_key = options_key(&options);
+            let prepared = backend
+                .documents
+                .prepare_check_if_current(&uri, token, options_key, |language| {
+                    options.language_enabled(&language)
+                })
+                .map(|prepared| backend.prepare_check(prepared, options));
             if let Some(prepared) = prepared {
                 log::debug!("Running debounced check for {uri} token={token:?}");
                 backend.run_prepared_check(prepared).await;
@@ -89,9 +100,13 @@ impl Backend {
 
     async fn check_uri_now(&self, uri: &Url) {
         let options = self.options().await;
+        let options_key = options_key(&options);
         let Some(prepared) = self
             .documents
-            .with_bumped_entry(uri, |entry| self.prepare_check_entry(entry, options))
+            .prepare_check(uri, options_key, |language| {
+                options.language_enabled(&language)
+            })
+            .map(|prepared| self.prepare_check(prepared, options))
         else {
             log::debug!("Skipping immediate check for {uri}: document not cached");
             return;
@@ -108,95 +123,167 @@ impl Backend {
     }
 
     async fn run_prepared_check(&self, prepared: PreparedCheck) {
-        let request = match prepared {
-            PreparedCheck::Check(request) => request,
+        let (requests, uri, version, token) = match prepared {
+            PreparedCheck::Check {
+                requests,
+                uri,
+                version,
+                token,
+            } => (requests, uri, version, token),
             PreparedCheck::Clear { uri, version } => {
                 log::debug!("Document {uri} is not checkable; clearing diagnostics");
                 self.clear_stale_diagnostics(&uri, Some(version)).await;
                 return;
             }
         };
-        let uri = &request.uri;
-        let token = request.token;
 
         log::debug!(
-            "Starting check for {uri} token={token:?} version={:?}",
-            request.version
+            "Starting check for {uri} token={token:?} version={version:?} check_blocks={}",
+            requests.len()
         );
-        log::debug!(
-            "Sending LanguageTool request for {uri} token={token:?} annotations={} ignored_byte_ranges={}",
-            request.annotated.annotation.len(),
-            request.ignored_byte_ranges.len()
-        );
-        let response = match self
-            .language_tool
-            .check_annotated(&request.annotated, &request.options)
-            .await
-        {
-            Ok(response) => {
-                log::debug!(
-                    "LanguageTool returned {} match(es) for {uri} token={token:?}",
-                    response.matches.len()
-                );
-                response
-            }
-            Err(err) => {
-                self.log_check_error(&request.options, err).await;
-                if self.documents.is_current(&request.uri, request.token) {
-                    self.clear_stale_diagnostics(&request.uri, Some(request.version))
-                        .await;
-                } else {
+
+        let mut checks = tokio::task::JoinSet::new();
+        for request in requests {
+            let language_tool = self.language_tool.clone();
+            checks.spawn(async move {
+                let result = language_tool
+                    .check_annotated(&request.block.annotated, &request.options)
+                    .await;
+                (request, result)
+            });
+        }
+
+        let mut responses = Vec::new();
+        let mut first_error = None;
+        let mut join_error = None;
+        while let Some(result) = checks.join_next().await {
+            match result {
+                Ok((request, Ok(response))) => {
                     log::debug!(
-                        "Skipping stale diagnostic clear for {} token={:?}",
+                        "LanguageTool returned {} match(es) for {} token={:?} block={:?}",
+                        response.matches.len(),
                         request.uri,
-                        request.token
+                        request.token,
+                        request.block.byte_range
                     );
+                    responses.push((request, response));
                 }
-                return;
+                Ok((request, Err(err))) => {
+                    if first_error.is_none() {
+                        first_error = Some((request.options.clone(), err));
+                    }
+                }
+                Err(err) => {
+                    if join_error.is_none() {
+                        join_error = Some(err);
+                    }
+                }
             }
-        };
+        }
 
-        if !self.documents.is_current(&request.uri, request.token) {
-            log::debug!(
-                "Discarding stale check result for {} token={:?}",
-                request.uri,
-                request.token
-            );
+        if first_error.is_some() || join_error.is_some() {
+            let Some(diagnostics) =
+                self.documents
+                    .complete_check_if_current(&uri, token, Vec::new())
+            else {
+                log::debug!(
+                    "Discarding stale check failure for {} token={:?}",
+                    uri,
+                    token
+                );
+                return;
+            };
+
+            if let Some((options, err)) = first_error {
+                self.log_check_error(&options, err).await;
+            } else if let Some(err) = join_error {
+                let message = format!("LanguageTool check task failed: {err}");
+                log::warn!("{message}");
+                self.client.log_message(MessageType::WARNING, message).await;
+            }
+            self.client
+                .publish_diagnostics(uri, diagnostics, Some(version))
+                .await;
             return;
         }
-        let diagnostics = diagnostics_for_request(&request, response.matches);
+
+        responses.sort_by_key(|(request, _)| request.block.byte_range.start.0);
+        let checked_blocks = responses
+            .into_iter()
+            .map(|(request, response)| {
+                let diagnostics = diagnostics_for_request(&request, response.matches);
+                CompletedCheckBlock {
+                    byte_range: request.block.byte_range,
+                    diagnostics: diagnostics
+                        .into_iter()
+                        .map(|diagnostic| CachedDiagnostic {
+                            doc_byte_range: diagnostic.doc_byte_range,
+                            diagnostic: diagnostic.diagnostic,
+                        })
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let Some(diagnostics) =
+            self.documents
+                .complete_check_if_current(&uri, token, checked_blocks)
+        else {
+            log::debug!(
+                "Discarding stale check result for {} token={:?}",
+                uri,
+                token
+            );
+            return;
+        };
         let diagnostic_count = diagnostics.len();
         log::debug!(
             "Publishing {diagnostic_count} diagnostic(s) for {uri} token={token:?} version={:?}",
-            request.version
+            version
         );
         self.client
-            .publish_diagnostics(request.uri.clone(), diagnostics, Some(request.version))
+            .publish_diagnostics(uri, diagnostics, Some(version))
             .await;
     }
 
-    fn prepare_check_entry(&self, entry: &DocumentEntry, options: ClientOptions) -> PreparedCheck {
-        let document = entry.document();
-        let token = entry.token();
-        let Some(checkable_document) =
-            document.checkable(|language| options.language_enabled(&language))
-        else {
-            return PreparedCheck::Clear {
-                uri: document.uri().clone(),
-                version: document.version(),
-            };
+    fn prepare_check(
+        &self,
+        prepared: PreparedDocumentCheck,
+        options: ClientOptions,
+    ) -> PreparedCheck {
+        let PreparedCheckData {
+            uri,
+            version,
+            token,
+            text,
+            index,
+            blocks: prepared_blocks,
+        } = match prepared {
+            PreparedDocumentCheck::Check(data) => data,
+            PreparedDocumentCheck::Clear { uri, version } => {
+                return PreparedCheck::Clear { uri, version };
+            }
         };
 
-        PreparedCheck::Check(Box::new(CheckRequest {
-            uri: checkable_document.uri().clone(),
-            version: checkable_document.version(),
+        let mut requests = Vec::new();
+        for prepared_block in prepared_blocks {
+            requests.push(CheckRequest {
+                uri: uri.clone(),
+                version,
+                token,
+                text: text.clone(),
+                index: index.clone(),
+                block: prepared_block.block,
+                options: options.clone(),
+            });
+        }
+
+        PreparedCheck::Check {
+            requests,
+            uri,
+            version,
             token,
-            text: checkable_document.text().to_string(),
-            index: checkable_document.index().clone(),
-            annotated: checkable_document.annotated().clone(),
-            ignored_byte_ranges: checkable_document.ignored_byte_ranges().to_vec(),
-            options,
-        }))
+        }
     }
 
     async fn log_check_error(&self, options: &ClientOptions, err: LanguageToolError) {
@@ -276,41 +363,36 @@ impl Backend {
 fn diagnostics_for_request(
     request: &CheckRequest,
     matches: Vec<LanguageToolMatch>,
-) -> Vec<Diagnostic> {
-    // Convert ignored byte ranges to UTF-16 once so match filtering stays in
-    // the same coordinate space that LanguageTool uses.
-    let ignored_utf16: Vec<Utf16Range> = request
-        .ignored_byte_ranges
-        .iter()
-        .map(|r| {
-            Utf16Range::new(
-                request.index.utf16_offset_for_byte(r.start),
-                request.index.utf16_offset_for_byte(r.end),
-            )
-        })
-        .collect();
-
+) -> Vec<MappedDiagnostic> {
+    let segments = text_segments_for_block(&request.block);
     let diagnostics = matches
         .iter()
         .filter_map(|item| match_utf16_range(item).map(|range| (item, range)))
-        .filter(|(_, range)| {
-            request
-                .index
-                .text_for_utf16_range(&request.text, *range)
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        })
-        .filter(|(_, range)| !ignored_utf16.iter().any(|ig| range.intersects(ig)))
-        .filter_map(|(item, _)| {
-            let data = diagnostic_data(
-                &request.text,
-                &request.index,
+        .filter_map(|(item, lt_range)| {
+            let doc_byte_range = map_lt_range_to_doc_bytes(&segments, lt_range)?;
+            let matched_text = request
+                .text
+                .get(doc_byte_range.start.0..doc_byte_range.end.0)?;
+            if matched_text.trim().is_empty() || request.options.is_ignored_word(matched_text) {
+                return None;
+            }
+
+            let utf16_start = request.index.utf16_offset_for_byte(doc_byte_range.start);
+            let utf16_end = request.index.utf16_offset_for_byte(doc_byte_range.end);
+            let range = Range {
+                start: request.index.position(utf16_start),
+                end: request.index.position(utf16_end),
+            };
+            let data = diagnostic_data_for_text(
+                matched_text.to_string(),
                 item,
                 &request.options,
                 Some(request.version),
             );
-            (!request.options.is_ignored_word(&data.matched_text))
-                .then(|| make_lsp_diagnostic(&request.index, item, data, &request.options))
+            Some(MappedDiagnostic {
+                doc_byte_range,
+                diagnostic: make_lsp_diagnostic_for_range(range, item, data, &request.options),
+            })
         })
         .collect::<Vec<_>>();
     log::debug!(
@@ -319,6 +401,85 @@ fn diagnostics_for_request(
         request.uri
     );
     diagnostics
+}
+
+#[derive(Debug, Clone)]
+struct MappedDiagnostic {
+    doc_byte_range: ByteRange,
+    diagnostic: Diagnostic,
+}
+
+struct TextSegment<'a> {
+    lt_utf16: Utf16Range,
+    doc_byte: ByteRange,
+    text: &'a str,
+}
+
+fn text_segments_for_block(block: &CheckBlock) -> Vec<TextSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut lt_utf16_cursor = 0usize;
+    let mut doc_byte_cursor = block.byte_range.start.0;
+
+    for annotation in &block.annotated.annotation {
+        let content = annotation_content(annotation);
+        let utf16_len = content.chars().map(char::len_utf16).sum::<usize>();
+        let byte_len = content.len();
+        if let Annotation::Text { text } = annotation {
+            segments.push(TextSegment {
+                lt_utf16: Utf16Range::new(lt_utf16_cursor, lt_utf16_cursor + utf16_len),
+                doc_byte: ByteRange::new(doc_byte_cursor, doc_byte_cursor + byte_len),
+                text,
+            });
+        }
+        lt_utf16_cursor += utf16_len;
+        doc_byte_cursor += byte_len;
+    }
+
+    segments
+}
+
+fn annotation_content(annotation: &Annotation) -> &str {
+    match annotation {
+        Annotation::Text { text } => text,
+        Annotation::Markup { markup, .. } => markup,
+    }
+}
+
+fn map_lt_range_to_doc_bytes(
+    segments: &[TextSegment<'_>],
+    lt_range: Utf16Range,
+) -> Option<ByteRange> {
+    let segment = segments.iter().find(|segment| {
+        segment.lt_utf16.start <= lt_range.start && lt_range.end <= segment.lt_utf16.end
+    })?;
+    let relative_start = lt_range.start.0 - segment.lt_utf16.start.0;
+    let relative_end = lt_range.end.0 - segment.lt_utf16.start.0;
+    let byte_start =
+        segment.doc_byte.start.0 + byte_offset_for_utf16_in_text(segment.text, relative_start)?;
+    let byte_end =
+        segment.doc_byte.start.0 + byte_offset_for_utf16_in_text(segment.text, relative_end)?;
+    Some(ByteRange::new(byte_start, byte_end))
+}
+
+fn byte_offset_for_utf16_in_text(text: &str, target: usize) -> Option<usize> {
+    let mut utf16 = 0usize;
+    for (byte, ch) in text.char_indices() {
+        if utf16 == target {
+            return Some(byte);
+        }
+        utf16 += ch.len_utf16();
+        if utf16 == target {
+            return Some(byte + ch.len_utf8());
+        }
+        if utf16 > target {
+            return None;
+        }
+    }
+    (utf16 == target).then_some(text.len())
+}
+
+fn options_key(options: &ClientOptions) -> String {
+    serde_json::to_string(options).unwrap_or_else(|_| format!("{options:?}"))
 }
 
 fn make_replacement_action(
@@ -642,13 +803,12 @@ mod tests {
             .checkable(|language| options.language_enabled(&language))
             .unwrap();
         CheckRequest {
-            uri: document.uri().clone(),
-            version: document.version(),
-            token: DocumentToken::new_for_test(0, document.version(), 0),
-            text: document.text().to_string(),
-            index: document.index().clone(),
-            annotated: document.annotated().clone(),
-            ignored_byte_ranges: document.ignored_byte_ranges().to_vec(),
+            uri: document.uri.clone(),
+            version: document.version,
+            token: DocumentToken::new_for_test(0, document.version, 0),
+            text: document.text.to_string(),
+            index: document.index.clone(),
+            block: document.check_blocks[0].clone(),
             options,
         }
     }
@@ -688,8 +848,8 @@ mod tests {
 
         let diagnostics = diagnostics_for_request(&request, vec![item]);
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].range.start, Position::new(0, 11));
-        assert_eq!(diagnostics[0].range.end, Position::new(0, 15));
+        assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 11));
+        assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 15));
     }
 
     #[test]
@@ -705,7 +865,7 @@ mod tests {
         let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),
             short_message: None,
-            offset: 18,
+            offset: 3,
             length: 4,
             replacements: Vec::new(),
             context: Box::default(),
@@ -722,8 +882,43 @@ mod tests {
 
         let diagnostics = diagnostics_for_request(&request, vec![item]);
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].range.start, Position::new(0, 18));
-        assert_eq!(diagnostics[0].range.end, Position::new(0, 22));
+        assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 18));
+        assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 22));
+    }
+
+    #[test]
+    fn diagnostics_drop_matches_in_markup_regions() {
+        let document = Document::new(
+            Url::parse("file:///tmp/test.rs").unwrap(),
+            1,
+            Some("rust".to_string()),
+            "let typoo = 1; // This are a comment.".to_string(),
+        );
+        let options = ClientOptions::default();
+        let request = check_request_for_test(&document, options);
+        let item = LanguageToolMatch {
+            message: "Possible spelling mistake found.".to_string(),
+            short_message: None,
+            offset: 0,
+            length: 2,
+            replacements: Vec::new(),
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
+                id: "MORFOLOGIK_RULE_EN_US".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
+                issue_type: Some("misspelling".to_string()),
+                category: Box::new(LanguageToolCategory {
+                    id: Some("TYPOS".to_string()),
+                    name: None,
+                }),
+            })),
+        };
+
+        let diagnostics = diagnostics_for_request(&request, vec![item]);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -759,10 +954,10 @@ mod tests {
 
         let diagnostics = diagnostics_for_request(&request, vec![item]);
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].range.start, Position::new(0, 3));
-        assert_eq!(diagnostics[0].range.end, Position::new(0, 11));
+        assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 3));
+        assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 11));
 
-        let data = parse_diagnostic_data(&diagnostics[0]).unwrap();
+        let data = parse_diagnostic_data(&diagnostics[0].diagnostic).unwrap();
         assert_eq!(data.matched_text, "This are");
     }
 }
