@@ -112,7 +112,7 @@ impl Backend {
                 );
 
                 let mut checks = tokio::task::JoinSet::new();
-                for prepared_block in data.blocks {
+                for block in data.blocks {
                     let language_tool = self.language_tool.clone();
                     let options = Arc::clone(&options);
                     let request = CheckRequest {
@@ -121,7 +121,7 @@ impl Backend {
                         token,
                         text: Arc::clone(&text),
                         index: Arc::clone(&index),
-                        block: prepared_block.block,
+                        block,
                     };
                     checks.spawn(async move {
                         let result = language_tool
@@ -766,8 +766,7 @@ mod tests {
             .blocks
             .into_iter()
             .next()
-            .expect("document should have a check block")
-            .block;
+            .expect("document should have a check block");
         CheckRequest {
             uri: prepared.uri,
             version: prepared.version,

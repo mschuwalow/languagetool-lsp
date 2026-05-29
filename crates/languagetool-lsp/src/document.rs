@@ -61,12 +61,7 @@ pub struct PreparedCheckData {
     pub version: i32,
     pub text: Arc<String>,
     pub index: Arc<TextIndex>,
-    pub blocks: Vec<PreparedCheckBlock>,
-}
-
-#[derive(Debug)]
-pub struct PreparedCheckBlock {
-    pub block: CheckBlock,
+    pub blocks: Vec<CheckBlock>,
 }
 
 #[derive(Debug)]
@@ -280,25 +275,11 @@ impl SupportedDocument {
             };
         }
 
-        // Any cached block should also be returned by the masker, as we should have invalidated
-        // the cache blocks otherwise.
-        debug_assert!(
-            self.diagnostics_cache.byte_ranges().all(|cached_range| {
-                check_blocks
-                    .iter()
-                    .any(|block| block.byte_range == *cached_range)
-            }),
-            "Not all cached blocks were returned by the masker"
-        );
-
         self.diagnostics_cache.reset_if_options_changed(options_key);
-
-        let blocks: Vec<PreparedCheckBlock> = check_blocks
+        let blocks: Vec<CheckBlock> = self
+            .diagnostics_cache
+            .retain_current_and_collect_uncached(check_blocks, |block| &block.byte_range)
             .into_iter()
-            .filter_map(|block| {
-                (!self.diagnostics_cache.contains_block(&block.byte_range))
-                    .then_some(PreparedCheckBlock { block })
-            })
             .collect();
 
         if blocks.is_empty() {

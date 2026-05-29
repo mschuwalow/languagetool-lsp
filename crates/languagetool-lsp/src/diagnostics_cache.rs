@@ -64,12 +64,45 @@ impl DiagnosticsCache {
         debug_assert!(is_sorted_by_range(&self.blocks));
     }
 
+    #[cfg(test)]
     pub fn contains_block(&self, byte_range: &ByteRange) -> bool {
         self.find_block(byte_range).is_ok()
     }
 
-    pub fn byte_ranges(&self) -> impl Iterator<Item = &ByteRange> {
-        self.blocks.iter().map(|block| &block.byte_range)
+    pub fn retain_current_and_collect_uncached<T>(
+        &mut self,
+        current_blocks: Vec<T>,
+        byte_range: impl Fn(&T) -> &ByteRange,
+    ) -> Vec<T> {
+        let mut cached_blocks = std::mem::take(&mut self.blocks).into_iter().peekable();
+        let mut uncached = Vec::new();
+        let mut previous_current_key = None;
+
+        for current_block in current_blocks {
+            let current_key = range_key(byte_range(&current_block));
+            debug_assert!(previous_current_key.is_none_or(|previous| previous < current_key));
+            previous_current_key = Some(current_key);
+
+            while cached_blocks
+                .peek()
+                .is_some_and(|block| range_key(&block.byte_range) < current_key)
+            {
+                cached_blocks.next();
+            }
+
+            if cached_blocks
+                .peek()
+                .is_some_and(|block| range_key(&block.byte_range) == current_key)
+            {
+                self.blocks
+                    .push(cached_blocks.next().expect("cached block should exist"));
+            } else {
+                uncached.push(current_block);
+            }
+        }
+
+        debug_assert!(is_sorted_by_range(&self.blocks));
+        uncached
     }
 
     pub fn store_checked_block(
@@ -204,6 +237,22 @@ mod tests {
         cache.apply_edit(&ByteRange::new(12, 15), 5, &index, 1);
 
         assert!(!cache.contains_block(&ByteRange::new(10, 22)));
+    }
+
+    #[test]
+    fn retain_current_and_collect_uncached_drops_stale_blocks() {
+        let mut cache = DiagnosticsCache::default();
+        cache.store_checked_block(ByteRange::new(10, 20), vec![cached_diagnostic(12, 16)]);
+        cache.store_checked_block(ByteRange::new(30, 40), vec![cached_diagnostic(32, 36)]);
+
+        let uncached = cache.retain_current_and_collect_uncached(
+            vec![ByteRange::new(30, 40), ByteRange::new(50, 60)],
+            |range| range,
+        );
+
+        assert!(!cache.contains_block(&ByteRange::new(10, 20)));
+        assert!(cache.contains_block(&ByteRange::new(30, 40)));
+        assert_eq!(uncached, vec![ByteRange::new(50, 60)]);
     }
 
     #[test]
