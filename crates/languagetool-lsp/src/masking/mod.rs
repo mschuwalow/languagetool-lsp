@@ -2,7 +2,7 @@ mod comment_blocks;
 
 use crate::language::SupportedLanguage;
 use crate::languagetool::{AnnotatedText, Annotation};
-use crate::text_index::{ByteOffset, ByteRange, TextIndex};
+use crate::text_index::{BytePosition, ByteRange};
 use comment_blocks::{merge_comment_blocks, CommentBlock};
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 use tree_sitter_md_025::{MarkdownParser, MarkdownTree};
@@ -19,25 +19,26 @@ impl Masker {
         Self { parsed }
     }
 
-    pub fn input_edit(index: &TextIndex, bytes: &ByteRange, updated_text: &str) -> InputEdit {
-        let byte_start = bytes.start.0;
-        let byte_end = bytes.end.0;
-        let start_position = point_for_byte(index, byte_start);
-        let old_end_position = point_for_byte(index, byte_end);
-        let new_end_byte = byte_start + updated_text.len();
-        let new_end_position = point_after_text(start_position, updated_text);
-        InputEdit {
-            start_byte: byte_start,
-            old_end_byte: byte_end,
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_edit(
+        &mut self,
+        start_byte: usize,
+        old_end_byte: usize,
+        new_end_byte: usize,
+        start_position: BytePosition,
+        old_end_position: BytePosition,
+        new_end_position: BytePosition,
+        new_text: &str,
+    ) {
+        let edit = InputEdit {
+            start_byte,
+            old_end_byte,
             new_end_byte,
-            start_position,
-            old_end_position,
-            new_end_position,
-        }
-    }
-
-    pub fn apply_edit(&mut self, edit: &InputEdit, new_text: &str) {
-        self.parsed.apply_edit(edit, new_text);
+            start_position: point_from_byte_position(start_position),
+            old_end_position: point_from_byte_position(old_end_position),
+            new_end_position: point_from_byte_position(new_end_position),
+        };
+        self.parsed.apply_edit(&edit, new_text);
     }
 
     /// Returns the list of blocks to be checked by LanguageTool.
@@ -432,26 +433,11 @@ fn collect_html_skip_ranges(node: Node<'_>, ranges: &mut Vec<Range>) {
     }
 }
 
-fn point_for_byte(index: &TextIndex, byte: usize) -> Point {
-    let position = index.byte_position(ByteOffset(byte));
+fn point_from_byte_position(position: BytePosition) -> Point {
     Point {
         row: position.row,
         column: position.column,
     }
-}
-
-fn point_after_text(start: Point, text: &str) -> Point {
-    let mut row = start.row;
-    let mut column = start.column;
-    for line in text.split_inclusive('\n') {
-        if line.ends_with('\n') {
-            row += 1;
-            column = 0;
-        } else {
-            column += line.len();
-        }
-    }
-    Point { row, column }
 }
 
 fn skip_horizontal_whitespace(bytes: &[u8], mut index: usize) -> usize {

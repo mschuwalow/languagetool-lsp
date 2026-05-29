@@ -1,7 +1,7 @@
 use crate::diagnostics_cache::{CachedDiagnostic, DiagnosticsCache};
 use crate::language::{DocumentLanguage, SupportedLanguage};
 use crate::masking::{CheckBlock, Masker};
-use crate::text_index::{ByteRange, TextIndex};
+use crate::text_index::{ByteOffset, ByteRange, TextIndex};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, TextDocumentItem, Url};
 
@@ -237,7 +237,7 @@ impl SupportedDocument {
         range: tower_lsp::lsp_types::Range,
         new_text: &str,
     ) -> DocumentChangeStatus {
-        let Some((bytes, utf16)) = self.index.edit_offsets(range) else {
+        let Some((old_byte_range, old_utf16_range)) = self.index.edit_offsets(range) else {
             log::error!(
                 "Rejected incremental change for {} because range {:?} is outside valid UTF-16 boundaries",
                 self.uri,
@@ -247,15 +247,35 @@ impl SupportedDocument {
             return DocumentChangeStatus::OutOfSync;
         };
 
-        let mask_edit = Masker::input_edit(&self.index, &bytes, new_text);
+        let start_position = self.index.byte_position(old_byte_range.start);
+        let old_end_position = self.index.byte_position(old_byte_range.end);
 
         let text = Arc::make_mut(&mut self.text);
-        text.replace_range(bytes.start.0..bytes.end.0, new_text);
+        text.replace_range(old_byte_range.start.0..old_byte_range.end.0, new_text);
 
-        Arc::make_mut(&mut self.index).apply_edit(text, &bytes, &utf16, new_text);
-        self.mask.apply_edit(&mask_edit, text);
+        Arc::make_mut(&mut self.index).apply_edit(
+            text,
+            &old_byte_range,
+            &old_utf16_range,
+            new_text,
+        );
+
+        let new_end_byte = old_byte_range.start.0 + new_text.len();
+        let new_end_position = self.index.byte_position(ByteOffset(new_end_byte));
+
+        self.mask.apply_edit(
+            old_byte_range.start.0,
+            old_byte_range.end.0,
+            new_end_byte,
+            start_position,
+            old_end_position,
+            new_end_position,
+            text,
+        );
+
         self.diagnostics_cache
-            .apply_edit(&bytes, new_text.len(), &self.index, version);
+            .apply_edit(&old_byte_range, new_text.len(), &self.index, version);
+
         self.version = version;
         DocumentChangeStatus::Incremental
     }
