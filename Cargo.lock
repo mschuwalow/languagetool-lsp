@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "languagetool-client"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "languagetool-lsp"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
