@@ -247,7 +247,7 @@ impl SupportedDocument {
             return DocumentChangeStatus::OutOfSync;
         };
 
-        let mask_edit = Masker::input_edit(&self.text, &bytes, new_text);
+        let mask_edit = Masker::input_edit(&self.index, &bytes, new_text);
 
         let text = Arc::make_mut(&mut self.text);
         text.replace_range(bytes.start.0..bytes.end.0, new_text);

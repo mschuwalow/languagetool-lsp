@@ -77,6 +77,13 @@ impl Utf16Range {
     }
 }
 
+/// A byte-based line/column point, matching Tree-sitter's `Point` semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BytePosition {
+    pub row: usize,
+    pub column: usize,
+}
+
 /// Per-document index built in a single O(n) pass.
 ///
 /// Provides O(log n) UTF-16 ↔ byte offset conversion and O(log n) flat-UTF-16-offset →
@@ -90,6 +97,7 @@ impl Utf16Range {
 pub struct TextIndex {
     line_starts_utf16: Vec<usize>,
     line_ends_utf16: Vec<usize>,
+    line_starts_bytes: Vec<usize>,
     checkpoints: Vec<(usize, usize)>,
     invalid_utf16_offsets: Vec<usize>,
     total_utf16: usize,
@@ -100,6 +108,7 @@ impl TextIndex {
     pub fn new(text: &str) -> Self {
         let mut line_starts_utf16 = vec![0usize];
         let mut line_ends_utf16 = Vec::new();
+        let mut line_starts_bytes = vec![0usize];
         let mut checkpoints: Vec<(usize, usize)> = Vec::new();
         let mut invalid_utf16_offsets = Vec::new();
         let mut utf16 = 0usize;
@@ -113,8 +122,9 @@ impl TextIndex {
                 line_ends_utf16.push(utf16);
                 utf16 += u16_len;
                 if chars.peek().is_some_and(|(_, next)| *next == '\n') {
-                    chars.next();
+                    let (next_byte_off, _) = chars.next().expect("peeked next char exists");
                     utf16 += 1;
+                    line_starts_bytes.push(next_byte_off + 1);
                 }
                 line_starts_utf16.push(utf16);
                 continue;
@@ -124,6 +134,7 @@ impl TextIndex {
                 line_ends_utf16.push(utf16);
                 utf16 += u16_len;
                 line_starts_utf16.push(utf16);
+                line_starts_bytes.push(byte_off + u8_len);
                 continue;
             }
 
@@ -140,6 +151,7 @@ impl TextIndex {
         Self {
             line_starts_utf16,
             line_ends_utf16,
+            line_starts_bytes,
             checkpoints,
             invalid_utf16_offsets,
             total_utf16: utf16,
@@ -190,6 +202,7 @@ impl TextIndex {
 
         self.apply_checkpoint_edit(byte_start, byte_end, utf16_start, utf16_end, new_text);
         self.apply_invalid_offset_edit(utf16_start, utf16_end, new_text, utf16_delta);
+        self.apply_byte_line_edit(byte_start, byte_end, new_text, byte_delta);
         self.apply_line_edit(
             text,
             LineEditWindow {
@@ -226,6 +239,16 @@ impl TextIndex {
 
     pub fn utf16_offset_for_byte(&self, offset: ByteOffset) -> Utf16Offset {
         Utf16Offset(self.utf16_offset_for_byte_raw(offset.0))
+    }
+
+    pub fn byte_position(&self, offset: ByteOffset) -> BytePosition {
+        let byte_offset = offset.0.min(self.total_bytes);
+        let next_line = self
+            .line_starts_bytes
+            .partition_point(|&ls| ls <= byte_offset);
+        let row = next_line.saturating_sub(1);
+        let column = byte_offset - self.line_starts_bytes[row];
+        BytePosition { row, column }
     }
 
     #[cfg(test)]
@@ -392,6 +415,29 @@ impl TextIndex {
         self.line_ends_utf16
             .splice(window.line_first..window.line_replace_end, new_ends);
     }
+
+    fn apply_byte_line_edit(
+        &mut self,
+        byte_start: usize,
+        byte_end: usize,
+        new_text: &str,
+        byte_delta: isize,
+    ) {
+        let first = self
+            .line_starts_bytes
+            .partition_point(|&ls| ls <= byte_start);
+        let last = self.line_starts_bytes.partition_point(|&ls| ls <= byte_end);
+
+        for start in &mut self.line_starts_bytes[last..] {
+            *start = (*start as isize + byte_delta) as usize;
+        }
+
+        let new_starts = new_text
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(byte_start + index + 1));
+        self.line_starts_bytes.splice(first..last, new_starts);
+    }
 }
 
 struct LineEditWindow {
@@ -550,6 +596,20 @@ mod tests {
     }
 
     #[test]
+    fn byte_positions_match_tree_sitter_line_rules() {
+        for text in boundary_corpus() {
+            let index = TextIndex::new(text);
+            for byte in 0..=text.len() {
+                assert_eq!(
+                    index.byte_position(ByteOffset(byte)),
+                    expected_byte_position(text, byte),
+                    "text={text:?} byte={byte}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ascii_only_has_no_checkpoints() {
         let index = TextIndex::new("hello world");
         assert!(index.checkpoints.is_empty());
@@ -578,6 +638,21 @@ mod tests {
         vec![
             "", "x", "xyz", "😀", "ß", "\n", "\r", "\r\n", "x\ny", "x\r\ny",
         ]
+    }
+
+    fn expected_byte_position(text: &str, byte: usize) -> BytePosition {
+        let mut row = 0;
+        let mut line_start = 0;
+        for (idx, b) in text.as_bytes().iter().enumerate().take(byte) {
+            if *b == b'\n' {
+                row += 1;
+                line_start = idx + 1;
+            }
+        }
+        BytePosition {
+            row,
+            column: byte - line_start,
+        }
     }
 
     fn utf16_char_boundaries(text: &str) -> Vec<usize> {
