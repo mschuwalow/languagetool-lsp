@@ -129,10 +129,7 @@ impl Document {
         }
     }
 
-    pub fn checkable(
-        &self,
-        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
-    ) -> Option<CheckableDocument<'_>> {
+    pub fn checkable(&self) -> Option<CheckableDocument<'_>> {
         let Some(document) = self.supported() else {
             log::debug!(
                 "Skipping {} because the document is not checkable",
@@ -140,14 +137,6 @@ impl Document {
             );
             return None;
         };
-        if !language_enabled(document.language) {
-            log::debug!(
-                "Skipping {} because language {:?} is disabled",
-                document.uri,
-                document.language
-            );
-            return None;
-        }
 
         let check_blocks = document.mask.check_blocks(&document.text);
         if check_blocks.is_empty() {
@@ -222,18 +211,14 @@ impl Document {
         }
     }
 
-    pub(crate) fn prepare_check(
-        &mut self,
-        options_key: String,
-        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
-    ) -> PreparedCheck {
+    pub(crate) fn prepare_check(&mut self, options_key: String) -> PreparedCheck {
         let Some(document) = self.supported_mut() else {
             return PreparedCheck::Clear {
                 uri: self.uri().clone(),
                 version: self.version(),
             };
         };
-        document.prepare_check(options_key, language_enabled)
+        document.prepare_check(options_key)
     }
 
     pub(crate) fn complete_check(
@@ -311,24 +296,7 @@ impl SupportedDocument {
         DocumentChangeStatus::Incremental
     }
 
-    fn prepare_check(
-        &mut self,
-        options_key: String,
-        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
-    ) -> PreparedCheck {
-        if !language_enabled(self.language) {
-            log::debug!(
-                "Skipping {} because language {:?} is disabled",
-                self.uri,
-                self.language
-            );
-            self.diagnostics_cache.clear();
-            return PreparedCheck::Clear {
-                uri: self.uri.clone(),
-                version: self.version,
-            };
-        }
-
+    fn prepare_check(&mut self, options_key: String) -> PreparedCheck {
         let check_blocks = self.mask.check_blocks(&self.text);
         if check_blocks.is_empty() {
             log::debug!(
@@ -438,7 +406,7 @@ mod tests {
         assert_eq!(status, Some(DocumentChangeStatus::OutOfSync));
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
-        assert!(document.checkable(|_| true).is_none());
+        assert!(document.checkable().is_none());
     }
 
     #[test]
@@ -601,7 +569,7 @@ mod tests {
         );
 
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
-        assert!(document.checkable(|_| true).is_none());
+        assert!(document.checkable().is_none());
         assert_eq!(document.version(), 1);
 
         let status = document.incremental_update(
@@ -612,7 +580,7 @@ mod tests {
 
         assert_eq!(status, None);
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
-        assert!(document.checkable(|_| true).is_none());
+        assert!(document.checkable().is_none());
         assert_eq!(document.version(), 2);
     }
 

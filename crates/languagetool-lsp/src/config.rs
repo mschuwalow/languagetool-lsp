@@ -1,4 +1,3 @@
-use crate::language::SupportedLanguage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -89,8 +88,6 @@ pub struct ClientOptions {
     pub diagnostic_severity: DiagnosticSeverityConfig,
     pub diagnostic_severity_auto: bool,
     pub max_replacements: usize,
-    pub enabled_languages: Vec<String>,
-    pub disabled_languages: Vec<String>,
     pub ignored_words: Vec<String>,
     pub project_config_path: String,
 }
@@ -117,8 +114,6 @@ impl Default for ClientOptions {
             diagnostic_severity: DiagnosticSeverityConfig::Information,
             diagnostic_severity_auto: true,
             max_replacements: 8,
-            enabled_languages: Vec::new(),
-            disabled_languages: Vec::new(),
             ignored_words: Vec::new(),
             project_config_path: default_project_config_path(),
         }
@@ -187,24 +182,6 @@ impl ClientOptions {
 
     pub fn configured_severity(&self) -> DiagnosticSeverity {
         self.diagnostic_severity.as_lsp()
-    }
-
-    pub fn language_enabled(&self, language: &SupportedLanguage) -> bool {
-        let language_id = language.id();
-
-        if self
-            .disabled_languages
-            .iter()
-            .any(|disabled| disabled == language_id)
-        {
-            return false;
-        }
-
-        self.enabled_languages.is_empty()
-            || self
-                .enabled_languages
-                .iter()
-                .any(|enabled| enabled == language_id)
     }
 
     pub fn is_ignored_word(&self, word: &str) -> bool {

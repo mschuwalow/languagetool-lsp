@@ -90,9 +90,7 @@ impl Backend {
             let options_key = options_key(&options);
             let prepared = backend
                 .documents
-                .prepare_check_if_current(&uri, token, options_key, |language| {
-                    options.language_enabled(&language)
-                })
+                .prepare_check_if_current(&uri, token, options_key)
                 .map(|(prepared, token)| backend.prepare_check(prepared, token, options));
             if let Some(prepared) = prepared {
                 log::debug!("Running debounced check for {uri} token={token:?}");
@@ -108,9 +106,7 @@ impl Backend {
         let options_key = options_key(&options);
         let Some(prepared) = self
             .documents
-            .prepare_check(uri, options_key, |language| {
-                options.language_enabled(&language)
-            })
+            .prepare_check(uri, options_key)
             .map(|(prepared, token)| self.prepare_check(prepared, token, options))
         else {
             log::debug!("Skipping immediate check for {uri}: document not cached");
@@ -839,9 +835,7 @@ mod tests {
     };
 
     fn check_request_for_test(document: &Document, options: ClientOptions) -> CheckRequest {
-        let document = document
-            .checkable(|language| options.language_enabled(&language))
-            .unwrap();
+        let document = document.checkable().unwrap();
         CheckRequest {
             uri: document.uri.clone(),
             version: document.version,

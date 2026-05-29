@@ -2,7 +2,6 @@ pub use crate::document::{
     CompletedCheckBlock, PreparedCheck, PreparedCheckBlock, PreparedCheckData,
 };
 use crate::document::{Document, DocumentChangeStatus};
-use crate::language::SupportedLanguage;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -80,15 +79,8 @@ impl DocumentEntry {
         DocumentToken::new(self.document_id, self.document.version(), self.generation)
     }
 
-    fn prepare_check(
-        &mut self,
-        options_key: String,
-        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
-    ) -> (PreparedCheck, DocumentToken) {
-        (
-            self.document.prepare_check(options_key, language_enabled),
-            self.token(),
-        )
+    fn prepare_check(&mut self, options_key: String) -> (PreparedCheck, DocumentToken) {
+        (self.document.prepare_check(options_key), self.token())
     }
 
     fn complete_check(&mut self, checked_blocks: Vec<CompletedCheckBlock>) -> Vec<Diagnostic> {
@@ -224,12 +216,11 @@ impl DocumentCache {
         &self,
         uri: &Url,
         options_key: String,
-        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
     ) -> Option<(PreparedCheck, DocumentToken)> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
         entry.generation += 1;
-        Some(entry.prepare_check(options_key, language_enabled))
+        Some(entry.prepare_check(options_key))
     }
 
     pub fn prepare_check_if_current(
@@ -237,7 +228,6 @@ impl DocumentCache {
         uri: &Url,
         token: DocumentToken,
         options_key: String,
-        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
     ) -> Option<(PreparedCheck, DocumentToken)> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
@@ -245,7 +235,7 @@ impl DocumentCache {
             return None;
         }
         entry.generation += 1;
-        Some(entry.prepare_check(options_key, language_enabled))
+        Some(entry.prepare_check(options_key))
     }
 
     pub fn with_bumped_entry_if_current<R>(
@@ -330,7 +320,7 @@ mod tests {
         cache
             .with_bumped_entry_if_current(&uri, token, |entry| {
                 let document = entry.document();
-                let checkable = document.checkable(|_| true).unwrap();
+                let checkable = document.checkable().unwrap();
                 assert_eq!(status, ChangeStatus::Stale);
                 assert_eq!(document.version(), 3);
                 assert_eq!(checkable.text, "new text");
@@ -365,7 +355,7 @@ mod tests {
         cache
             .with_bumped_entry_if_current(&uri, token, |entry| {
                 let document = entry.document();
-                let checkable = document.checkable(|_| true).unwrap();
+                let checkable = document.checkable().unwrap();
                 assert_eq!(status, ChangeStatus::Applied);
                 assert_eq!(document.version(), 2);
                 assert_eq!(checkable.text, "hi world!");
