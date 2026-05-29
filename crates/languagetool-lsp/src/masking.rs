@@ -8,9 +8,8 @@ use tree_sitter_md_025::{MarkdownParser, MarkdownTree};
 ///
 /// For plain-text, HTML, and Markdown documents there is exactly one block
 /// covering the entire document. For comment-tree languages there is one block
-/// per group of adjacent comments (consecutive line comments separated only by
-/// single newlines form one block; a blank line or non-whitespace gap splits
-/// into separate blocks; each block comment is always its own block).
+/// per group of adjacent standalone line comments. Blank lines, non-whitespace
+/// gaps, inline-to-standalone transitions, and block comments split blocks.
 #[derive(Debug, Clone)]
 pub struct CheckBlock {
     /// Absolute byte span of this block within the document.
@@ -59,10 +58,9 @@ impl Masker {
     /// - `PlainText`: one block covering the whole document.
     /// - `Html` / `Markdown`: one block covering the whole document, with
     ///   skipped regions marked as `Markup`.
-    /// - `CommentTree`: one block per group of adjacent comments (consecutive
-    ///   line comments with only single-newline gaps form one block; a blank
-    ///   line or non-whitespace gap splits into separate blocks; each block
-    ///   comment is always its own block).
+    /// - `CommentTree`: one block per group of adjacent standalone line
+    ///   comments. Blank lines, non-whitespace gaps, inline-to-standalone
+    ///   transitions, and block comments split blocks.
     ///
     /// Blocks where the annotated text contains no `Text` annotations are
     /// silently dropped.
@@ -239,6 +237,8 @@ struct CommentInfo {
     content_range: Range,
     /// True if the comment starts with `/*` (block comment).
     is_block: bool,
+    /// True if only horizontal whitespace precedes the comment on its line.
+    is_standalone_line: bool,
 }
 
 fn parse_markdown_tree(
@@ -339,6 +339,7 @@ fn collect_comment_infos(
                 },
                 content_range,
                 is_block,
+                is_standalone_line: comment_starts_line(text, node_start),
             });
         }
         return;
@@ -352,6 +353,15 @@ fn collect_comment_infos(
 
 fn is_comment_node(node: Node<'_>) -> bool {
     node.kind().contains("comment")
+}
+
+fn comment_starts_line(text: &str, node_start: usize) -> bool {
+    let line_start = text[..node_start]
+        .rfind(['\n', '\r'])
+        .map_or(0, |index| index + 1);
+    text[line_start..node_start]
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t'))
 }
 
 fn comment_content_range(
@@ -378,10 +388,18 @@ fn normalized_content_range(source: &str, mut start: usize, mut end: usize) -> O
     source.get(start..end).map(|_| Range { start, end })
 }
 
-/// Returns true if the gap `text[prev_end..next_start]` contains a blank line
-/// (two newlines with only horizontal whitespace between them) or any
-/// non-whitespace character.
-fn gap_splits_block(text: &str, prev_end: usize, next_start: usize) -> bool {
+fn comments_split_block(text: &str, prev: &CommentInfo, curr: &CommentInfo) -> bool {
+    prev.is_block
+        || curr.is_block
+        || !prev.is_standalone_line
+        || comment_gap_splits_block(text, prev.node_range.end, curr.node_range.start)
+}
+
+/// Returns true if the comment gap contains a physical blank line or any
+/// non-whitespace character. Some grammars include the trailing line ending in
+/// line-comment nodes, so include it when checking for blank-line separators.
+fn comment_gap_splits_block(text: &str, prev_end: usize, next_start: usize) -> bool {
+    let prev_end = include_trailing_line_ending(text, prev_end);
     let gap = match text.get(prev_end..next_start) {
         Some(g) => g,
         None => return true,
@@ -394,9 +412,12 @@ fn gap_splits_block(text: &str, prev_end: usize, next_start: usize) -> bool {
     {
         return true;
     }
-    // Check for blank line: a '\n' followed (after optional horizontal whitespace) by another '\n'
+    gap_contains_blank_line(gap)
+}
+
+fn gap_contains_blank_line(gap: &str) -> bool {
     let mut saw_newline = false;
-    for &b in bytes {
+    for &b in gap.as_bytes() {
         match b {
             b'\n' => {
                 if saw_newline {
@@ -414,6 +435,18 @@ fn gap_splits_block(text: &str, prev_end: usize, next_start: usize) -> bool {
         }
     }
     false
+}
+
+fn include_trailing_line_ending(text: &str, end: usize) -> usize {
+    let bytes = text.as_bytes();
+    if end == 0 || bytes.get(end - 1) != Some(&b'\n') {
+        return end;
+    }
+    if end >= 2 && bytes.get(end - 2) == Some(&b'\r') {
+        end - 2
+    } else {
+        end - 1
+    }
 }
 
 fn build_check_blocks(text: &str, infos: &[CommentInfo]) -> Vec<CheckBlock> {
@@ -445,11 +478,7 @@ fn build_check_blocks(text: &str, infos: &[CommentInfo]) -> Vec<CheckBlock> {
         let prev = &infos[i - 1];
         let curr = &infos[i];
 
-        let split = prev.is_block
-            || curr.is_block
-            || gap_splits_block(text, prev.node_range.end, curr.node_range.start);
-
-        if split {
+        if comments_split_block(text, prev, curr) {
             flush_group(&infos[group_start..i]);
             group_start = i;
         }
@@ -656,7 +685,6 @@ fn merge_ranges(ranges: &mut [Range]) -> Vec<Range> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::text_index::TextIndex;
     use indoc::indoc;
 
     fn check_blocks_for_test(text: &str, language_id: &str) -> Vec<CheckBlock> {
@@ -748,6 +776,74 @@ mod tests {
         assert!(
             second_text.contains("Second block."),
             "second={second_text:?}"
+        );
+    }
+
+    #[test]
+    fn blank_line_splits_standalone_line_comments_into_two_blocks() {
+        let text = indoc! {"
+            // foo
+
+            // bar
+        "};
+        let blocks = check_blocks_for_test(text, "rust");
+
+        assert_eq!(blocks.len(), 2, "blocks={blocks:#?}");
+        assert_eq!(all_text(&blocks[0..1]), "foo");
+        assert_eq!(all_text(&blocks[1..2]), "bar");
+    }
+
+    #[test]
+    fn rust_doc_comments_and_line_comments_separated_by_blank_line_are_separate_blocks() {
+        let text = indoc! {r#"
+            fn main() {
+                // This are a tset dd in a comment.
+                //
+                // dds
+                //
+
+                /// This is the next block.
+                /// This is the next block.
+                /// This is the next block.
+
+                // This is the next block
+                // This is the next block
+                // This is the next block
+                // This is the next block
+                let _value = "This are not checked in a string yet.";
+            }
+        "#};
+        let blocks = check_blocks_for_test(text, "rust");
+
+        assert_eq!(blocks.len(), 3, "blocks={blocks:#?}");
+        assert_eq!(
+            all_text(&blocks[0..1]),
+            "This are a tset dd in a comment.dds"
+        );
+        assert_eq!(
+            all_text(&blocks[1..2]),
+            "This is the next block.This is the next block.This is the next block."
+        );
+        assert_eq!(
+            all_text(&blocks[2..3]),
+            "This is the next blockThis is the next blockThis is the next blockThis is the next block"
+        );
+    }
+
+    #[test]
+    fn adjacent_rust_doc_comments_and_line_comments_form_one_block() {
+        let text = indoc! {r#"
+            /// This is one block.
+            /// This is one block.
+            // This is one block.
+            // This is one block.
+        "#};
+        let blocks = check_blocks_for_test(text, "rust");
+
+        assert_eq!(blocks.len(), 1, "blocks={blocks:#?}");
+        assert_eq!(
+            all_text(&blocks),
+            "This is one block.This is one block.This is one block.This is one block."
         );
     }
 
@@ -1052,19 +1148,28 @@ mod tests {
     fn block_byte_ranges_cover_comment_nodes() {
         let text = "let x = 1; // First.\n// Second.\n";
         let blocks = check_blocks_for_test(text, "rust");
-        // Both line comments have only a single newline gap, so they form one block.
+        assert_eq!(blocks.len(), 2);
+        let first = &text[blocks[0].byte_range.start.0..blocks[0].byte_range.end.0];
+        let second = &text[blocks[1].byte_range.start.0..blocks[1].byte_range.end.0];
+        assert!(first.contains("First."), "first={first:?}");
+        assert!(second.contains("Second."), "second={second:?}");
+    }
+
+    #[test]
+    fn consecutive_standalone_line_comments_form_one_block_after_code() {
+        let text = "let x = 1;\n// First.\n// Second.\n";
+        let blocks = check_blocks_for_test(text, "rust");
         assert_eq!(blocks.len(), 1);
-        let block = &blocks[0];
-        let covered = &text[block.byte_range.start.0..block.byte_range.end.0];
-        assert!(covered.contains("First."), "covered={covered:?}");
-        assert!(covered.contains("Second."), "covered={covered:?}");
+        let block = &text[blocks[0].byte_range.start.0..blocks[0].byte_range.end.0];
+
+        assert!(block.contains("First."), "block={block:?}");
+        assert!(block.contains("Second."), "block={block:?}");
     }
 
     #[test]
     fn byte_ranges_for_non_ascii_comments() {
         // Ensure byte offsets are correct when non-ASCII chars precede comments.
         let text = "let x = \"café\"; // Ünïcödé comment.\n";
-        let index = TextIndex::new(text);
         let blocks = check_blocks_for_test(text, "rust");
         assert_eq!(blocks.len(), 1);
         let block = &blocks[0];
@@ -1081,7 +1186,6 @@ mod tests {
             "content={content_text:?}"
         );
         // Verify that the byte_range actually indexes back correctly.
-        let _ = index; // suppress unused-variable warning; index is used above for non-ASCII verification
         let block_slice = &text[block.byte_range.start.0..block.byte_range.end.0];
         assert!(
             block_slice.contains("Ünïcödé comment."),
