@@ -1,8 +1,8 @@
-use crate::diagnostics_cache::{CachedDiagnostic, DiagnosticsCache};
+pub use crate::document::{
+    CompletedCheckBlock, PreparedCheck, PreparedCheckBlock, PreparedCheckData,
+};
 use crate::document::{Document, DocumentChangeStatus};
 use crate::language::SupportedLanguage;
-use crate::masking::CheckBlock;
-use crate::text_index::{ByteRange, TextIndex};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -24,34 +24,6 @@ pub struct DocumentEntry {
     document: Document,
     document_id: u64,
     generation: u64,
-    diagnostics_cache: DiagnosticsCache,
-}
-
-#[derive(Debug)]
-pub enum PreparedDocumentCheck {
-    Check(PreparedCheckData),
-    Clear { uri: Url, version: i32 },
-}
-
-#[derive(Debug)]
-pub struct PreparedCheckData {
-    pub uri: Url,
-    pub version: i32,
-    pub token: DocumentToken,
-    pub text: String,
-    pub index: TextIndex,
-    pub blocks: Vec<PreparedCheckBlock>,
-}
-
-#[derive(Debug)]
-pub struct PreparedCheckBlock {
-    pub block: CheckBlock,
-}
-
-#[derive(Debug)]
-pub struct CompletedCheckBlock {
-    pub byte_range: ByteRange,
-    pub diagnostics: Vec<CachedDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +69,6 @@ impl DocumentEntry {
             document,
             document_id: next_document_id(),
             generation: 0,
-            diagnostics_cache: DiagnosticsCache::default(),
         }
     }
 
@@ -113,52 +84,15 @@ impl DocumentEntry {
         &mut self,
         options_key: String,
         language_enabled: impl FnOnce(SupportedLanguage) -> bool,
-    ) -> PreparedDocumentCheck {
-        let Some(checkable_document) = self.document.checkable(language_enabled) else {
-            self.clear_diagnostics_cache();
-            return PreparedDocumentCheck::Clear {
-                uri: self.document.uri().clone(),
-                version: self.document.version(),
-            };
-        };
-
-        let uri = checkable_document.uri.clone();
-        let version = checkable_document.version;
-        let text = checkable_document.text.to_string();
-        let index = checkable_document.index.clone();
-        let check_blocks = checkable_document.check_blocks;
-
-        self.diagnostics_cache.reset_if_options_changed(options_key);
-
-        let blocks = check_blocks
-            .into_iter()
-            .filter_map(|block| {
-                (!self.diagnostics_cache.contains_block(&block.byte_range))
-                    .then_some(PreparedCheckBlock { block })
-            })
-            .collect();
-
-        PreparedDocumentCheck::Check(PreparedCheckData {
-            uri,
-            version,
-            token: self.token(),
-            text,
-            index,
-            blocks,
-        })
-    }
-
-    pub fn clear_diagnostics_cache(&mut self) {
-        self.diagnostics_cache.clear();
+    ) -> (PreparedCheck, DocumentToken) {
+        (
+            self.document.prepare_check(options_key, language_enabled),
+            self.token(),
+        )
     }
 
     fn complete_check(&mut self, checked_blocks: Vec<CompletedCheckBlock>) -> Vec<Diagnostic> {
-        for checked in checked_blocks {
-            self.diagnostics_cache
-                .store_checked_block(checked.byte_range, checked.diagnostics);
-        }
-
-        self.diagnostics_cache.diagnostics()
+        self.document.complete_check(checked_blocks)
     }
 }
 
@@ -188,7 +122,6 @@ impl DocumentCache {
         let key = uri.to_string();
         if let Some(entry) = documents.get_mut(&key) {
             entry.document.full_update(version, text);
-            entry.clear_diagnostics_cache();
         } else {
             documents.insert(
                 key,
@@ -210,30 +143,10 @@ impl DocumentCache {
         );
         let key = uri.to_string();
         if let Some(entry) = documents.get_mut(&key) {
-            let status = entry.document.incremental_update(version, range, new_text);
-            match &status {
-                Some(DocumentChangeStatus::Incremental(edit)) => {
-                    if let Some(index) = entry.document.index() {
-                        entry
-                            .diagnostics_cache
-                            .apply_edit(&edit.byte_range, edit.new_len, index);
-                    } else {
-                        entry.clear_diagnostics_cache();
-                    }
-                }
-                Some(DocumentChangeStatus::FullReplace | DocumentChangeStatus::OutOfSync)
-                | None => {
-                    entry.clear_diagnostics_cache();
-                }
-            }
-            return status;
+            return entry.document.incremental_update(version, range, new_text);
         }
 
         log::error!("Received ranged change for uncached document {uri}; marking out of sync");
-        documents.insert(
-            key,
-            DocumentEntry::new(Document::out_of_sync(uri.clone(), version)),
-        );
         Some(DocumentChangeStatus::OutOfSync)
     }
 
@@ -312,7 +225,7 @@ impl DocumentCache {
         uri: &Url,
         options_key: String,
         language_enabled: impl FnOnce(SupportedLanguage) -> bool,
-    ) -> Option<PreparedDocumentCheck> {
+    ) -> Option<(PreparedCheck, DocumentToken)> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
         entry.generation += 1;
@@ -325,7 +238,7 @@ impl DocumentCache {
         token: DocumentToken,
         options_key: String,
         language_enabled: impl FnOnce(SupportedLanguage) -> bool,
-    ) -> Option<PreparedDocumentCheck> {
+    ) -> Option<(PreparedCheck, DocumentToken)> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
         if entry.token() != token {
@@ -388,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn ranged_change_for_uncached_document_marks_out_of_sync() {
+    fn ranged_change_for_uncached_document_marks_out_of_sync_without_caching() {
         let cache = DocumentCache::default();
         let uri = Url::parse("file:///tmp/missing.txt").unwrap();
         let status = cache.apply_change(
@@ -401,15 +314,8 @@ mod tests {
             },
         );
 
-        let token = cache.token(&uri).unwrap();
         assert_eq!(status, ChangeStatus::OutOfSync);
-        cache
-            .with_bumped_entry_if_current(&uri, token, |entry| {
-                let document = entry.document();
-                assert_eq!(document.version(), 1);
-                assert!(document.checkable(|_| true).is_none());
-            })
-            .unwrap();
+        assert!(cache.token(&uri).is_none());
     }
 
     #[test]

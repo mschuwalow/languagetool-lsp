@@ -1,7 +1,8 @@
+use crate::diagnostics_cache::{CachedDiagnostic, DiagnosticsCache};
 use crate::language::{DocumentLanguage, SupportedLanguage};
 use crate::masking::{CheckBlock, Masker};
 use crate::text_index::{ByteRange, TextIndex};
-use tower_lsp::lsp_types::{TextDocumentItem, Url};
+use tower_lsp::lsp_types::{Diagnostic, TextDocumentItem, Url};
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -23,6 +24,7 @@ struct SupportedDocument {
     text: String,
     index: TextIndex,
     mask: Masker,
+    diagnostics_cache: DiagnosticsCache,
 }
 
 #[derive(Debug, Clone)]
@@ -35,20 +37,41 @@ struct UnsupportedDocument {
 struct OutOfSyncDocument {
     uri: Url,
     version: i32,
-    language: Option<SupportedLanguage>,
+    language: SupportedLanguage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocumentChangeStatus {
-    Incremental(AppliedEdit),
+    Incremental,
     FullReplace,
     OutOfSync,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppliedEdit {
+#[derive(Debug)]
+pub enum PreparedCheck {
+    Check(PreparedCheckData),
+    ReuseCached { uri: Url, version: i32 },
+    Clear { uri: Url, version: i32 },
+}
+
+#[derive(Debug)]
+pub struct PreparedCheckData {
+    pub uri: Url,
+    pub version: i32,
+    pub text: String,
+    pub index: TextIndex,
+    pub blocks: Vec<PreparedCheckBlock>,
+}
+
+#[derive(Debug)]
+pub struct PreparedCheckBlock {
+    pub block: CheckBlock,
+}
+
+#[derive(Debug)]
+pub struct CompletedCheckBlock {
     pub byte_range: ByteRange,
-    pub new_len: usize,
+    pub diagnostics: Vec<CachedDiagnostic>,
 }
 
 pub struct CheckableDocument<'a> {
@@ -90,16 +113,6 @@ impl Document {
         )
     }
 
-    pub(crate) fn out_of_sync(uri: Url, version: i32) -> Self {
-        Self {
-            kind: DocumentKind::OutOfSync(OutOfSyncDocument {
-                uri,
-                version,
-                language: None,
-            }),
-        }
-    }
-
     pub fn uri(&self) -> &Url {
         match &self.kind {
             DocumentKind::Supported(document) => &document.uri,
@@ -114,10 +127,6 @@ impl Document {
             DocumentKind::Unsupported(document) => document.version,
             DocumentKind::OutOfSync(document) => document.version,
         }
-    }
-
-    pub(crate) fn index(&self) -> Option<&TextIndex> {
-        self.supported().map(|document| &document.index)
     }
 
     pub fn checkable(
@@ -166,14 +175,13 @@ impl Document {
             }
             DocumentKind::OutOfSync(document) => {
                 let uri = document.uri.clone();
-                *self = if let Some(language) = document.language {
-                    Self {
-                        kind: DocumentKind::Supported(Box::new(SupportedDocument::new(
-                            uri, version, language, text,
-                        ))),
-                    }
-                } else {
-                    Self::new(uri, version, None, text)
+                *self = Self {
+                    kind: DocumentKind::Supported(Box::new(SupportedDocument::new(
+                        uri,
+                        version,
+                        document.language,
+                        text,
+                    ))),
                 };
             }
             DocumentKind::Unsupported(document) => {
@@ -198,7 +206,7 @@ impl Document {
                     self.kind = DocumentKind::OutOfSync(OutOfSyncDocument {
                         uri,
                         version,
-                        language: Some(language),
+                        language,
                     });
                 }
                 Some(status)
@@ -214,9 +222,40 @@ impl Document {
         }
     }
 
+    pub(crate) fn prepare_check(
+        &mut self,
+        options_key: String,
+        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
+    ) -> PreparedCheck {
+        let Some(document) = self.supported_mut() else {
+            return PreparedCheck::Clear {
+                uri: self.uri().clone(),
+                version: self.version(),
+            };
+        };
+        document.prepare_check(options_key, language_enabled)
+    }
+
+    pub(crate) fn complete_check(
+        &mut self,
+        checked_blocks: Vec<CompletedCheckBlock>,
+    ) -> Vec<Diagnostic> {
+        let Some(document) = self.supported_mut() else {
+            return Vec::new();
+        };
+        document.complete_check(checked_blocks)
+    }
+
     fn supported(&self) -> Option<&SupportedDocument> {
         match &self.kind {
             DocumentKind::Supported(document) => Some(document.as_ref()),
+            DocumentKind::Unsupported(_) | DocumentKind::OutOfSync(_) => None,
+        }
+    }
+
+    fn supported_mut(&mut self) -> Option<&mut SupportedDocument> {
+        match &mut self.kind {
+            DocumentKind::Supported(document) => Some(document.as_mut()),
             DocumentKind::Unsupported(_) | DocumentKind::OutOfSync(_) => None,
         }
     }
@@ -233,12 +272,14 @@ impl SupportedDocument {
             text,
             index,
             mask,
+            diagnostics_cache: DiagnosticsCache::default(),
         }
     }
 
     fn set_text(&mut self, text: String) {
         self.index = TextIndex::new(&text);
         self.mask = Masker::new(&text, self.language);
+        self.diagnostics_cache.clear();
         self.text = text;
     }
 
@@ -264,11 +305,76 @@ impl SupportedDocument {
         self.index.apply_edit(&self.text, &bytes, &utf16, new_text);
         self.mask
             .apply_edit(&old_text, &self.text, &bytes, new_text);
+        self.diagnostics_cache
+            .apply_edit(&bytes, new_text.len(), &self.index);
         self.version = version;
-        DocumentChangeStatus::Incremental(AppliedEdit {
-            byte_range: bytes,
-            new_len: new_text.len(),
+        DocumentChangeStatus::Incremental
+    }
+
+    fn prepare_check(
+        &mut self,
+        options_key: String,
+        language_enabled: impl FnOnce(SupportedLanguage) -> bool,
+    ) -> PreparedCheck {
+        if !language_enabled(self.language) {
+            log::debug!(
+                "Skipping {} because language {:?} is disabled",
+                self.uri,
+                self.language
+            );
+            self.diagnostics_cache.clear();
+            return PreparedCheck::Clear {
+                uri: self.uri.clone(),
+                version: self.version,
+            };
+        }
+
+        let check_blocks = self.mask.check_blocks(&self.text);
+        if check_blocks.is_empty() {
+            log::debug!(
+                "Skipping {} because language {:?} produced no checkable blocks",
+                self.uri,
+                self.language
+            );
+            self.diagnostics_cache.clear();
+            return PreparedCheck::Clear {
+                uri: self.uri.clone(),
+                version: self.version,
+            };
+        }
+
+        self.diagnostics_cache.reset_if_options_changed(options_key);
+        let blocks: Vec<PreparedCheckBlock> = check_blocks
+            .into_iter()
+            .filter_map(|block| {
+                (!self.diagnostics_cache.contains_block(&block.byte_range))
+                    .then_some(PreparedCheckBlock { block })
+            })
+            .collect();
+
+        if blocks.is_empty() {
+            return PreparedCheck::ReuseCached {
+                uri: self.uri.clone(),
+                version: self.version,
+            };
+        }
+
+        PreparedCheck::Check(PreparedCheckData {
+            uri: self.uri.clone(),
+            version: self.version,
+            text: self.text.clone(),
+            index: self.index.clone(),
+            blocks,
         })
+    }
+
+    fn complete_check(&mut self, checked_blocks: Vec<CompletedCheckBlock>) -> Vec<Diagnostic> {
+        for checked in checked_blocks {
+            self.diagnostics_cache
+                .store_checked_block(checked.byte_range, checked.diagnostics);
+        }
+
+        self.diagnostics_cache.diagnostics()
     }
 }
 

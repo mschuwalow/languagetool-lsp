@@ -1,7 +1,7 @@
 use crate::text_index::{ByteRange, TextIndex};
 use tower_lsp::lsp_types::{Diagnostic, Range};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DiagnosticsCache {
     blocks: Vec<CachedBlock>,
     options_key: String,

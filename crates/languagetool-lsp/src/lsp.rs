@@ -5,8 +5,8 @@ use crate::diagnostics::{
 };
 use crate::diagnostics_cache::CachedDiagnostic;
 use crate::document_cache::{
-    ChangeStatus, CompletedCheckBlock, DocumentCache, DocumentToken, PreparedCheckData,
-    PreparedDocumentCheck,
+    ChangeStatus, CompletedCheckBlock, DocumentCache, DocumentToken, PreparedCheck,
+    PreparedCheckData,
 };
 use crate::languagetool::{Annotation, LanguageToolClient, LanguageToolError, LanguageToolMatch};
 use crate::masking::CheckBlock;
@@ -43,9 +43,14 @@ struct CheckRequest {
     options: ClientOptions,
 }
 
-enum PreparedCheck {
+enum PreparedLspCheck {
     Check {
         requests: Vec<CheckRequest>,
+        uri: Url,
+        version: i32,
+        token: DocumentToken,
+    },
+    ReuseCached {
         uri: Url,
         version: i32,
         token: DocumentToken,
@@ -88,7 +93,7 @@ impl Backend {
                 .prepare_check_if_current(&uri, token, options_key, |language| {
                     options.language_enabled(&language)
                 })
-                .map(|prepared| backend.prepare_check(prepared, options));
+                .map(|(prepared, token)| backend.prepare_check(prepared, token, options));
             if let Some(prepared) = prepared {
                 log::debug!("Running debounced check for {uri} token={token:?}");
                 backend.run_prepared_check(prepared).await;
@@ -106,7 +111,7 @@ impl Backend {
             .prepare_check(uri, options_key, |language| {
                 options.language_enabled(&language)
             })
-            .map(|prepared| self.prepare_check(prepared, options))
+            .map(|(prepared, token)| self.prepare_check(prepared, token, options))
         else {
             log::debug!("Skipping immediate check for {uri}: document not cached");
             return;
@@ -122,15 +127,40 @@ impl Backend {
             .await;
     }
 
-    async fn run_prepared_check(&self, prepared: PreparedCheck) {
+    async fn run_prepared_check(&self, prepared: PreparedLspCheck) {
         let (requests, uri, version, token) = match prepared {
-            PreparedCheck::Check {
+            PreparedLspCheck::Check {
                 requests,
                 uri,
                 version,
                 token,
             } => (requests, uri, version, token),
-            PreparedCheck::Clear { uri, version } => {
+            PreparedLspCheck::ReuseCached {
+                uri,
+                version,
+                token,
+            } => {
+                let Some(diagnostics) =
+                    self.documents
+                        .complete_check_if_current(&uri, token, Vec::new())
+                else {
+                    log::debug!(
+                        "Discarding stale cached check result for {} token={:?}",
+                        uri,
+                        token
+                    );
+                    return;
+                };
+                log::debug!(
+                    "Publishing {} cached diagnostic(s) for {uri} token={token:?} version={version:?}",
+                    diagnostics.len()
+                );
+                self.client
+                    .publish_diagnostics(uri, diagnostics, Some(version))
+                    .await;
+                return;
+            }
+            PreparedLspCheck::Clear { uri, version } => {
                 log::debug!("Document {uri} is not checkable; clearing diagnostics");
                 self.clear_stale_diagnostics(&uri, Some(version)).await;
                 return;
@@ -248,20 +278,27 @@ impl Backend {
 
     fn prepare_check(
         &self,
-        prepared: PreparedDocumentCheck,
+        prepared: PreparedCheck,
+        token: DocumentToken,
         options: ClientOptions,
-    ) -> PreparedCheck {
+    ) -> PreparedLspCheck {
         let PreparedCheckData {
             uri,
             version,
-            token,
             text,
             index,
             blocks: prepared_blocks,
         } = match prepared {
-            PreparedDocumentCheck::Check(data) => data,
-            PreparedDocumentCheck::Clear { uri, version } => {
-                return PreparedCheck::Clear { uri, version };
+            PreparedCheck::Check(data) => data,
+            PreparedCheck::ReuseCached { uri, version } => {
+                return PreparedLspCheck::ReuseCached {
+                    uri,
+                    version,
+                    token,
+                };
+            }
+            PreparedCheck::Clear { uri, version } => {
+                return PreparedLspCheck::Clear { uri, version };
             }
         };
 
@@ -278,7 +315,7 @@ impl Backend {
             });
         }
 
-        PreparedCheck::Check {
+        PreparedLspCheck::Check {
             requests,
             uri,
             version,
@@ -621,13 +658,16 @@ impl LanguageServer for Backend {
             params.text_document.version,
             params.content_changes,
         );
+
         if change_status == ChangeStatus::OutOfSync {
-            self.run_prepared_check(PreparedCheck::Clear {
+            self.run_prepared_check(PreparedLspCheck::Clear {
                 uri: uri.clone(),
                 version: params.text_document.version,
             })
             .await;
+            return;
         }
+
         if had_changes && self.options().await.check_while_typing {
             self.schedule_check(uri).await;
         } else if had_changes {
