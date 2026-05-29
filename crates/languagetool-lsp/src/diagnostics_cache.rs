@@ -1,6 +1,6 @@
 use crate::diagnostics::DiagnosticData;
 use crate::text_index::{ByteRange, TextIndex};
-use tower_lsp::lsp_types::{Diagnostic, Range};
+use tower_lsp_server::ls_types::{Diagnostic, Range};
 
 #[derive(Debug, Default, Clone)]
 pub struct DiagnosticsCache {
@@ -199,7 +199,7 @@ fn update_diagnostic_range(diagnostic: &mut CachedDiagnostic, index: &TextIndex)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::Position;
+    use tower_lsp_server::ls_types::Position;
 
     fn cached_diagnostic(start: usize, end: usize) -> CachedDiagnostic {
         CachedDiagnostic {

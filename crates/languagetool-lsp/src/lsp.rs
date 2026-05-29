@@ -17,9 +17,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tower_lsp::jsonrpc::{Error as RpcError, Result as RpcResult};
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp_server::jsonrpc::{Error as RpcError, Result as RpcResult};
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer};
 
 const COMMAND_IGNORE_WORD: &str = "languagetool.ignoreWordInWorkspace";
 const COMMAND_DISABLE_RULE: &str = "languagetool.disableRuleInWorkspace";
@@ -49,13 +49,19 @@ impl Backend {
         self.config.options().await
     }
 
-    async fn schedule_check(&self, uri: Url) {
+    async fn schedule_check(&self, uri: Uri) {
         let Some(token) = self.documents.token(&uri) else {
-            log::debug!("Skipping check schedule for {uri}: document not cached");
+            log::debug!(
+                "Skipping check schedule for {uri}: document not cached",
+                uri = uri.as_str()
+            );
             return;
         };
         let debounce = self.options().await.debounce_ms;
-        log::debug!("Scheduling check for {uri} token={token:?} debounce_ms={debounce}");
+        log::debug!(
+            "Scheduling check for {uri} token={token:?} debounce_ms={debounce}",
+            uri = uri.as_str()
+        );
         let backend = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
@@ -65,28 +71,40 @@ impl Backend {
                 .documents
                 .prepare_check_if_current(&uri, token, options_key);
             if let Some((prepared, token)) = prepared {
-                log::debug!("Running debounced check for {uri} token={token:?}");
+                log::debug!(
+                    "Running debounced check for {uri} token={token:?}",
+                    uri = uri.as_str()
+                );
                 backend.run_prepared_check(prepared, token, options).await;
             } else {
-                log::debug!("Skipping stale debounced check for {uri} token={token:?}");
+                log::debug!(
+                    "Skipping stale debounced check for {uri} token={token:?}",
+                    uri = uri.as_str()
+                );
             }
         });
     }
 
-    async fn check_uri_now(&self, uri: &Url) {
+    async fn check_uri_now(&self, uri: &Uri) {
         let options = self.options().await;
         let options_key = options_key(&options);
         let Some(prepared) = self.documents.prepare_check(uri, options_key) else {
-            log::debug!("Skipping immediate check for {uri}: document not cached");
+            log::debug!(
+                "Skipping immediate check for {uri}: document not cached",
+                uri = uri.as_str()
+            );
             return;
         };
-        log::debug!("Running immediate check for {uri}");
+        log::debug!("Running immediate check for {uri}", uri = uri.as_str());
         let (prepared, token) = prepared;
         self.run_prepared_check(prepared, token, options).await;
     }
 
-    async fn clear_stale_diagnostics(&self, uri: &Url, version: Option<i32>) {
-        log::debug!("Clearing stale diagnostics for {uri} version={version:?}");
+    async fn clear_stale_diagnostics(&self, uri: &Uri, version: Option<i32>) {
+        log::debug!(
+            "Clearing stale diagnostics for {uri} version={version:?}",
+            uri = uri.as_str()
+        );
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), version)
             .await;
@@ -108,7 +126,8 @@ impl Backend {
 
                 log::debug!(
                     "Starting check for {uri} token={token:?} version={version:?} check_blocks={}",
-                    data.blocks.len()
+                    data.blocks.len(),
+                    uri = uri.as_str()
                 );
 
                 let mut checks = tokio::task::JoinSet::new();
@@ -138,7 +157,7 @@ impl Backend {
                             log::debug!(
                                 "LanguageTool returned {} match(es) for {} token={:?} block={:?}",
                                 response.matches.len(),
-                                request.uri,
+                                request.uri.as_str(),
                                 request.token,
                                 request.block.byte_range
                             );
@@ -165,7 +184,10 @@ impl Backend {
                     .await;
             }
             PreparedCheck::Clear { uri, version } => {
-                log::debug!("Document {uri} is not checkable; clearing diagnostics");
+                log::debug!(
+                    "Document {uri} is not checkable; clearing diagnostics",
+                    uri = uri.as_str()
+                );
                 self.clear_stale_diagnostics(&uri, Some(version)).await;
             }
         }
@@ -173,7 +195,7 @@ impl Backend {
 
     async fn complete_and_publish_check(
         &self,
-        uri: Url,
+        uri: Uri,
         version: i32,
         token: DocumentToken,
         checked_blocks: Vec<CompletedCheckBlock>,
@@ -186,13 +208,13 @@ impl Backend {
             if cached {
                 log::debug!(
                     "Discarding stale cached check result for {} token={:?}",
-                    uri,
+                    uri.as_str(),
                     token
                 );
             } else {
                 log::debug!(
                     "Discarding stale check result for {} token={:?}",
-                    uri,
+                    uri.as_str(),
                     token
                 );
             }
@@ -202,12 +224,14 @@ impl Backend {
         if cached {
             log::debug!(
                 "Publishing {} cached diagnostic(s) for {uri} token={token:?} version={version:?}",
-                diagnostics.len()
+                diagnostics.len(),
+                uri = uri.as_str()
             );
         } else {
             log::debug!(
                 "Publishing {} diagnostic(s) for {uri} token={token:?} version={version:?}",
-                diagnostics.len()
+                diagnostics.len(),
+                uri = uri.as_str()
             );
         }
 
@@ -288,7 +312,6 @@ impl Backend {
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
         if let Some(root) = workspace_root(&params) {
@@ -338,6 +361,7 @@ impl LanguageServer for Backend {
                 name: "LanguageTool LSP".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
+            offset_encoding: None,
         })
     }
 
@@ -363,13 +387,17 @@ impl LanguageServer for Backend {
             "Opened document {uri} language_id={} version={} bytes={}",
             params.text_document.language_id,
             params.text_document.version,
-            params.text_document.text.len()
+            params.text_document.text.len(),
+            uri = uri.as_str()
         );
         self.documents.insert(&params.text_document);
         if self.options().await.check_on_open {
             self.check_uri_now(&uri).await;
         } else {
-            log::debug!("Skipping open check for {uri}: check_on_open=false");
+            log::debug!(
+                "Skipping open check for {uri}: check_on_open=false",
+                uri = uri.as_str()
+            );
         }
     }
 
@@ -379,7 +407,8 @@ impl LanguageServer for Backend {
         log::debug!(
             "Received {} change(s) for {uri} version={}",
             params.content_changes.len(),
-            params.text_document.version
+            params.text_document.version,
+            uri = uri.as_str()
         );
         let change_status = self.documents.apply_changes(
             &uri,
@@ -396,22 +425,28 @@ impl LanguageServer for Backend {
         if had_changes && self.options().await.check_while_typing {
             self.schedule_check(uri).await;
         } else if had_changes {
-            log::debug!("Skipping typing check for {uri}: check_while_typing=false");
+            log::debug!(
+                "Skipping typing check for {uri}: check_while_typing=false",
+                uri = uri.as_str()
+            );
         }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
-        log::info!("Saved document {uri}");
+        log::info!("Saved document {uri}", uri = uri.as_str());
         if self.options().await.check_on_save {
             self.check_uri_now(&uri).await;
         } else {
-            log::debug!("Skipping save check for {uri}: check_on_save=false");
+            log::debug!(
+                "Skipping save check for {uri}: check_on_save=false",
+                uri = uri.as_str()
+            );
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        log::info!("Closed document {}", params.text_document.uri);
+        log::info!("Closed document {}", params.text_document.uri.as_str());
         self.documents.remove(&params.text_document.uri);
         self.clear_stale_diagnostics(&params.text_document.uri, None)
             .await;
@@ -422,7 +457,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let project_config_display_path = self.project_config_display_path().await;
         let diagnostic_count = params.context.diagnostics.len();
-        log::debug!("Building code actions for {uri} diagnostics={diagnostic_count}");
+        log::debug!(
+            "Building code actions for {uri} diagnostics={diagnostic_count}",
+            uri = uri.as_str()
+        );
 
         for diagnostic in params.context.diagnostics {
             if diagnostic.source.as_deref() != Some(SOURCE) {
@@ -479,10 +517,14 @@ impl LanguageServer for Backend {
         }
 
         if actions.is_empty() {
-            log::debug!("No code actions available for {uri}");
+            log::debug!("No code actions available for {uri}", uri = uri.as_str());
             Ok(None)
         } else {
-            log::debug!("Returning {} code action(s) for {uri}", actions.len());
+            log::debug!(
+                "Returning {} code action(s) for {uri}",
+                actions.len(),
+                uri = uri.as_str()
+            );
             Ok(Some(actions))
         }
     }
@@ -542,7 +584,7 @@ impl LanguageServer for Backend {
 }
 
 struct CheckRequest {
-    uri: Url,
+    uri: Uri,
     version: i32,
     token: DocumentToken,
     text: Arc<String>,
@@ -623,7 +665,7 @@ fn diagnostics_for_request(
     log::debug!(
         "Mapped LanguageTool matches to {} diagnostic(s) for {}",
         diagnostics.len(),
-        request.uri
+        request.uri.as_str()
     );
     diagnostics
 }
@@ -696,7 +738,7 @@ fn options_key(options: &ClientOptions) -> String {
 }
 
 fn make_replacement_action(
-    uri: &Url,
+    uri: &Uri,
     diagnostic: &Diagnostic,
     replacement: &str,
     document_version: Option<i32>,
@@ -736,17 +778,18 @@ fn make_command(title: String, command: &str, argument: String) -> Command {
     }
 }
 
+#[allow(deprecated)]
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     params
         .workspace_folders
         .as_ref()
         .and_then(|folders| folders.first())
-        .and_then(|folder| folder.uri.to_file_path().ok())
+        .and_then(|folder| folder.uri.to_file_path().map(|path| path.into_owned()))
         .or_else(|| {
             params
                 .root_uri
                 .as_ref()
-                .and_then(|uri| uri.to_file_path().ok())
+                .and_then(|uri| uri.to_file_path().map(|path| path.into_owned()))
         })
 }
 
@@ -780,7 +823,7 @@ mod tests {
     #[test]
     fn builds_diagnostics_for_document() {
         let document = Document::new(
-            Url::parse("file:///tmp/test.txt").unwrap(),
+            "file:///tmp/test.txt".parse::<Uri>().unwrap(),
             1,
             Some("plaintext".to_string()),
             "This are a tset.".to_string(),
@@ -819,7 +862,7 @@ mod tests {
     #[test]
     fn diagnostics_use_original_document_offsets() {
         let document = Document::new(
-            Url::parse("file:///tmp/test.rs").unwrap(),
+            "file:///tmp/test.rs".parse::<Uri>().unwrap(),
             1,
             Some("rust".to_string()),
             "let value = 1; // This are a comment.".to_string(),
@@ -853,7 +896,7 @@ mod tests {
     #[test]
     fn diagnostics_drop_matches_in_markup_regions() {
         let document = Document::new(
-            Url::parse("file:///tmp/test.rs").unwrap(),
+            "file:///tmp/test.rs".parse::<Uri>().unwrap(),
             1,
             Some("rust".to_string()),
             "let typoo = 1; // This are a comment.".to_string(),
@@ -888,7 +931,7 @@ mod tests {
     #[test]
     fn diagnostics_use_languagetool_utf16_offsets() {
         let document = Document::new(
-            Url::parse("file:///tmp/test.txt").unwrap(),
+            "file:///tmp/test.txt".parse::<Uri>().unwrap(),
             1,
             Some("plaintext".to_string()),
             "😀 This are a tset.".to_string(),

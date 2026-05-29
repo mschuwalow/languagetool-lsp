@@ -3,7 +3,9 @@ use crate::document::{Document, DocumentChangeStatus};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tower_lsp::lsp_types::{Diagnostic, TextDocumentContentChangeEvent, TextDocumentItem, Url};
+use tower_lsp_server::ls_types::{
+    Diagnostic, Range, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
+};
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -81,25 +83,26 @@ impl DocumentCache {
         let document = Document::from_text_document(document);
         log::debug!(
             "Inserting document {} version={:?}",
-            document.uri(),
+            document.uri().as_str(),
             document.version()
         );
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = DocumentEntry::new(document);
-        documents.insert(entry.document.uri().to_string(), entry);
+        documents.insert(entry.document.uri().as_str().to_string(), entry);
     }
 
     fn full_update_locked(
         documents: &mut HashMap<String, DocumentEntry>,
-        uri: &Url,
+        uri: &Uri,
         version: i32,
         text: String,
     ) {
         log::debug!(
             "Applying full document update for {uri} version={version:?} bytes={}",
-            text.len()
+            text.len(),
+            uri = uri.as_str()
         );
-        let key = uri.to_string();
+        let key = uri.as_str().to_string();
         if let Some(entry) = documents.get_mut(&key) {
             entry.document.full_update(version, text);
         } else {
@@ -112,31 +115,35 @@ impl DocumentCache {
 
     fn incremental_update_locked(
         documents: &mut HashMap<String, DocumentEntry>,
-        uri: &Url,
+        uri: &Uri,
         version: i32,
-        range: tower_lsp::lsp_types::Range,
+        range: Range,
         new_text: &str,
     ) -> Option<DocumentChangeStatus> {
         log::debug!(
             "Applying ranged document change for {uri} version={version:?} range={range:?} replacement_bytes={}",
-            new_text.len()
+            new_text.len(),
+            uri = uri.as_str()
         );
-        let key = uri.to_string();
+        let key = uri.as_str().to_string();
         if let Some(entry) = documents.get_mut(&key) {
             return entry.document.incremental_update(version, range, new_text);
         }
 
-        log::error!("Received ranged change for uncached document {uri}; marking out of sync");
+        log::error!(
+            "Received ranged change for uncached document {uri}; marking out of sync",
+            uri = uri.as_str()
+        );
         Some(DocumentChangeStatus::OutOfSync)
     }
 
     pub fn apply_changes(
         &self,
-        uri: &Url,
+        uri: &Uri,
         version: i32,
         changes: Vec<TextDocumentContentChangeEvent>,
     ) -> ChangeStatus {
-        let key = uri.to_string();
+        let key = uri.as_str().to_string();
         let mut documents = self.documents.write().expect("document cache poisoned");
         if documents
             .get(&key)
@@ -144,7 +151,8 @@ impl DocumentCache {
         {
             log::warn!(
                 "Ignoring stale document change for {uri} version={version}; cached version={:?}",
-                documents.get(&key).map(|entry| entry.document.version())
+                documents.get(&key).map(|entry| entry.document.version()),
+                uri = uri.as_str()
             );
             return ChangeStatus::Stale;
         }
@@ -167,22 +175,22 @@ impl DocumentCache {
     #[cfg(test)]
     pub fn apply_change(
         &self,
-        uri: &Url,
+        uri: &Uri,
         version: i32,
         change: TextDocumentContentChangeEvent,
     ) -> ChangeStatus {
         self.apply_changes(uri, version, vec![change])
     }
 
-    pub fn remove(&self, uri: &Url) {
-        log::debug!("Removing document {uri} from cache");
+    pub fn remove(&self, uri: &Uri) {
+        log::debug!("Removing document {uri} from cache", uri = uri.as_str());
         self.documents
             .write()
             .expect("document cache poisoned")
             .remove(uri.as_str());
     }
 
-    pub fn token(&self, uri: &Url) -> Option<DocumentToken> {
+    pub fn token(&self, uri: &Uri) -> Option<DocumentToken> {
         self.documents
             .read()
             .expect("document cache poisoned")
@@ -193,7 +201,7 @@ impl DocumentCache {
     #[cfg(test)]
     pub fn with_bumped_entry<R>(
         &self,
-        uri: &Url,
+        uri: &Uri,
         f: impl FnOnce(&mut DocumentEntry) -> R,
     ) -> Option<R> {
         let mut documents = self.documents.write().expect("document cache poisoned");
@@ -204,7 +212,7 @@ impl DocumentCache {
 
     pub fn prepare_check(
         &self,
-        uri: &Url,
+        uri: &Uri,
         options_key: String,
     ) -> Option<(PreparedCheck, DocumentToken)> {
         let mut documents = self.documents.write().expect("document cache poisoned");
@@ -215,7 +223,7 @@ impl DocumentCache {
 
     pub fn prepare_check_if_current(
         &self,
-        uri: &Url,
+        uri: &Uri,
         token: DocumentToken,
         options_key: String,
     ) -> Option<(PreparedCheck, DocumentToken)> {
@@ -231,7 +239,7 @@ impl DocumentCache {
     #[cfg(test)]
     pub fn with_bumped_entry_if_current<R>(
         &self,
-        uri: &Url,
+        uri: &Uri,
         token: DocumentToken,
         f: impl FnOnce(&mut DocumentEntry) -> R,
     ) -> Option<R> {
@@ -246,7 +254,7 @@ impl DocumentCache {
 
     pub fn complete_check_if_current(
         &self,
-        uri: &Url,
+        uri: &Uri,
         token: DocumentToken,
         checked_blocks: Vec<CompletedCheckBlock>,
     ) -> Option<Vec<Diagnostic>> {
@@ -258,7 +266,7 @@ impl DocumentCache {
         Some(entry.document.complete_check(checked_blocks))
     }
 
-    pub fn urls(&self) -> Vec<Url> {
+    pub fn urls(&self) -> Vec<Uri> {
         self.documents
             .read()
             .expect("document cache poisoned")
@@ -271,8 +279,7 @@ impl DocumentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::{Position, Range};
-
+    use tower_lsp_server::ls_types::Position;
     fn full_change(text: &str) -> TextDocumentContentChangeEvent {
         TextDocumentContentChangeEvent {
             range: None,
@@ -292,7 +299,7 @@ mod tests {
     #[test]
     fn ranged_change_for_uncached_document_marks_out_of_sync_without_caching() {
         let cache = DocumentCache::default();
-        let uri = Url::parse("file:///tmp/missing.txt").unwrap();
+        let uri = "file:///tmp/missing.txt".parse::<Uri>().unwrap();
         let status = cache.apply_change(
             &uri,
             1,
@@ -310,7 +317,7 @@ mod tests {
     #[test]
     fn stale_change_does_not_roll_document_back() {
         let cache = DocumentCache::default();
-        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         cache.apply_change(&uri, 3, full_change("new text"));
 
         let status = cache.apply_change(&uri, 2, full_change("old text"));
@@ -328,7 +335,7 @@ mod tests {
     #[test]
     fn multi_change_notification_uses_one_version_check() {
         let cache = DocumentCache::default();
-        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         cache.apply_change(&uri, 1, full_change("hello world"));
 
         let status = cache.apply_changes(
@@ -361,7 +368,7 @@ mod tests {
     #[test]
     fn document_version_change_invalidates_scheduled_token_without_generation_bump() {
         let cache = DocumentCache::default();
-        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         cache.apply_change(&uri, 1, full_change("first"));
         let scheduled = cache.token(&uri).unwrap();
         assert_eq!(scheduled.generation(), 0);
@@ -377,7 +384,7 @@ mod tests {
     #[test]
     fn tracks_generation_with_document_entry() {
         let cache = DocumentCache::default();
-        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         assert_eq!(cache.token(&uri), None);
         assert!(cache
             .with_bumped_entry(&uri, |entry| entry.token())
@@ -409,7 +416,7 @@ mod tests {
     #[test]
     fn replacing_document_assigns_new_document_id() {
         let cache = DocumentCache::default();
-        let uri = Url::parse("file:///tmp/test.txt").unwrap();
+        let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         let first = TextDocumentItem {
             uri: uri.clone(),
             language_id: "plaintext".to_string(),

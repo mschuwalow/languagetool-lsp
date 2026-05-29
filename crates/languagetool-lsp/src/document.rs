@@ -3,7 +3,7 @@ use crate::language::{DocumentLanguage, SupportedLanguage};
 use crate::masking::{CheckBlock, Masker};
 use crate::text_index::{ByteOffset, ByteRange, TextIndex};
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Diagnostic, TextDocumentItem, Url};
+use tower_lsp_server::ls_types::{Diagnostic, Range, TextDocumentItem, Uri};
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -19,7 +19,7 @@ enum DocumentKind {
 
 #[derive(Debug, Clone)]
 struct SupportedDocument {
-    uri: Url,
+    uri: Uri,
     version: i32,
     language: SupportedLanguage,
     text: Arc<String>,
@@ -30,13 +30,13 @@ struct SupportedDocument {
 
 #[derive(Debug, Clone)]
 struct UnsupportedDocument {
-    uri: Url,
+    uri: Uri,
     version: i32,
 }
 
 #[derive(Debug, Clone)]
 struct OutOfSyncDocument {
-    uri: Url,
+    uri: Uri,
     version: i32,
     language: SupportedLanguage,
 }
@@ -51,13 +51,13 @@ pub(crate) enum DocumentChangeStatus {
 #[derive(Debug)]
 pub enum PreparedCheck {
     Check(PreparedCheckData),
-    ReuseCached { uri: Url, version: i32 },
-    Clear { uri: Url, version: i32 },
+    ReuseCached { uri: Uri, version: i32 },
+    Clear { uri: Uri, version: i32 },
 }
 
 #[derive(Debug)]
 pub struct PreparedCheckData {
-    pub uri: Url,
+    pub uri: Uri,
     pub version: i32,
     pub text: Arc<String>,
     pub index: Arc<TextIndex>,
@@ -71,12 +71,13 @@ pub struct CompletedCheckBlock {
 }
 
 impl Document {
-    pub fn new(uri: Url, version: i32, language_id: Option<String>, text: String) -> Self {
+    pub fn new(uri: Uri, version: i32, language_id: Option<String>, text: String) -> Self {
         let text_len = text.len();
         let kind = match DocumentLanguage::from_lsp_or_uri(language_id.as_deref(), &uri) {
             DocumentLanguage::Supported(language) => {
                 log::debug!(
-                    "Created supported document {uri} version={version:?} language={language:?} bytes={text_len}"
+                    "Created supported document {uri} version={version:?} language={language:?} bytes={text_len}",
+                    uri = uri.as_str()
                 );
                 DocumentKind::Supported(Box::new(SupportedDocument::new(
                     uri, version, language, text,
@@ -84,7 +85,8 @@ impl Document {
             }
             DocumentLanguage::Unsupported => {
                 log::debug!(
-                    "Created unsupported document {uri} version={version:?}; text will not be cached"
+                    "Created unsupported document {uri} version={version:?}; text will not be cached",
+                    uri = uri.as_str()
                 );
                 DocumentKind::Unsupported(UnsupportedDocument { uri, version })
             }
@@ -101,7 +103,7 @@ impl Document {
         )
     }
 
-    pub fn uri(&self) -> &Url {
+    pub fn uri(&self) -> &Uri {
         match &self.kind {
             DocumentKind::Supported(document) => &document.uri,
             DocumentKind::Unsupported(document) => &document.uri,
@@ -144,7 +146,7 @@ impl Document {
     pub(crate) fn incremental_update(
         &mut self,
         version: i32,
-        range: tower_lsp::lsp_types::Range,
+        range: Range,
         new_text: &str,
     ) -> Option<DocumentChangeStatus> {
         match &mut self.kind {
@@ -209,7 +211,7 @@ impl Document {
 }
 
 impl SupportedDocument {
-    fn new(uri: Url, version: i32, language: SupportedLanguage, text: String) -> Self {
+    fn new(uri: Uri, version: i32, language: SupportedLanguage, text: String) -> Self {
         let text = Arc::new(text);
         let index = Arc::new(TextIndex::new(&text));
         let mask = Masker::new(&text, language);
@@ -234,13 +236,13 @@ impl SupportedDocument {
     fn incremental_update(
         &mut self,
         version: i32,
-        range: tower_lsp::lsp_types::Range,
+        range: Range,
         new_text: &str,
     ) -> DocumentChangeStatus {
         let Some((old_byte_range, old_utf16_range)) = self.index.edit_offsets(range) else {
             log::error!(
                 "Rejected incremental change for {} because range {:?} is outside valid UTF-16 boundaries",
-                self.uri,
+                self.uri.as_str(),
                 range
             );
             self.version = version;
@@ -285,7 +287,7 @@ impl SupportedDocument {
         if check_blocks.is_empty() {
             log::debug!(
                 "Skipping {} because language {:?} produced no checkable blocks",
-                self.uri,
+                self.uri.as_str(),
                 self.language
             );
             self.diagnostics_cache.clear();
@@ -332,8 +334,7 @@ impl SupportedDocument {
 mod tests {
     use super::*;
     use indoc::indoc;
-    use tower_lsp::lsp_types::{Position, Range};
-
+    use tower_lsp_server::ls_types::Position;
     fn supported_document(document: &Document) -> SupportedDocument {
         document
             .supported()
@@ -343,7 +344,7 @@ mod tests {
 
     fn plaintext_document(text: &str) -> Document {
         Document::new(
-            Url::parse("file:///tmp/test.txt").unwrap(),
+            "file:///tmp/test.txt".parse::<Uri>().unwrap(),
             1,
             Some("plaintext".to_string()),
             text.to_string(),
@@ -422,7 +423,7 @@ mod tests {
     #[test]
     fn full_change_resynchronizes_out_of_sync_document_with_original_language() {
         let mut document = Document::new(
-            Url::parse("file:///tmp/test.rs").unwrap(),
+            "file:///tmp/test.rs".parse::<Uri>().unwrap(),
             1,
             Some("rust".to_string()),
             "let code = 1; // This are old docs.".to_string(),
@@ -512,7 +513,7 @@ mod tests {
     #[test]
     fn incremental_changes_update_mask_tree() {
         let mut document = Document::new(
-            Url::parse("file:///tmp/test.rs").unwrap(),
+            "file:///tmp/test.rs".parse::<Uri>().unwrap(),
             1,
             Some("rust".to_string()),
             indoc! {r#"
@@ -560,7 +561,7 @@ mod tests {
     #[test]
     fn unsupported_document_is_noop_without_cached_text() {
         let mut document = Document::new(
-            Url::parse("file:///tmp/test.rb").unwrap(),
+            "file:///tmp/test.rb".parse::<Uri>().unwrap(),
             1,
             Some("ruby".to_string()),
             "This are a tset.".to_string(),
@@ -591,7 +592,7 @@ mod tests {
     #[test]
     fn unsupported_full_update_remains_unsupported_without_supported_uri() {
         let mut document = Document::new(
-            Url::parse("untitled:notes").unwrap(),
+            "untitled:notes".parse::<Uri>().unwrap(),
             1,
             Some("unknown".to_string()),
             "This are ignored.".to_string(),
@@ -605,7 +606,7 @@ mod tests {
     #[test]
     fn unknown_lsp_language_id_falls_back_to_supported_uri() {
         let document = Document::new(
-            Url::parse("file:///tmp/notes.txt").unwrap(),
+            "file:///tmp/notes.txt".parse::<Uri>().unwrap(),
             1,
             Some("unknown".to_string()),
             "This are checked.".to_string(),

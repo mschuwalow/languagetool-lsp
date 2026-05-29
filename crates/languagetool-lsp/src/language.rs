@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportedLanguage {
@@ -76,7 +76,7 @@ impl DocumentLanguage {
             .unwrap_or(Self::Unsupported)
     }
 
-    pub fn from_lsp_or_uri(language_id: Option<&str>, uri: &Url) -> Self {
+    pub fn from_lsp_or_uri(language_id: Option<&str>, uri: &Uri) -> Self {
         if let Some(language_id) = language_id.filter(|value| !value.trim().is_empty()) {
             if let Some(language) = SupportedLanguage::from_language_id(language_id) {
                 return Self::Supported(language);
@@ -84,8 +84,7 @@ impl DocumentLanguage {
         }
 
         uri.to_file_path()
-            .ok()
-            .map(|path| Self::from_path(&path))
+            .map(|path| Self::from_path(path.as_ref()))
             .unwrap_or(Self::Unsupported)
     }
 }
@@ -120,7 +119,7 @@ mod tests {
 
     #[test]
     fn unknown_lsp_language_ids_fall_back_to_uri() {
-        let uri = Url::parse("file:///tmp/notes.txt").unwrap();
+        let uri = "file:///tmp/notes.txt".parse::<Uri>().unwrap();
         assert_eq!(
             DocumentLanguage::from_lsp_or_uri(Some("unknown-client-language"), &uri),
             DocumentLanguage::Supported(SupportedLanguage::PlainText)

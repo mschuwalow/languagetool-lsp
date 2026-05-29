@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use tower_lsp::lsp_types::{
-    CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Range, Url,
+use tower_lsp_server::ls_types::{
+    CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Range, Uri,
 };
 
 use crate::config::ClientOptions;
@@ -119,7 +119,7 @@ fn code_description(rule_id: &str, language: &str) -> Option<CodeDescription> {
         urlencoding::encode(rule_id),
         urlencoding::encode(language)
     );
-    Url::parse(&uri).ok().map(|href| CodeDescription { href })
+    uri.parse::<Uri>().ok().map(|href| CodeDescription { href })
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use languagetool_lsp::lsp::Backend;
 use std::path::{Path, PathBuf};
-use tower_lsp::{LspService, Server};
+use tower_lsp_server::{LspService, Server};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None, arg_required_else_help = true)]

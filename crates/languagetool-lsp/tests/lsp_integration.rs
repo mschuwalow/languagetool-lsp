@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{duplex, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
-use tower_lsp::lsp_types::Url;
-use tower_lsp::{LspService, Server};
+use tower_lsp_server::ls_types::Uri;
+use tower_lsp_server::{LspService, Server};
 
 fn encode_message(message: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", message.len(), message)
@@ -48,12 +48,12 @@ impl TestContext {
         }
     }
 
-    fn root_uri(&self) -> Url {
-        Url::from_file_path(self.workspace.path()).expect("workspace path should be a file URL")
+    fn root_uri(&self) -> Uri {
+        Uri::from_file_path(self.workspace.path()).expect("workspace path should be a file URL")
     }
 
-    fn doc_uri(&self, path: &str) -> Url {
-        Url::from_file_path(self.workspace.path().join(path))
+    fn doc_uri(&self, path: &str) -> Uri {
+        Uri::from_file_path(self.workspace.path().join(path))
             .expect("document path should be a file URL")
     }
 
@@ -107,7 +107,7 @@ impl TestContext {
         response
     }
 
-    async fn open_document(&mut self, uri: &Url, language_id: &str, text: &str) {
+    async fn open_document(&mut self, uri: &Uri, language_id: &str, text: &str) {
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -241,7 +241,7 @@ impl TestContext {
 }
 
 impl TestContext {
-    async fn change_document(&mut self, uri: &Url, version: i64, changes: serde_json::Value) {
+    async fn change_document(&mut self, uri: &Uri, version: i64, changes: serde_json::Value) {
         self.notify(
             "textDocument/didChange",
             json!({
@@ -252,7 +252,7 @@ impl TestContext {
         .await;
     }
 
-    async fn save_document(&mut self, uri: &Url) {
+    async fn save_document(&mut self, uri: &Uri) {
         self.notify(
             "textDocument/didSave",
             json!({

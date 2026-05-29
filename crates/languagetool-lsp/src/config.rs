@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tower_lsp::lsp_types::DiagnosticSeverity;
+use tower_lsp_server::ls_types::DiagnosticSeverity;
 
 pub const CONFIG_DIR: &str = ".zed";
 pub const CONFIG_FILE: &str = "languagetool.json";
