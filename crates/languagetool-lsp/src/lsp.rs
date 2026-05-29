@@ -102,7 +102,7 @@ impl Backend {
             PreparedCheck::Check(data) => {
                 let uri = data.uri;
                 let version = data.version;
-                let text = Arc::new(data.text);
+                let text = data.text;
                 let index = Arc::new(data.index);
                 let options = Arc::new(options);
 
@@ -132,8 +132,6 @@ impl Backend {
                 }
 
                 let mut responses = Vec::new();
-                let mut first_error = None;
-                let mut join_error = None;
                 while let Some(result) = checks.join_next().await {
                     match result {
                         Ok((request, Ok(response))) => {
@@ -146,46 +144,15 @@ impl Backend {
                             );
                             responses.push((request, response));
                         }
-                        Ok((_request, Err(err))) => {
-                            if first_error.is_none() {
-                                first_error = Some(err);
-                            }
+                        Ok((_, Err(err))) => {
+                            self.log_check_error(options.as_ref(), err).await;
                         }
                         Err(err) => {
-                            if join_error.is_none() {
-                                join_error = Some(err);
-                            }
+                            let message = format!("LanguageTool check task failed: {err}");
+                            log::warn!("{message}");
+                            self.client.log_message(MessageType::WARNING, message).await;
                         }
                     }
-                }
-
-                if first_error.is_some() || join_error.is_some() {
-                    responses.sort_by_key(|(request, _)| request.block.byte_range.start.0);
-                    let checked_blocks =
-                        completed_blocks_from_responses(responses, options.as_ref());
-                    let Some(diagnostics) =
-                        self.documents
-                            .complete_check_if_current(&uri, token, checked_blocks)
-                    else {
-                        log::debug!(
-                            "Discarding stale check failure for {} token={:?}",
-                            uri,
-                            token
-                        );
-                        return;
-                    };
-
-                    if let Some(err) = first_error {
-                        self.log_check_error(options.as_ref(), err).await;
-                    } else if let Some(err) = join_error {
-                        let message = format!("LanguageTool check task failed: {err}");
-                        log::warn!("{message}");
-                        self.client.log_message(MessageType::WARNING, message).await;
-                    }
-                    self.client
-                        .publish_diagnostics(uri, diagnostics, Some(version))
-                        .await;
-                    return;
                 }
 
                 responses.sort_by_key(|(request, _)| request.block.byte_range.start.0);
@@ -202,11 +169,13 @@ impl Backend {
                     );
                     return;
                 };
-                let diagnostic_count = diagnostics.len();
+
                 log::debug!(
-                    "Publishing {diagnostic_count} diagnostic(s) for {uri} token={token:?} version={:?}",
+                    "Publishing {} diagnostic(s) for {uri} token={token:?} version={:?}",
+                    diagnostics.len(),
                     version
                 );
+
                 self.client
                     .publish_diagnostics(uri, diagnostics, Some(version))
                     .await;
@@ -223,10 +192,12 @@ impl Backend {
                     );
                     return;
                 };
+
                 log::debug!(
                     "Publishing {} cached diagnostic(s) for {uri} token={token:?} version={version:?}",
                     diagnostics.len()
                 );
+
                 self.client
                     .publish_diagnostics(uri, diagnostics, Some(version))
                     .await;
@@ -794,7 +765,7 @@ mod tests {
             uri: prepared.uri,
             version: prepared.version,
             token: DocumentToken::new_for_test(0, prepared.version, 0),
-            text: Arc::new(prepared.text),
+            text: prepared.text,
             index: Arc::new(prepared.index),
             block,
         }

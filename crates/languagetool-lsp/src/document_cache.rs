@@ -286,7 +286,7 @@ mod tests {
         else {
             panic!("document should be checkable");
         };
-        prepared.text
+        prepared.text.as_ref().clone()
     }
 
     #[test]

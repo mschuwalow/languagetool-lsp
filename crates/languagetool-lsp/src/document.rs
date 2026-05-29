@@ -2,6 +2,7 @@ use crate::diagnostics_cache::{CachedDiagnostic, DiagnosticsCache};
 use crate::language::{DocumentLanguage, SupportedLanguage};
 use crate::masking::{CheckBlock, Masker};
 use crate::text_index::{ByteRange, TextIndex};
+use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, TextDocumentItem, Url};
 
 #[derive(Debug, Clone)]
@@ -21,7 +22,7 @@ struct SupportedDocument {
     uri: Url,
     version: i32,
     language: SupportedLanguage,
-    text: String,
+    text: Arc<String>,
     index: TextIndex,
     mask: Masker,
     diagnostics_cache: DiagnosticsCache,
@@ -58,7 +59,7 @@ pub enum PreparedCheck {
 pub struct PreparedCheckData {
     pub uri: Url,
     pub version: i32,
-    pub text: String,
+    pub text: Arc<String>,
     pub index: TextIndex,
     pub blocks: Vec<PreparedCheckBlock>,
 }
@@ -214,6 +215,7 @@ impl Document {
 
 impl SupportedDocument {
     fn new(uri: Url, version: i32, language: SupportedLanguage, text: String) -> Self {
+        let text = Arc::new(text);
         let index = TextIndex::new(&text);
         let mask = Masker::new(&text, language);
         Self {
@@ -231,7 +233,7 @@ impl SupportedDocument {
         self.index = TextIndex::new(&text);
         self.mask = Masker::new(&text, self.language);
         self.diagnostics_cache.clear();
-        self.text = text;
+        self.text = Arc::new(text);
     }
 
     fn incremental_update(
@@ -250,12 +252,13 @@ impl SupportedDocument {
             return DocumentChangeStatus::OutOfSync;
         };
 
-        let old_text = self.text.clone();
-        self.text
-            .replace_range(bytes.start.0..bytes.end.0, new_text);
-        self.index.apply_edit(&self.text, &bytes, &utf16, new_text);
-        self.mask
-            .apply_edit(&old_text, &self.text, &bytes, new_text);
+        let mask_edit = Masker::input_edit(&self.text, &bytes, new_text);
+
+        let text = Arc::make_mut(&mut self.text);
+        text.replace_range(bytes.start.0..bytes.end.0, new_text);
+
+        self.index.apply_edit(text, &bytes, &utf16, new_text);
+        self.mask.apply_edit(&mask_edit, text);
         self.diagnostics_cache
             .apply_edit(&bytes, new_text.len(), &self.index);
         self.version = version;
@@ -277,7 +280,19 @@ impl SupportedDocument {
             };
         }
 
+        // Any cached block should also be returned by the masker, as we should have invalidated
+        // the cache blocks otherwise.
+        debug_assert!(
+            self.diagnostics_cache.byte_ranges().all(|cached_range| {
+                check_blocks
+                    .iter()
+                    .any(|block| block.byte_range == *cached_range)
+            }),
+            "Not all cached blocks were returned by the masker"
+        );
+
         self.diagnostics_cache.reset_if_options_changed(options_key);
+
         let blocks: Vec<PreparedCheckBlock> = check_blocks
             .into_iter()
             .filter_map(|block| {
@@ -296,7 +311,7 @@ impl SupportedDocument {
         PreparedCheck::Check(PreparedCheckData {
             uri: self.uri.clone(),
             version: self.version,
-            text: self.text.clone(),
+            text: Arc::clone(&self.text),
             index: self.index.clone(),
             blocks,
         })
@@ -349,7 +364,7 @@ mod tests {
         );
 
         let document = supported_document(&document);
-        assert_eq!(document.text, "hi zed");
+        assert_eq!(document.text.as_str(), "hi zed");
         assert_eq!(document.version, 3);
     }
 
@@ -357,7 +372,7 @@ mod tests {
     fn applies_utf16_incremental_change() {
         let mut document = plaintext_document("a😀b");
         document.incremental_update(2, Range::new(Position::new(0, 1), Position::new(0, 3)), "x");
-        assert_eq!(supported_document(&document).text, "axb");
+        assert_eq!(supported_document(&document).text.as_str(), "axb");
     }
 
     #[test]
@@ -399,7 +414,7 @@ mod tests {
         document.full_update(3, "axb".to_string());
 
         let document = supported_document(&document);
-        assert_eq!(document.text, "axb");
+        assert_eq!(document.text.as_str(), "axb");
         assert_eq!(document.version, 3);
     }
 
@@ -450,7 +465,10 @@ mod tests {
             "zed",
         );
         assert_index_consistent(&document);
-        assert_eq!(supported_document(&document).text, "hello zed\nfoo bar");
+        assert_eq!(
+            supported_document(&document).text.as_str(),
+            "hello zed\nfoo bar"
+        );
 
         document.incremental_update(
             3,
@@ -458,11 +476,17 @@ mod tests {
             "\n",
         );
         assert_index_consistent(&document);
-        assert_eq!(supported_document(&document).text, "hello zed\nfoo\n bar");
+        assert_eq!(
+            supported_document(&document).text.as_str(),
+            "hello zed\nfoo\n bar"
+        );
 
         document.incremental_update(4, Range::new(Position::new(1, 3), Position::new(2, 0)), "");
         assert_index_consistent(&document);
-        assert_eq!(supported_document(&document).text, "hello zed\nfoo bar");
+        assert_eq!(
+            supported_document(&document).text.as_str(),
+            "hello zed\nfoo bar"
+        );
     }
 
     #[test]
@@ -472,7 +496,7 @@ mod tests {
 
         document.incremental_update(2, Range::new(Position::new(0, 3), Position::new(0, 5)), "x");
         assert_index_consistent(&document);
-        assert_eq!(supported_document(&document).text, "hi x there");
+        assert_eq!(supported_document(&document).text.as_str(), "hi x there");
 
         document.incremental_update(
             3,
@@ -480,7 +504,7 @@ mod tests {
             "😂",
         );
         assert_index_consistent(&document);
-        assert_eq!(supported_document(&document).text, "hi x😂 there");
+        assert_eq!(supported_document(&document).text.as_str(), "hi x😂 there");
     }
 
     #[test]
@@ -525,7 +549,10 @@ mod tests {
             "three",
         );
         assert_index_consistent(&document);
-        assert_eq!(supported_document(&document).text, "line one\r\nline three");
+        assert_eq!(
+            supported_document(&document).text.as_str(),
+            "line one\r\nline three"
+        );
     }
 
     #[test]
@@ -583,7 +610,7 @@ mod tests {
         );
 
         let document = supported_document(&document);
-        assert_eq!(document.text, "This are checked.");
+        assert_eq!(document.text.as_str(), "This are checked.");
         assert_eq!(document.version, 1);
     }
 }

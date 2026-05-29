@@ -58,6 +58,10 @@ impl DiagnosticsCache {
         self.find_block(byte_range).is_ok()
     }
 
+    pub fn byte_ranges(&self) -> impl Iterator<Item = &ByteRange> {
+        self.blocks.iter().map(|block| &block.byte_range)
+    }
+
     pub fn store_checked_block(
         &mut self,
         byte_range: ByteRange,
