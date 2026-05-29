@@ -1,5 +1,98 @@
 use tower_lsp::lsp_types::{Position, Range};
 
+/// A byte offset into document text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ByteOffset(pub usize);
+
+impl ByteOffset {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for ByteOffset {
+    fn from(v: usize) -> Self {
+        Self(v)
+    }
+}
+
+impl From<ByteOffset> for usize {
+    fn from(v: ByteOffset) -> Self {
+        v.0
+    }
+}
+
+/// A UTF-16 code-unit offset, as used by the LSP and LanguageTool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Utf16Offset(pub usize);
+
+impl Utf16Offset {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for Utf16Offset {
+    fn from(v: usize) -> Self {
+        Self(v)
+    }
+}
+
+impl From<Utf16Offset> for usize {
+    fn from(v: Utf16Offset) -> Self {
+        v.0
+    }
+}
+
+/// A range expressed as a pair of byte offsets into document text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByteRange {
+    pub start: ByteOffset,
+    pub end: ByteOffset,
+}
+
+impl ByteRange {
+    pub fn new(start: impl Into<ByteOffset>, end: impl Into<ByteOffset>) -> Self {
+        Self {
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+}
+
+impl From<std::ops::Range<usize>> for ByteRange {
+    fn from(r: std::ops::Range<usize>) -> Self {
+        Self::new(r.start, r.end)
+    }
+}
+
+impl From<ByteRange> for std::ops::Range<usize> {
+    fn from(r: ByteRange) -> Self {
+        r.start.0..r.end.0
+    }
+}
+
+/// A range expressed as a pair of UTF-16 code-unit offsets, as used by the
+/// LSP and LanguageTool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Utf16Range {
+    pub start: Utf16Offset,
+    pub end: Utf16Offset,
+}
+
+impl Utf16Range {
+    pub fn new(start: impl Into<Utf16Offset>, end: impl Into<Utf16Offset>) -> Self {
+        Self {
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+
+    pub fn intersects(&self, other: &Utf16Range) -> bool {
+        self.start < other.end && self.end > other.start
+    }
+}
+
 /// Per-document index built in a single O(n) pass.
 ///
 /// Provides O(log n) UTF-16 ↔ byte offset conversion and O(log n) flat-UTF-16-offset →
@@ -82,20 +175,21 @@ impl TextIndex {
 
     /// Update the index for a single range replacement.
     ///
-    /// `text` is the full document text after applying the edit. `byte_start`/`byte_end`
-    /// are the byte boundaries of the replaced region in the old text. `utf16_start`/
-    /// `utf16_end` are the corresponding UTF-16 offsets. `new_text` is the replacement
-    /// string. Obtain all four offset values cheaply via [`Self::edit_offsets`] before
-    /// mutating the text.
+    /// `text` is the full document text after applying the edit. `bytes` and
+    /// `utf16` are the old-text boundaries of the replaced region, as returned
+    /// by [`Self::edit_offsets`]. `new_text` is the replacement string.
     pub fn apply_edit(
         &mut self,
         text: &str,
-        byte_start: usize,
-        byte_end: usize,
-        utf16_start: usize,
-        utf16_end: usize,
+        bytes: &ByteRange,
+        utf16: &Utf16Range,
         new_text: &str,
     ) {
+        let byte_start = bytes.start.0;
+        let byte_end = bytes.end.0;
+        let utf16_start = utf16.start.0;
+        let utf16_end = utf16.end.0;
+
         let new_utf16_len: usize = new_text.chars().map(|c| c.len_utf16()).sum();
         let new_byte_len = new_text.len();
         let utf16_delta = new_utf16_len as isize - (utf16_end - utf16_start) as isize;
@@ -107,7 +201,7 @@ impl TextIndex {
         let line_replace_end = (line_last + 1).min(self.line_starts_utf16.len());
         let window_utf16_start = self.line_starts_utf16[line_first];
         let window_byte_start = self
-            .byte_offset_for_utf16(window_utf16_start)
+            .byte_offset_for_utf16_raw(window_utf16_start)
             .expect("line starts are valid UTF-16 offsets");
         let window_utf16_end = self
             .line_starts_utf16
@@ -115,7 +209,7 @@ impl TextIndex {
             .copied()
             .unwrap_or(self.total_utf16);
         let old_window_byte_end = self
-            .byte_offset_for_utf16(window_utf16_end)
+            .byte_offset_for_utf16_raw(window_utf16_end)
             .expect("line starts are valid UTF-16 offsets");
         let new_window_byte_end = (old_window_byte_end as isize + byte_delta) as usize;
         let include_trailing_line = line_replace_end == self.line_starts_utf16.len();
@@ -138,8 +232,8 @@ impl TextIndex {
         self.total_bytes = (self.total_bytes as isize + byte_delta) as usize;
     }
 
-    pub fn position(&self, utf16_offset: usize) -> Position {
-        let utf16_offset = utf16_offset.min(self.total_utf16);
+    pub fn position(&self, offset: Utf16Offset) -> Position {
+        let utf16_offset = offset.0.min(self.total_utf16);
         let next_line = self
             .line_starts_utf16
             .partition_point(|&ls| ls <= utf16_offset);
@@ -151,7 +245,39 @@ impl TextIndex {
         }
     }
 
-    pub fn byte_offset_for_utf16(&self, utf16_offset: usize) -> Option<usize> {
+    pub fn byte_offset_for_utf16(&self, offset: Utf16Offset) -> Option<ByteOffset> {
+        self.byte_offset_for_utf16_raw(offset.0).map(ByteOffset)
+    }
+
+    pub fn utf16_offset_for_byte(&self, offset: ByteOffset) -> Utf16Offset {
+        Utf16Offset(self.utf16_offset_for_byte_raw(offset.0))
+    }
+
+    pub fn text_for_utf16_range<'t>(&self, text: &'t str, range: Utf16Range) -> Option<&'t str> {
+        if range.start > range.end {
+            return None;
+        }
+        let byte_start = self.byte_offset_for_utf16_raw(range.start.0)?;
+        let byte_end = self.byte_offset_for_utf16_raw(range.end.0)?;
+        text.get(byte_start..byte_end)
+    }
+
+    /// Returns byte and UTF-16 offsets for an LSP range.
+    pub fn edit_offsets(&self, range: Range) -> Option<(ByteRange, Utf16Range)> {
+        let utf16_start = self.utf16_offset_for_lsp_position(range.start)?;
+        let utf16_end = self.utf16_offset_for_lsp_position(range.end)?;
+        if utf16_start > utf16_end {
+            return None;
+        }
+        let byte_start = self.byte_offset_for_utf16_raw(utf16_start)?;
+        let byte_end = self.byte_offset_for_utf16_raw(utf16_end)?;
+        Some((
+            ByteRange::new(byte_start, byte_end),
+            Utf16Range::new(utf16_start, utf16_end),
+        ))
+    }
+
+    fn byte_offset_for_utf16_raw(&self, utf16_offset: usize) -> Option<usize> {
         if utf16_offset > self.total_utf16 {
             return None;
         }
@@ -173,11 +299,10 @@ impl TextIndex {
         } else {
             self.checkpoints[idx - 1]
         };
-        let byte_offset = base_byte + (utf16_offset - base_utf16);
-        Some(byte_offset)
+        Some(base_byte + (utf16_offset - base_utf16))
     }
 
-    pub fn utf16_offset_for_byte(&self, byte_offset: usize) -> usize {
+    fn utf16_offset_for_byte_raw(&self, byte_offset: usize) -> usize {
         if byte_offset >= self.total_bytes {
             return self.total_utf16;
         }
@@ -190,32 +315,6 @@ impl TextIndex {
             self.checkpoints[idx - 1]
         };
         base_utf16 + (byte_offset - base_byte)
-    }
-
-    pub fn text_for_utf16_range<'t>(
-        &self,
-        text: &'t str,
-        start: usize,
-        end: usize,
-    ) -> Option<&'t str> {
-        if start > end {
-            return None;
-        }
-        let byte_start = self.byte_offset_for_utf16(start)?;
-        let byte_end = self.byte_offset_for_utf16(end)?;
-        text.get(byte_start..byte_end)
-    }
-
-    /// Returns byte and UTF-16 offsets for an LSP range.
-    pub fn edit_offsets(&self, range: Range) -> Option<(usize, usize, usize, usize)> {
-        let utf16_start = self.utf16_offset_for_lsp_position(range.start)?;
-        let utf16_end = self.utf16_offset_for_lsp_position(range.end)?;
-        if utf16_start > utf16_end {
-            return None;
-        }
-        let byte_start = self.byte_offset_for_utf16(utf16_start)?;
-        let byte_end = self.byte_offset_for_utf16(utf16_end)?;
-        Some((byte_start, byte_end, utf16_start, utf16_end))
     }
 
     fn utf16_offset_for_lsp_position(&self, position: Position) -> Option<usize> {
@@ -371,20 +470,20 @@ mod tests {
     #[test]
     fn maps_ascii_offsets() {
         let index = TextIndex::new("hello\nworld");
-        assert_eq!(index.position(0), Position::new(0, 0));
-        assert_eq!(index.position(5), Position::new(0, 5));
-        assert_eq!(index.position(6), Position::new(1, 0));
-        assert_eq!(index.position(11), Position::new(1, 5));
+        assert_eq!(index.position(Utf16Offset(0)), Position::new(0, 0));
+        assert_eq!(index.position(Utf16Offset(5)), Position::new(0, 5));
+        assert_eq!(index.position(Utf16Offset(6)), Position::new(1, 0));
+        assert_eq!(index.position(Utf16Offset(11)), Position::new(1, 5));
     }
 
     #[test]
     fn maps_utf16_offsets() {
         let index = TextIndex::new("a😀b\nz");
-        assert_eq!(index.position(0), Position::new(0, 0));
-        assert_eq!(index.position(1), Position::new(0, 1));
-        assert_eq!(index.position(3), Position::new(0, 3));
-        assert_eq!(index.position(4), Position::new(0, 4));
-        assert_eq!(index.position(5), Position::new(1, 0));
+        assert_eq!(index.position(Utf16Offset(0)), Position::new(0, 0));
+        assert_eq!(index.position(Utf16Offset(1)), Position::new(0, 1));
+        assert_eq!(index.position(Utf16Offset(3)), Position::new(0, 3));
+        assert_eq!(index.position(Utf16Offset(4)), Position::new(0, 4));
+        assert_eq!(index.position(Utf16Offset(5)), Position::new(1, 0));
     }
 
     #[test]
@@ -393,9 +492,15 @@ mod tests {
         let index = TextIndex::new(text);
         assert_eq!(
             index.edit_offsets(Range::new(Position::new(0, 1), Position::new(0, 3))),
-            Some((1, 5, 1, 3))
+            Some((
+                ByteRange::new(1usize, 5usize),
+                Utf16Range::new(1usize, 3usize)
+            ))
         );
-        assert_eq!(index.text_for_utf16_range(text, 1, 3), Some("😀"));
+        assert_eq!(
+            index.text_for_utf16_range(text, Utf16Range::new(1usize, 3usize)),
+            Some("😀")
+        );
     }
 
     #[test]
@@ -423,7 +528,7 @@ mod tests {
     #[test]
     fn rejects_utf16_offsets_inside_surrogate_pairs() {
         let index = TextIndex::new("a😀b");
-        assert_eq!(index.byte_offset_for_utf16(2), None);
+        assert_eq!(index.byte_offset_for_utf16(Utf16Offset(2)), None);
         assert_eq!(
             index.edit_offsets(Range::new(Position::new(0, 2), Position::new(0, 2))),
             None
@@ -437,19 +542,25 @@ mod tests {
         let mut utf16 = 0usize;
         for (byte_off, ch) in text.char_indices() {
             assert_eq!(
-                index.byte_offset_for_utf16(utf16),
-                Some(byte_off),
+                index.byte_offset_for_utf16(Utf16Offset(utf16)),
+                Some(ByteOffset(byte_off)),
                 "utf16={utf16} ch={ch:?}"
             );
             assert_eq!(
-                index.utf16_offset_for_byte(byte_off),
-                utf16,
+                index.utf16_offset_for_byte(ByteOffset(byte_off)),
+                Utf16Offset(utf16),
                 "byte={byte_off} ch={ch:?}"
             );
             utf16 += ch.len_utf16();
         }
-        assert_eq!(index.byte_offset_for_utf16(utf16), Some(text.len()));
-        assert_eq!(index.utf16_offset_for_byte(text.len()), utf16);
+        assert_eq!(
+            index.byte_offset_for_utf16(Utf16Offset(utf16)),
+            Some(ByteOffset(text.len()))
+        );
+        assert_eq!(
+            index.utf16_offset_for_byte(ByteOffset(text.len())),
+            Utf16Offset(utf16)
+        );
     }
 
     #[test]
@@ -498,10 +609,10 @@ mod tests {
         utf16_char_boundaries(text)
             .into_iter()
             .filter(|&offset| {
-                let position = index.position(offset);
+                let position = index.position(Utf16Offset(offset));
                 index
                     .edit_offsets(Range::new(position, position))
-                    .is_some_and(|(_, _, start, end)| start == offset && end == offset)
+                    .is_some_and(|(_, utf16)| utf16.start.0 == offset && utf16.end.0 == offset)
             })
             .collect()
     }
@@ -513,19 +624,15 @@ mod tests {
         new_text: &str,
     ) {
         let mut index = TextIndex::new(before);
-        let range = Range::new(index.position(utf16_start), index.position(utf16_end));
-        let (byte_start, byte_end, utf16_start, utf16_end) = index.edit_offsets(range).unwrap();
+        let range = Range::new(
+            index.position(Utf16Offset(utf16_start)),
+            index.position(Utf16Offset(utf16_end)),
+        );
+        let (bytes, utf16) = index.edit_offsets(range).unwrap();
 
         let mut after = before.to_string();
-        after.replace_range(byte_start..byte_end, new_text);
-        index.apply_edit(
-            &after,
-            byte_start,
-            byte_end,
-            utf16_start,
-            utf16_end,
-            new_text,
-        );
+        after.replace_range(bytes.start.0..bytes.end.0, new_text);
+        index.apply_edit(&after, &bytes, &utf16, new_text);
         let expected = TextIndex::new(&after);
 
         assert_eq!(
@@ -538,18 +645,11 @@ mod tests {
     // on the post-edit text.
     fn check_apply_edit(before: &str, range: Range, new_text: &str) {
         let mut index = TextIndex::new(before);
-        let (byte_start, byte_end, utf16_start, utf16_end) = index.edit_offsets(range).unwrap();
+        let (bytes, utf16) = index.edit_offsets(range).unwrap();
 
         let mut after = before.to_string();
-        after.replace_range(byte_start..byte_end, new_text);
-        index.apply_edit(
-            &after,
-            byte_start,
-            byte_end,
-            utf16_start,
-            utf16_end,
-            new_text,
-        );
+        after.replace_range(bytes.start.0..bytes.end.0, new_text);
+        index.apply_edit(&after, &bytes, &utf16, new_text);
         let expected = TextIndex::new(&after);
 
         assert_eq!(index, expected, "after text: {after:?}");
@@ -575,23 +675,25 @@ mod tests {
             let index = TextIndex::new(text);
             for byte in 0..=text.len() {
                 if text.is_char_boundary(byte) {
-                    let utf16 = index.utf16_offset_for_byte(byte);
+                    let utf16 = index.utf16_offset_for_byte(ByteOffset(byte));
                     assert_eq!(
                         index.byte_offset_for_utf16(utf16),
-                        Some(byte),
-                        "text={text:?} byte={byte} utf16={utf16}"
+                        Some(ByteOffset(byte)),
+                        "text={text:?} byte={byte} utf16={:?}",
+                        utf16.0
                     );
                 }
             }
 
             for utf16 in 0..=index.total_utf16 {
-                match index.byte_offset_for_utf16(utf16) {
+                match index.byte_offset_for_utf16(Utf16Offset(utf16)) {
                     Some(byte) => {
                         assert!(
-                            text.is_char_boundary(byte),
-                            "text={text:?} utf16={utf16} byte={byte}"
+                            text.is_char_boundary(byte.0),
+                            "text={text:?} utf16={utf16} byte={:?}",
+                            byte.0
                         );
-                        assert_eq!(index.utf16_offset_for_byte(byte), utf16);
+                        assert_eq!(index.utf16_offset_for_byte(byte), Utf16Offset(utf16));
                     }
                     None => assert!(
                         index.invalid_utf16_offsets.binary_search(&utf16).is_ok(),
@@ -617,8 +719,8 @@ mod tests {
                 let start = index.line_starts_utf16[line];
                 let end = index.line_ends_utf16[line];
                 assert!(start <= end, "text={text:?} line={line}");
-                assert!(index.byte_offset_for_utf16(start).is_some());
-                assert!(index.byte_offset_for_utf16(end).is_some());
+                assert!(index.byte_offset_for_utf16(Utf16Offset(start)).is_some());
+                assert!(index.byte_offset_for_utf16(Utf16Offset(end)).is_some());
 
                 if let Some(&next_start) = index.line_starts_utf16.get(line + 1) {
                     assert!(end <= next_start, "text={text:?} line={line}");
@@ -703,19 +805,19 @@ mod tests {
     fn maps_crlf_line_endings() {
         // \r\n counts as one line ending; the new line starts after the \n.
         let index = TextIndex::new("hello\r\nworld");
-        assert_eq!(index.position(0), Position::new(0, 0));
-        assert_eq!(index.position(5), Position::new(0, 5)); // the \r
-        assert_eq!(index.position(6), Position::new(0, 6)); // the \n
-        assert_eq!(index.position(7), Position::new(1, 0)); // 'w'
-        assert_eq!(index.position(12), Position::new(1, 5));
+        assert_eq!(index.position(Utf16Offset(0)), Position::new(0, 0));
+        assert_eq!(index.position(Utf16Offset(5)), Position::new(0, 5)); // the \r
+        assert_eq!(index.position(Utf16Offset(6)), Position::new(0, 6)); // the \n
+        assert_eq!(index.position(Utf16Offset(7)), Position::new(1, 0)); // 'w'
+        assert_eq!(index.position(Utf16Offset(12)), Position::new(1, 5));
     }
 
     #[test]
     fn maps_bare_cr_line_endings() {
         let index = TextIndex::new("hello\rworld");
-        assert_eq!(index.position(0), Position::new(0, 0));
-        assert_eq!(index.position(5), Position::new(0, 5)); // the \r
-        assert_eq!(index.position(6), Position::new(1, 0)); // 'w'
+        assert_eq!(index.position(Utf16Offset(0)), Position::new(0, 0));
+        assert_eq!(index.position(Utf16Offset(5)), Position::new(0, 5)); // the \r
+        assert_eq!(index.position(Utf16Offset(6)), Position::new(1, 0)); // 'w'
     }
 
     #[test]

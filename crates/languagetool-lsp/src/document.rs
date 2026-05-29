@@ -1,7 +1,7 @@
 use crate::language::{DocumentLanguage, SupportedLanguage};
 use crate::languagetool::AnnotatedText;
 use crate::masking::Masker;
-use crate::text_index::TextIndex;
+use crate::text_index::{ByteRange, TextIndex};
 use tower_lsp::lsp_types::{TextDocumentItem, Url};
 
 #[derive(Debug, Clone)]
@@ -48,7 +48,7 @@ pub(crate) enum DocumentChangeStatus {
 pub struct CheckableDocument<'a> {
     document: &'a SupportedDocument,
     annotated: AnnotatedText,
-    ignored_ranges: Vec<(usize, usize)>,
+    ignored_byte_ranges: Vec<ByteRange>,
 }
 
 impl CheckableDocument<'_> {
@@ -64,8 +64,8 @@ impl CheckableDocument<'_> {
         &self.annotated
     }
 
-    pub fn ignored_ranges(&self) -> &[(usize, usize)] {
-        &self.ignored_ranges
+    pub fn ignored_byte_ranges(&self) -> &[ByteRange] {
+        &self.ignored_byte_ranges
     }
 
     pub fn text(&self) -> &str {
@@ -164,12 +164,10 @@ impl Document {
             return None;
         }
 
-        let ignored_ranges = document
-            .mask
-            .ignored_ranges(&document.text, &document.index);
+        let ignored_byte_ranges = document.mask.ignored_byte_ranges(&document.text);
         Some(CheckableDocument {
             document,
-            ignored_ranges,
+            ignored_byte_ranges,
             annotated,
         })
     }
@@ -266,8 +264,7 @@ impl SupportedDocument {
         range: tower_lsp::lsp_types::Range,
         new_text: &str,
     ) -> DocumentChangeStatus {
-        let Some((byte_start, byte_end, utf16_start, utf16_end)) = self.index.edit_offsets(range)
-        else {
+        let Some((bytes, utf16)) = self.index.edit_offsets(range) else {
             log::error!(
                 "Rejected incremental change for {} because range {:?} is outside valid UTF-16 boundaries",
                 self.uri,
@@ -278,17 +275,11 @@ impl SupportedDocument {
         };
 
         let old_text = self.text.clone();
-        self.text.replace_range(byte_start..byte_end, new_text);
-        self.index.apply_edit(
-            &self.text,
-            byte_start,
-            byte_end,
-            utf16_start,
-            utf16_end,
-            new_text,
-        );
+        self.text
+            .replace_range(bytes.start.0..bytes.end.0, new_text);
+        self.index.apply_edit(&self.text, &bytes, &utf16, new_text);
         self.mask
-            .apply_edit(&old_text, &self.text, byte_start, byte_end, new_text);
+            .apply_edit(&old_text, &self.text, &bytes, new_text);
         self.version = version;
         DocumentChangeStatus::Applied
     }

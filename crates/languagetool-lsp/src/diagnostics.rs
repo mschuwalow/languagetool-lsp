@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{
 
 use crate::config::ClientOptions;
 use crate::languagetool::LanguageToolMatch;
-use crate::text_index::TextIndex;
+use crate::text_index::{TextIndex, Utf16Range};
 
 pub const SOURCE: &str = "LanguageTool";
 
@@ -27,11 +27,11 @@ pub fn make_lsp_diagnostic(
     data: DiagnosticData,
     options: &ClientOptions,
 ) -> Diagnostic {
-    let Some((offset, length)) = match_offsets(item) else {
+    let Some(Utf16Range { start: offset, end }) = match_utf16_range(item) else {
         return Diagnostic::default();
     };
     let start = index.position(offset);
-    let end = index.position(offset + length);
+    let end = index.position(end);
     let rule_id = item.rule.as_ref().map(|rule| rule.id.as_str());
     Diagnostic {
         range: Range { start, end },
@@ -53,9 +53,9 @@ pub fn diagnostic_data(
     options: &ClientOptions,
     document_version: Option<i32>,
 ) -> DiagnosticData {
-    let (offset, length) = match_offsets(item).unwrap_or_default();
+    let range = match_utf16_range(item).unwrap_or(Utf16Range::new(0, 0));
     let matched_text = index
-        .text_for_utf16_range(text, offset, offset + length)
+        .text_for_utf16_range(text, range)
         .unwrap_or_default()
         .to_string();
     let rule = item.rule.as_deref();
@@ -76,10 +76,10 @@ pub fn diagnostic_data(
     }
 }
 
-pub fn match_offsets(item: &LanguageToolMatch) -> Option<(usize, usize)> {
-    Some((
+pub fn match_utf16_range(item: &LanguageToolMatch) -> Option<Utf16Range> {
+    Some(Utf16Range::new(
         usize::try_from(item.offset).ok()?,
-        usize::try_from(item.length).ok()?,
+        usize::try_from(item.offset + item.length).ok()?,
     ))
 }
 

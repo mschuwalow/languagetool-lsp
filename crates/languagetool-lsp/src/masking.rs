@@ -1,6 +1,6 @@
 use crate::language::SupportedLanguage;
 use crate::languagetool::{AnnotatedText, Annotation};
-use crate::text_index::TextIndex;
+use crate::text_index::ByteRange;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 use tree_sitter_md_025::{MarkdownParser, MarkdownTree};
 
@@ -20,10 +20,11 @@ impl Masker {
         &mut self,
         old_text: &str,
         text: &str,
-        byte_start: usize,
-        byte_end: usize,
+        bytes: &crate::text_index::ByteRange,
         new_text: &str,
     ) {
+        let byte_start = bytes.start.0;
+        let byte_end = bytes.end.0;
         let start_position = point_for_byte(old_text, byte_start);
         let old_end_position = point_for_byte(old_text, byte_end);
         let new_end_byte = byte_start + new_text.len();
@@ -55,10 +56,31 @@ impl Masker {
         AnnotatedText { annotation }
     }
 
-    pub fn ignored_ranges(&self, text: &str, index: &TextIndex) -> Vec<(usize, usize)> {
+    /// Returns the byte ranges of document text that should be ignored when
+    /// checking diagnostics. For skip-masked languages (HTML, Markdown) these
+    /// are the skip ranges themselves; for keep-masked languages (comment
+    /// trees) they are the complement of the keep ranges; for plain text there
+    /// are no ignored ranges.
+    pub fn ignored_byte_ranges(&self, text: &str) -> Vec<ByteRange> {
         match self.ranges(text) {
-            Some(MaskRanges::Keep(mut ranges)) => inverse_ranges_as_utf16(text, index, &mut ranges),
-            Some(MaskRanges::Skip(mut ranges)) => ranges_as_utf16(index, &mut ranges),
+            Some(MaskRanges::Keep(mut ranges)) => {
+                let mut ignored = Vec::new();
+                let mut cursor = 0usize;
+                for range in merge_ranges(&mut ranges) {
+                    if cursor < range.start {
+                        ignored.push(ByteRange::new(cursor, range.start));
+                    }
+                    cursor = cursor.max(range.end);
+                }
+                if cursor < text.len() {
+                    ignored.push(ByteRange::new(cursor, text.len()));
+                }
+                ignored
+            }
+            Some(MaskRanges::Skip(mut ranges)) => merge_ranges(&mut ranges)
+                .into_iter()
+                .map(|r| ByteRange::new(r.start, r.end))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -506,46 +528,10 @@ fn merge_ranges(ranges: &mut [Range]) -> Vec<Range> {
     merged
 }
 
-fn ranges_as_utf16(index: &TextIndex, ranges: &mut [Range]) -> Vec<(usize, usize)> {
-    merge_ranges(ranges)
-        .into_iter()
-        .map(|range| {
-            (
-                index.utf16_offset_for_byte(range.start),
-                index.utf16_offset_for_byte(range.end),
-            )
-        })
-        .collect()
-}
-
-fn inverse_ranges_as_utf16(
-    text: &str,
-    index: &TextIndex,
-    keep_ranges: &mut [Range],
-) -> Vec<(usize, usize)> {
-    let mut ignored = Vec::new();
-    let mut cursor = 0;
-    for range in merge_ranges(keep_ranges) {
-        if cursor < range.start {
-            ignored.push(Range {
-                start: cursor,
-                end: range.start,
-            });
-        }
-        cursor = cursor.max(range.end);
-    }
-    if cursor < text.len() {
-        ignored.push(Range {
-            start: cursor,
-            end: text.len(),
-        });
-    }
-    ranges_as_utf16(index, &mut ignored)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_index::{TextIndex, Utf16Range};
     use indoc::indoc;
 
     fn annotated_for_test(text: &str, language_id: &str) -> AnnotatedText {
@@ -554,14 +540,10 @@ mod tests {
         mask.annotated(text)
     }
 
-    fn ignored_ranges_for_test(
-        text: &str,
-        index: &TextIndex,
-        language_id: &str,
-    ) -> Vec<(usize, usize)> {
+    fn ignored_byte_ranges_for_test(text: &str, language_id: &str) -> Vec<ByteRange> {
         let language = SupportedLanguage::from_language_id(language_id).unwrap();
         let mask = Masker::new(text, language);
-        mask.ignored_ranges(text, index)
+        mask.ignored_byte_ranges(text)
     }
 
     #[test]
@@ -681,10 +663,22 @@ mod tests {
             // This are a comment.
         "##};
         let index = TextIndex::new(text);
-        let ignored_ranges = ignored_ranges_for_test(text, &index, "rust");
-        let checked = complement_utf16_ranges(text, &index, &ignored_ranges)
+        let ignored_byte_ranges = ignored_byte_ranges_for_test(text, "rust");
+        // Convert byte ranges to UTF-16 for the complement helper.
+        let ignored_utf16: Vec<(usize, usize)> = ignored_byte_ranges
+            .iter()
+            .map(|r| {
+                (
+                    index.utf16_offset_for_byte(r.start).as_usize(),
+                    index.utf16_offset_for_byte(r.end).as_usize(),
+                )
+            })
+            .collect();
+        let checked = complement_utf16_ranges(text, &index, &ignored_utf16)
             .into_iter()
-            .filter_map(|(start, end)| index.text_for_utf16_range(text, start, end))
+            .filter_map(|(start, end)| {
+                index.text_for_utf16_range(text, Utf16Range::new(start, end))
+            })
             .collect::<String>();
 
         assert_eq!(checked, "This are a comment.");
@@ -893,9 +887,12 @@ mod tests {
         index: &TextIndex,
         ignored_ranges: &[(usize, usize)],
     ) -> Vec<(usize, usize)> {
+        use crate::text_index::ByteOffset;
         let mut checked = Vec::new();
-        let mut cursor = 0;
-        let total = index.utf16_offset_for_byte(text.len());
+        let mut cursor = 0usize;
+        let total = index
+            .utf16_offset_for_byte(ByteOffset(text.len()))
+            .as_usize();
         for &(start, end) in ignored_ranges {
             if cursor < start {
                 checked.push((cursor, start));

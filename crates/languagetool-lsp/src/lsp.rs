@@ -1,13 +1,13 @@
 use crate::config::{BackendKind, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
-    diagnostic_data, make_lsp_diagnostic, match_offsets, parse_diagnostic_data, SOURCE,
+    diagnostic_data, make_lsp_diagnostic, match_utf16_range, parse_diagnostic_data, SOURCE,
 };
 use crate::document_cache::{ChangeStatus, DocumentCache, DocumentEntry, DocumentToken};
 use crate::languagetool::{
     AnnotatedText, LanguageToolClient, LanguageToolError, LanguageToolMatch,
 };
 use crate::runtime_config::RuntimeConfig;
-use crate::text_index::TextIndex;
+use crate::text_index::{ByteRange, TextIndex, Utf16Range};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -36,7 +36,7 @@ struct CheckRequest {
     text: String,
     index: TextIndex,
     annotated: AnnotatedText,
-    ignored_ranges: Vec<(usize, usize)>,
+    ignored_byte_ranges: Vec<ByteRange>,
     options: ClientOptions,
 }
 
@@ -124,9 +124,9 @@ impl Backend {
             request.version
         );
         log::debug!(
-            "Sending LanguageTool request for {uri} token={token:?} annotations={} ignored_ranges={}",
+            "Sending LanguageTool request for {uri} token={token:?} annotations={} ignored_byte_ranges={}",
             request.annotated.annotation.len(),
-            request.ignored_ranges.len()
+            request.ignored_byte_ranges.len()
         );
         let response = match self
             .language_tool
@@ -194,7 +194,7 @@ impl Backend {
             text: checkable_document.text().to_string(),
             index: checkable_document.index().clone(),
             annotated: checkable_document.annotated().clone(),
-            ignored_ranges: checkable_document.ignored_ranges().to_vec(),
+            ignored_byte_ranges: checkable_document.ignored_byte_ranges().to_vec(),
             options,
         }))
     }
@@ -277,20 +277,31 @@ fn diagnostics_for_request(
     request: &CheckRequest,
     matches: Vec<LanguageToolMatch>,
 ) -> Vec<Diagnostic> {
+    // Convert ignored byte ranges to UTF-16 once so match filtering stays in
+    // the same coordinate space that LanguageTool uses.
+    let ignored_utf16: Vec<Utf16Range> = request
+        .ignored_byte_ranges
+        .iter()
+        .map(|r| {
+            Utf16Range::new(
+                request.index.utf16_offset_for_byte(r.start),
+                request.index.utf16_offset_for_byte(r.end),
+            )
+        })
+        .collect();
+
     let diagnostics = matches
         .iter()
-        .filter_map(|item| match_offsets(item).map(|(offset, length)| (item, offset, length)))
-        .filter(|(_, offset, length)| {
-            !request
+        .filter_map(|item| match_utf16_range(item).map(|range| (item, range)))
+        .filter(|(_, range)| {
+            request
                 .index
-                .text_for_utf16_range(&request.text, *offset, *offset + *length)
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
+                .text_for_utf16_range(&request.text, *range)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
         })
-        .filter(|(_, offset, length)| {
-            !intersects_ignored_ranges(*offset, *offset + *length, &request.ignored_ranges)
-        })
-        .filter_map(|(item, _, _)| {
+        .filter(|(_, range)| !ignored_utf16.iter().any(|ig| range.intersects(ig)))
+        .filter_map(|(item, _)| {
             let data = diagnostic_data(
                 &request.text,
                 &request.index,
@@ -308,12 +319,6 @@ fn diagnostics_for_request(
         request.uri
     );
     diagnostics
-}
-
-fn intersects_ignored_ranges(start: usize, end: usize, ignored_ranges: &[(usize, usize)]) -> bool {
-    ignored_ranges
-        .iter()
-        .any(|(ignored_start, ignored_end)| start < *ignored_end && end > *ignored_start)
 }
 
 fn make_replacement_action(
@@ -643,7 +648,7 @@ mod tests {
             text: document.text().to_string(),
             index: document.index().clone(),
             annotated: document.annotated().clone(),
-            ignored_ranges: document.ignored_ranges().to_vec(),
+            ignored_byte_ranges: document.ignored_byte_ranges().to_vec(),
             options,
         }
     }
