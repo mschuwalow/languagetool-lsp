@@ -1,5 +1,4 @@
 use std::path::Path;
-
 use tower_lsp_server::ls_types::Uri;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

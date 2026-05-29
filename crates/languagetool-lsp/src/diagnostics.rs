@@ -1,11 +1,10 @@
+use crate::config::ClientOptions;
+use crate::languagetool::LanguageToolMatch;
+use crate::text_index::Utf16Range;
 use serde::{Deserialize, Serialize};
 use tower_lsp_server::ls_types::{
     CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Range, Uri,
 };
-
-use crate::config::ClientOptions;
-use crate::languagetool::LanguageToolMatch;
-use crate::text_index::Utf16Range;
 
 pub const SOURCE: &str = "LanguageTool";
 
