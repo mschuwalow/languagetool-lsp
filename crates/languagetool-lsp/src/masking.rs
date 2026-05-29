@@ -33,13 +33,13 @@ impl Masker {
         Self { parsed }
     }
 
-    pub fn input_edit(old_text: &str, bytes: &ByteRange, new_text: &str) -> InputEdit {
+    pub fn input_edit(old_text: &str, bytes: &ByteRange, updated_text: &str) -> InputEdit {
         let byte_start = bytes.start.0;
         let byte_end = bytes.end.0;
         let start_position = point_for_byte(old_text, byte_start);
         let old_end_position = point_for_byte(old_text, byte_end);
-        let new_end_byte = byte_start + new_text.len();
-        let new_end_position = point_after_text(start_position, new_text);
+        let new_end_byte = byte_start + updated_text.len();
+        let new_end_position = point_after_text(start_position, updated_text);
         InputEdit {
             start_byte: byte_start,
             old_end_byte: byte_end,
@@ -50,8 +50,8 @@ impl Masker {
         }
     }
 
-    pub fn apply_edit(&mut self, edit: &InputEdit, text: &str) {
-        self.parsed.apply_edit(edit, text);
+    pub fn apply_edit(&mut self, edit: &InputEdit, new_text: &str) {
+        self.parsed.apply_edit(edit, new_text);
     }
 
     /// Returns the list of blocks to be checked by LanguageTool.

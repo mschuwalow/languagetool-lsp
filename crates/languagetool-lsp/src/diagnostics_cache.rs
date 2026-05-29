@@ -32,7 +32,13 @@ impl DiagnosticsCache {
         }
     }
 
-    pub fn apply_edit(&mut self, edit: &ByteRange, new_len: usize, index: &TextIndex) {
+    pub fn apply_edit(
+        &mut self,
+        edit: &ByteRange,
+        new_len: usize,
+        index: &TextIndex,
+        document_version: i32,
+    ) {
         let old_len = edit.end.0 - edit.start.0;
         let delta = new_len as isize - old_len as isize;
 
@@ -47,6 +53,10 @@ impl DiagnosticsCache {
                     shift_range(&mut diagnostic.doc_byte_range, delta);
                     update_diagnostic_range(diagnostic, index);
                 }
+            }
+
+            for diagnostic in &mut block.diagnostics {
+                update_diagnostic_document_version(diagnostic, document_version);
             }
 
             true
@@ -80,14 +90,14 @@ impl DiagnosticsCache {
         );
     }
 
-    pub fn diagnostics(&mut self, document_version: i32) -> Vec<Diagnostic> {
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
         self.blocks
-            .iter_mut()
+            .iter()
             .flat_map(|block| {
-                block.diagnostics.iter_mut().map(|diagnostic| {
-                    update_diagnostic_document_version(diagnostic, document_version);
-                    diagnostic.diagnostic.clone()
-                })
+                block
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.clone())
             })
             .collect()
     }
@@ -177,9 +187,9 @@ mod tests {
         cache.store_checked_block(ByteRange::new(10, 20), vec![cached_diagnostic(12, 16)]);
 
         let index = TextIndex::new("abcxxxxx0123456789012345");
-        cache.apply_edit(&ByteRange::new(3, 3), 5, &index);
+        cache.apply_edit(&ByteRange::new(3, 3), 5, &index, 1);
         assert!(cache.contains_block(&ByteRange::new(15, 25)));
-        let diagnostics = cache.diagnostics(1);
+        let diagnostics = cache.diagnostics();
 
         assert_eq!(diagnostics[0].range.start, Position::new(0, 17));
         assert_eq!(diagnostics[0].range.end, Position::new(0, 21));
@@ -191,7 +201,7 @@ mod tests {
         cache.store_checked_block(ByteRange::new(10, 20), vec![cached_diagnostic(12, 16)]);
 
         let index = TextIndex::new("0123456789xxxxx56789");
-        cache.apply_edit(&ByteRange::new(12, 15), 5, &index);
+        cache.apply_edit(&ByteRange::new(12, 15), 5, &index, 1);
 
         assert!(!cache.contains_block(&ByteRange::new(10, 22)));
     }
@@ -202,13 +212,13 @@ mod tests {
         cache.store_checked_block(ByteRange::new(0, 10), vec![cached_diagnostic(2, 5)]);
 
         let index = TextIndex::new("0123456789x");
-        cache.apply_edit(&ByteRange::new(10, 10), 1, &index);
+        cache.apply_edit(&ByteRange::new(10, 10), 1, &index, 1);
 
         assert!(!cache.contains_block(&ByteRange::new(0, 10)));
     }
 
     #[test]
-    fn diagnostics_refresh_embedded_document_version() {
+    fn apply_edit_refreshes_embedded_document_version() {
         let mut cache = DiagnosticsCache::default();
         let mut diagnostic = cached_diagnostic(0, 4);
         diagnostic.diagnostic.data = serde_json::to_value(DiagnosticData {
@@ -222,7 +232,10 @@ mod tests {
         .ok();
         cache.store_checked_block(ByteRange::new(0, 4), vec![diagnostic]);
 
-        let diagnostics = cache.diagnostics(2);
+        let index = TextIndex::new("test x");
+        cache.apply_edit(&ByteRange::new(5, 5), 1, &index, 2);
+
+        let diagnostics = cache.diagnostics();
         let data: DiagnosticData =
             serde_json::from_value(diagnostics[0].data.clone().unwrap()).unwrap();
 

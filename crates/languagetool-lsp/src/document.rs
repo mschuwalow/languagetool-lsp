@@ -23,7 +23,7 @@ struct SupportedDocument {
     version: i32,
     language: SupportedLanguage,
     text: Arc<String>,
-    index: TextIndex,
+    index: Arc<TextIndex>,
     mask: Masker,
     diagnostics_cache: DiagnosticsCache,
 }
@@ -60,7 +60,7 @@ pub struct PreparedCheckData {
     pub uri: Url,
     pub version: i32,
     pub text: Arc<String>,
-    pub index: TextIndex,
+    pub index: Arc<TextIndex>,
     pub blocks: Vec<PreparedCheckBlock>,
 }
 
@@ -216,7 +216,7 @@ impl Document {
 impl SupportedDocument {
     fn new(uri: Url, version: i32, language: SupportedLanguage, text: String) -> Self {
         let text = Arc::new(text);
-        let index = TextIndex::new(&text);
+        let index = Arc::new(TextIndex::new(&text));
         let mask = Masker::new(&text, language);
         Self {
             uri,
@@ -230,7 +230,7 @@ impl SupportedDocument {
     }
 
     fn set_text(&mut self, text: String) {
-        self.index = TextIndex::new(&text);
+        self.index = Arc::new(TextIndex::new(&text));
         self.mask = Masker::new(&text, self.language);
         self.diagnostics_cache.clear();
         self.text = Arc::new(text);
@@ -257,10 +257,10 @@ impl SupportedDocument {
         let text = Arc::make_mut(&mut self.text);
         text.replace_range(bytes.start.0..bytes.end.0, new_text);
 
-        self.index.apply_edit(text, &bytes, &utf16, new_text);
+        Arc::make_mut(&mut self.index).apply_edit(text, &bytes, &utf16, new_text);
         self.mask.apply_edit(&mask_edit, text);
         self.diagnostics_cache
-            .apply_edit(&bytes, new_text.len(), &self.index);
+            .apply_edit(&bytes, new_text.len(), &self.index, version);
         self.version = version;
         DocumentChangeStatus::Incremental
     }
@@ -312,7 +312,7 @@ impl SupportedDocument {
             uri: self.uri.clone(),
             version: self.version,
             text: Arc::clone(&self.text),
-            index: self.index.clone(),
+            index: Arc::clone(&self.index),
             blocks,
         })
     }
@@ -323,7 +323,7 @@ impl SupportedDocument {
                 .store_checked_block(checked.byte_range, checked.diagnostics);
         }
 
-        self.diagnostics_cache.diagnostics(self.version)
+        self.diagnostics_cache.diagnostics()
     }
 }
 
@@ -448,7 +448,8 @@ mod tests {
         let doc = supported_document(document);
         let expected = TextIndex::new(&doc.text);
         assert_eq!(
-            doc.index, expected,
+            doc.index.as_ref(),
+            &expected,
             "index is inconsistent with text {:?}",
             doc.text
         );

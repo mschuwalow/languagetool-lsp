@@ -103,7 +103,7 @@ impl Backend {
                 let uri = data.uri;
                 let version = data.version;
                 let text = data.text;
-                let index = Arc::new(data.index);
+                let index = data.index;
                 let options = Arc::new(options);
 
                 log::debug!(
@@ -157,49 +157,11 @@ impl Backend {
 
                 responses.sort_by_key(|(request, _)| request.block.byte_range.start.0);
                 let checked_blocks = completed_blocks_from_responses(responses, options.as_ref());
-
-                let Some(diagnostics) =
-                    self.documents
-                        .complete_check_if_current(&uri, token, checked_blocks)
-                else {
-                    log::debug!(
-                        "Discarding stale check result for {} token={:?}",
-                        uri,
-                        token
-                    );
-                    return;
-                };
-
-                log::debug!(
-                    "Publishing {} diagnostic(s) for {uri} token={token:?} version={:?}",
-                    diagnostics.len(),
-                    version
-                );
-
-                self.client
-                    .publish_diagnostics(uri, diagnostics, Some(version))
+                self.complete_and_publish_check(uri, version, token, checked_blocks, false)
                     .await;
             }
             PreparedCheck::ReuseCached { uri, version } => {
-                let Some(diagnostics) =
-                    self.documents
-                        .complete_check_if_current(&uri, token, Vec::new())
-                else {
-                    log::debug!(
-                        "Discarding stale cached check result for {} token={:?}",
-                        uri,
-                        token
-                    );
-                    return;
-                };
-
-                log::debug!(
-                    "Publishing {} cached diagnostic(s) for {uri} token={token:?} version={version:?}",
-                    diagnostics.len()
-                );
-
-                self.client
-                    .publish_diagnostics(uri, diagnostics, Some(version))
+                self.complete_and_publish_check(uri, version, token, Vec::new(), true)
                     .await;
             }
             PreparedCheck::Clear { uri, version } => {
@@ -207,6 +169,51 @@ impl Backend {
                 self.clear_stale_diagnostics(&uri, Some(version)).await;
             }
         }
+    }
+
+    async fn complete_and_publish_check(
+        &self,
+        uri: Url,
+        version: i32,
+        token: DocumentToken,
+        checked_blocks: Vec<CompletedCheckBlock>,
+        cached: bool,
+    ) {
+        let Some(diagnostics) =
+            self.documents
+                .complete_check_if_current(&uri, token, checked_blocks)
+        else {
+            if cached {
+                log::debug!(
+                    "Discarding stale cached check result for {} token={:?}",
+                    uri,
+                    token
+                );
+            } else {
+                log::debug!(
+                    "Discarding stale check result for {} token={:?}",
+                    uri,
+                    token
+                );
+            }
+            return;
+        };
+
+        if cached {
+            log::debug!(
+                "Publishing {} cached diagnostic(s) for {uri} token={token:?} version={version:?}",
+                diagnostics.len()
+            );
+        } else {
+            log::debug!(
+                "Publishing {} diagnostic(s) for {uri} token={token:?} version={version:?}",
+                diagnostics.len()
+            );
+        }
+
+        self.client
+            .publish_diagnostics(uri, diagnostics, Some(version))
+            .await;
     }
 
     async fn log_check_error(&self, options: &ClientOptions, err: LanguageToolError) {
@@ -766,7 +773,7 @@ mod tests {
             version: prepared.version,
             token: DocumentToken::new_for_test(0, prepared.version, 0),
             text: prepared.text,
-            index: Arc::new(prepared.index),
+            index: prepared.index,
             block,
         }
     }
