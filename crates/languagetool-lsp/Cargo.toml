@@ -40,6 +40,5 @@ urlencoding = "2"
 
 [dev-dependencies]
 httpmock = "0.8"
-pretty_assertions = "1"
 tempfile = "3"
 indoc = "2"

@@ -51,22 +51,6 @@ impl SupportedLanguage {
             _ => None,
         }
     }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::PlainText => "plaintext",
-            Self::Rust => "rust",
-            Self::Scala => "scala",
-            Self::Nix => "nix",
-            Self::Html => "html",
-            Self::Java => "java",
-            Self::Python => "python",
-            Self::Javascript => "javascript",
-            Self::Typescript => "typescript",
-            Self::Tsx => "tsx",
-            Self::Markdown => "markdown",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +60,7 @@ pub enum DocumentLanguage {
 }
 
 impl DocumentLanguage {
+    #[cfg(test)]
     pub fn from_language_id(language_id: Option<&str>) -> Self {
         let Some(language_id) = language_id.filter(|value| !value.trim().is_empty()) else {
             return Self::Unsupported;
@@ -102,20 +87,6 @@ impl DocumentLanguage {
             .ok()
             .map(|path| Self::from_path(&path))
             .unwrap_or(Self::Unsupported)
-    }
-
-    pub fn supported(self) -> Option<SupportedLanguage> {
-        match self {
-            Self::Unsupported => None,
-            Self::Supported(language) => Some(language),
-        }
-    }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::Unsupported => "unsupported",
-            Self::Supported(language) => language.id(),
-        }
     }
 }
 

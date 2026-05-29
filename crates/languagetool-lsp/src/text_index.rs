@@ -4,12 +4,6 @@ use tower_lsp::lsp_types::{Position, Range};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteOffset(pub usize);
 
-impl ByteOffset {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
 impl From<usize> for ByteOffset {
     fn from(v: usize) -> Self {
         Self(v)
@@ -25,12 +19,6 @@ impl From<ByteOffset> for usize {
 /// A UTF-16 code-unit offset, as used by the LSP and LanguageTool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Utf16Offset(pub usize);
-
-impl Utf16Offset {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
 
 impl From<usize> for Utf16Offset {
     fn from(v: usize) -> Self {
@@ -86,10 +74,6 @@ impl Utf16Range {
             start: start.into(),
             end: end.into(),
         }
-    }
-
-    pub fn intersects(&self, other: &Utf16Range) -> bool {
-        self.start < other.end && self.end > other.start
     }
 }
 
@@ -245,6 +229,7 @@ impl TextIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn byte_offset_for_utf16(&self, offset: Utf16Offset) -> Option<ByteOffset> {
         self.byte_offset_for_utf16_raw(offset.0).map(ByteOffset)
     }
@@ -253,6 +238,7 @@ impl TextIndex {
         Utf16Offset(self.utf16_offset_for_byte_raw(offset.0))
     }
 
+    #[cfg(test)]
     pub fn text_for_utf16_range<'t>(&self, text: &'t str, range: Utf16Range) -> Option<&'t str> {
         if range.start > range.end {
             return None;

@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{
 
 use crate::config::ClientOptions;
 use crate::languagetool::LanguageToolMatch;
-use crate::text_index::{TextIndex, Utf16Range};
+use crate::text_index::Utf16Range;
 
 pub const SOURCE: &str = "LanguageTool";
 
@@ -19,20 +19,6 @@ pub struct DiagnosticData {
     pub matched_text: String,
     #[serde(default)]
     pub document_version: Option<i32>,
-}
-
-pub fn make_lsp_diagnostic(
-    index: &TextIndex,
-    item: &LanguageToolMatch,
-    data: DiagnosticData,
-    options: &ClientOptions,
-) -> Diagnostic {
-    let Some(Utf16Range { start: offset, end }) = match_utf16_range(item) else {
-        return Diagnostic::default();
-    };
-    let start = index.position(offset);
-    let end = index.position(end);
-    make_lsp_diagnostic_for_range(Range { start, end }, item, data, options)
 }
 
 pub fn make_lsp_diagnostic_for_range(
@@ -53,21 +39,6 @@ pub fn make_lsp_diagnostic_for_range(
         tags: None,
         data: serde_json::to_value(data).ok(),
     }
-}
-
-pub fn diagnostic_data(
-    text: &str,
-    index: &TextIndex,
-    item: &LanguageToolMatch,
-    options: &ClientOptions,
-    document_version: Option<i32>,
-) -> DiagnosticData {
-    let range = match_utf16_range(item).unwrap_or(Utf16Range::new(0, 0));
-    let matched_text = index
-        .text_for_utf16_range(text, range)
-        .unwrap_or_default()
-        .to_string();
-    diagnostic_data_for_text(matched_text, item, options, document_version)
 }
 
 pub fn diagnostic_data_for_text(

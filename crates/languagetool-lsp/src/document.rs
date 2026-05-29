@@ -74,14 +74,6 @@ pub struct CompletedCheckBlock {
     pub diagnostics: Vec<CachedDiagnostic>,
 }
 
-pub struct CheckableDocument<'a> {
-    pub uri: &'a Url,
-    pub version: i32,
-    pub text: &'a str,
-    pub index: &'a TextIndex,
-    pub check_blocks: Vec<CheckBlock>,
-}
-
 impl Document {
     pub fn new(uri: Url, version: i32, language_id: Option<String>, text: String) -> Self {
         let text_len = text.len();
@@ -127,33 +119,6 @@ impl Document {
             DocumentKind::Unsupported(document) => document.version,
             DocumentKind::OutOfSync(document) => document.version,
         }
-    }
-
-    pub fn checkable(&self) -> Option<CheckableDocument<'_>> {
-        let Some(document) = self.supported() else {
-            log::debug!(
-                "Skipping {} because the document is not checkable",
-                self.uri()
-            );
-            return None;
-        };
-
-        let check_blocks = document.mask.check_blocks(&document.text);
-        if check_blocks.is_empty() {
-            log::debug!(
-                "Skipping {} because language {:?} produced no checkable blocks",
-                document.uri,
-                document.language
-            );
-            return None;
-        }
-        Some(CheckableDocument {
-            uri: &document.uri,
-            version: document.version,
-            text: &document.text,
-            index: &document.index,
-            check_blocks,
-        })
     }
 
     pub(crate) fn full_update(&mut self, version: i32, text: String) {
@@ -231,6 +196,7 @@ impl Document {
         document.complete_check(checked_blocks)
     }
 
+    #[cfg(test)]
     fn supported(&self) -> Option<&SupportedDocument> {
         match &self.kind {
             DocumentKind::Supported(document) => Some(document.as_ref()),
@@ -406,7 +372,10 @@ mod tests {
         assert_eq!(status, Some(DocumentChangeStatus::OutOfSync));
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
-        assert!(document.checkable().is_none());
+        assert!(matches!(
+            document.prepare_check("test".to_string()),
+            PreparedCheck::Clear { .. }
+        ));
     }
 
     #[test]
@@ -569,7 +538,10 @@ mod tests {
         );
 
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
-        assert!(document.checkable().is_none());
+        assert!(matches!(
+            document.prepare_check("test".to_string()),
+            PreparedCheck::Clear { .. }
+        ));
         assert_eq!(document.version(), 1);
 
         let status = document.incremental_update(
@@ -580,7 +552,10 @@ mod tests {
 
         assert_eq!(status, None);
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
-        assert!(document.checkable().is_none());
+        assert!(matches!(
+            document.prepare_check("test".to_string()),
+            PreparedCheck::Clear { .. }
+        ));
         assert_eq!(document.version(), 2);
     }
 

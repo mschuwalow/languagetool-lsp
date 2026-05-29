@@ -829,20 +829,28 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::Document;
+    use crate::document::{Document, PreparedCheck};
     use crate::languagetool::{
         LanguageToolCategory, LanguageToolMatch, LanguageToolReplacement, LanguageToolRule,
     };
 
-    fn check_request_for_test(document: &Document, options: ClientOptions) -> CheckRequest {
-        let document = document.checkable().unwrap();
+    fn check_request_for_test(mut document: Document, options: ClientOptions) -> CheckRequest {
+        let PreparedCheck::Check(prepared) = document.prepare_check(options_key(&options)) else {
+            panic!("document should be checkable");
+        };
+        let block = prepared
+            .blocks
+            .into_iter()
+            .next()
+            .expect("document should have a check block")
+            .block;
         CheckRequest {
-            uri: document.uri.clone(),
-            version: document.version,
-            token: DocumentToken::new_for_test(0, document.version, 0),
-            text: document.text.to_string(),
-            index: document.index.clone(),
-            block: document.check_blocks[0].clone(),
+            uri: prepared.uri,
+            version: prepared.version,
+            token: DocumentToken::new_for_test(0, prepared.version, 0),
+            text: prepared.text,
+            index: prepared.index,
+            block,
             options,
         }
     }
@@ -856,7 +864,7 @@ mod tests {
             "This are a tset.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(&document, options);
+        let request = check_request_for_test(document, options);
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
             short_message: None,
@@ -895,7 +903,7 @@ mod tests {
             "let value = 1; // This are a comment.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(&document, options);
+        let request = check_request_for_test(document, options);
         let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),
             short_message: None,
@@ -929,7 +937,7 @@ mod tests {
             "let typoo = 1; // This are a comment.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(&document, options);
+        let request = check_request_for_test(document, options);
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
             short_message: None,
@@ -964,7 +972,7 @@ mod tests {
             "😀 This are a tset.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(&document, options);
+        let request = check_request_for_test(document, options);
         let item = LanguageToolMatch {
             message: "The verb 'are' is plural.".to_string(),
             short_message: None,

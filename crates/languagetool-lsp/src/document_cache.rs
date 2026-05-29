@@ -1,6 +1,4 @@
-pub use crate::document::{
-    CompletedCheckBlock, PreparedCheck, PreparedCheckBlock, PreparedCheckData,
-};
+pub use crate::document::{CompletedCheckBlock, PreparedCheck, PreparedCheckData};
 use crate::document::{Document, DocumentChangeStatus};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,10 +39,12 @@ impl DocumentToken {
         }
     }
 
+    #[cfg(test)]
     pub fn document_id(self) -> u64 {
         self.document_id
     }
 
+    #[cfg(test)]
     pub fn generation(self) -> u64 {
         self.generation
     }
@@ -71,20 +71,8 @@ impl DocumentEntry {
         }
     }
 
-    pub fn document(&self) -> &Document {
-        &self.document
-    }
-
     pub fn token(&self) -> DocumentToken {
         DocumentToken::new(self.document_id, self.document.version(), self.generation)
-    }
-
-    fn prepare_check(&mut self, options_key: String) -> (PreparedCheck, DocumentToken) {
-        (self.document.prepare_check(options_key), self.token())
-    }
-
-    fn complete_check(&mut self, checked_blocks: Vec<CompletedCheckBlock>) -> Vec<Diagnostic> {
-        self.document.complete_check(checked_blocks)
     }
 }
 
@@ -176,6 +164,7 @@ impl DocumentCache {
         status
     }
 
+    #[cfg(test)]
     pub fn apply_change(
         &self,
         uri: &Url,
@@ -201,6 +190,7 @@ impl DocumentCache {
             .map(DocumentEntry::token)
     }
 
+    #[cfg(test)]
     pub fn with_bumped_entry<R>(
         &self,
         uri: &Url,
@@ -220,7 +210,7 @@ impl DocumentCache {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
         entry.generation += 1;
-        Some(entry.prepare_check(options_key))
+        Some((entry.document.prepare_check(options_key), entry.token()))
     }
 
     pub fn prepare_check_if_current(
@@ -235,9 +225,10 @@ impl DocumentCache {
             return None;
         }
         entry.generation += 1;
-        Some(entry.prepare_check(options_key))
+        Some((entry.document.prepare_check(options_key), entry.token()))
     }
 
+    #[cfg(test)]
     pub fn with_bumped_entry_if_current<R>(
         &self,
         uri: &Url,
@@ -264,7 +255,7 @@ impl DocumentCache {
         if entry.token() != token {
             return None;
         }
-        Some(entry.complete_check(checked_blocks))
+        Some(entry.document.complete_check(checked_blocks))
     }
 
     pub fn urls(&self) -> Vec<Url> {
@@ -288,6 +279,14 @@ mod tests {
             range_length: None,
             text: text.to_string(),
         }
+    }
+
+    fn prepared_text(entry: &mut DocumentEntry) -> String {
+        let PreparedCheck::Check(prepared) = entry.document.prepare_check("test".to_string())
+        else {
+            panic!("document should be checkable");
+        };
+        prepared.text
     }
 
     #[test]
@@ -319,11 +318,9 @@ mod tests {
         let token = cache.token(&uri).unwrap();
         cache
             .with_bumped_entry_if_current(&uri, token, |entry| {
-                let document = entry.document();
-                let checkable = document.checkable().unwrap();
                 assert_eq!(status, ChangeStatus::Stale);
-                assert_eq!(document.version(), 3);
-                assert_eq!(checkable.text, "new text");
+                assert_eq!(entry.document.version(), 3);
+                assert_eq!(prepared_text(entry), "new text");
             })
             .unwrap();
     }
@@ -354,11 +351,9 @@ mod tests {
         let token = cache.token(&uri).unwrap();
         cache
             .with_bumped_entry_if_current(&uri, token, |entry| {
-                let document = entry.document();
-                let checkable = document.checkable().unwrap();
                 assert_eq!(status, ChangeStatus::Applied);
-                assert_eq!(document.version(), 2);
-                assert_eq!(checkable.text, "hi world!");
+                assert_eq!(entry.document.version(), 2);
+                assert_eq!(prepared_text(entry), "hi world!");
             })
             .unwrap();
     }

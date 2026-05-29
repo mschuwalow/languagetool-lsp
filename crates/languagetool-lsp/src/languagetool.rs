@@ -3,11 +3,13 @@ use languagetool_client as api;
 use serde::Serialize;
 use thiserror::Error;
 
-pub type LanguageToolSoftware = languagetool_client::models::CheckPost200ResponseSoftware;
 pub type LanguageToolMatch = languagetool_client::models::CheckPost200ResponseMatchesInner;
+#[cfg(test)]
 pub type LanguageToolReplacement =
     languagetool_client::models::CheckPost200ResponseMatchesInnerReplacementsInner;
+#[cfg(test)]
 pub type LanguageToolRule = languagetool_client::models::CheckPost200ResponseMatchesInnerRule;
+#[cfg(test)]
 pub type LanguageToolCategory =
     languagetool_client::models::CheckPost200ResponseMatchesInnerRuleCategory;
 
@@ -41,46 +43,20 @@ impl LanguageToolClient {
         Self
     }
 
-    pub async fn check(
-        &self,
-        text: &str,
-        options: &ClientOptions,
-    ) -> Result<LanguageToolResponse, LanguageToolError> {
-        self.check_with_payload(CheckPayload::Text(text), options)
-            .await
-    }
-
     pub async fn check_annotated(
         &self,
         data: &AnnotatedText,
         options: &ClientOptions,
     ) -> Result<LanguageToolResponse, LanguageToolError> {
-        self.check_with_payload(CheckPayload::Data(data), options)
-            .await
-    }
-
-    async fn check_with_payload(
-        &self,
-        payload: CheckPayload<'_>,
-        options: &ClientOptions,
-    ) -> Result<LanguageToolResponse, LanguageToolError> {
         let endpoint = options.endpoint();
         let api_base_url = options.api_base_url();
-        let payload_kind = payload.kind();
-        log::debug!("Sending LanguageTool {payload_kind} request to {endpoint}");
+        log::debug!("Sending LanguageTool annotated request to {endpoint}");
         let preferred_variants = join_parameter(&options.preferred_variants);
         let disabled_rules = join_parameter(&options.disabled_rules);
         let disabled_categories = join_parameter(&options.disabled_categories);
         let enabled_rules = join_parameter(&options.enabled_rules);
         let enabled_categories = join_parameter(&options.enabled_categories);
-
-        let (text, data_json) = match payload {
-            CheckPayload::Text(text) => (Some(text), None),
-            CheckPayload::Data(data) => (
-                None,
-                Some(serde_json::to_string(data).expect("annotated text should serialize")),
-            ),
-        };
+        let data_json = serde_json::to_string(data).expect("annotated text should serialize");
         let mother_tongue = options
             .mother_tongue
             .as_deref()
@@ -117,8 +93,8 @@ impl LanguageToolClient {
         let response = api::apis::default_api::check_post(
             &configuration,
             &options.language,
-            text,
-            data_json.as_deref(),
+            None,
+            Some(data_json.as_str()),
             username,
             api_key,
             None,
@@ -135,7 +111,7 @@ impl LanguageToolClient {
         .map(LanguageToolResponse::from)
         .map_err(|source| LanguageToolError::Api { endpoint, source })?;
         log::debug!(
-            "LanguageTool {payload_kind} request returned {} match(es)",
+            "LanguageTool annotated request returned {} match(es)",
             response.matches.len()
         );
         Ok(response)
@@ -144,29 +120,13 @@ impl LanguageToolClient {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LanguageToolResponse {
-    pub software: Option<LanguageToolSoftware>,
     pub matches: Vec<LanguageToolMatch>,
 }
 
 impl From<api::models::CheckPost200Response> for LanguageToolResponse {
     fn from(response: api::models::CheckPost200Response) -> Self {
         Self {
-            software: response.software.map(|software| *software),
             matches: response.matches.unwrap_or_default().into_iter().collect(),
-        }
-    }
-}
-
-enum CheckPayload<'a> {
-    Text(&'a str),
-    Data(&'a AnnotatedText),
-}
-
-impl CheckPayload<'_> {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Text(_) => "text",
-            Self::Data(_) => "annotated",
         }
     }
 }
@@ -235,6 +195,7 @@ impl Annotation {
         }
     }
 
+    #[cfg(test)]
     pub fn as_markup(&self) -> Option<&str> {
         match self {
             Annotation::Text { .. } => None,
@@ -242,6 +203,7 @@ impl Annotation {
         }
     }
 
+    #[cfg(test)]
     pub fn interpret_as(&self) -> Option<&str> {
         match self {
             Annotation::Text { .. } => None,
