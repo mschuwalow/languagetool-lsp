@@ -13,14 +13,14 @@ pub(crate) struct RuntimeConfig {
 struct RuntimeConfigState {
     client_options: ClientOptions,
     project_config: ProjectConfig,
-    options: ClientOptions,
+    options: Arc<ClientOptions>,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         let client_options = ClientOptions::default();
         let project_config = ProjectConfig::default();
-        let options = project_config.merged_options(&client_options);
+        let options = Arc::new(project_config.merged_options(&client_options));
         Self {
             state: Arc::new(RwLock::new(RuntimeConfigState {
                 client_options,
@@ -32,16 +32,24 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub(crate) async fn options(&self) -> ClientOptions {
+    pub(crate) async fn options(&self) -> Arc<ClientOptions> {
         self.state.read().await.options.clone()
     }
 
     pub(crate) async fn project_config_path(&self, root: &Path) -> PathBuf {
-        self.client_options().await.project_config_path(root)
+        self.state
+            .read()
+            .await
+            .client_options
+            .project_config_path(root)
     }
 
     pub(crate) async fn project_config_display_path(&self) -> String {
-        self.client_options().await.project_config_display_path()
+        self.state
+            .read()
+            .await
+            .client_options
+            .project_config_display_path()
     }
 
     pub(crate) async fn set_client_options(&self, client_options: ClientOptions, root: &Path) {
@@ -64,7 +72,7 @@ impl RuntimeConfig {
             ProjectConfig::load(&new_project_config_path).await
         };
 
-        state.options = project_config.merged_options(&client_options);
+        state.options = Arc::new(project_config.merged_options(&client_options));
         state.client_options = client_options;
         state.project_config = project_config;
         Ok(())
@@ -87,21 +95,17 @@ impl RuntimeConfig {
             .await
             .map_err(|err| format!("Failed to save project config: {err}"))?;
 
-        state.options = next_config.merged_options(&state.client_options);
+        state.options = Arc::new(next_config.merged_options(&state.client_options));
         state.project_config = next_config;
         Ok(true)
     }
 
     async fn replace(&self, client_options: ClientOptions, project_config: ProjectConfig) {
-        let options = project_config.merged_options(&client_options);
+        let options = Arc::new(project_config.merged_options(&client_options));
         *self.state.write().await = RuntimeConfigState {
             client_options,
             project_config,
             options,
         };
-    }
-
-    async fn client_options(&self) -> ClientOptions {
-        self.state.read().await.client_options.clone()
     }
 }

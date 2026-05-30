@@ -41,13 +41,6 @@ struct OutOfSyncDocument {
     language: SupportedLanguage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DocumentChangeStatus {
-    Incremental,
-    FullReplace,
-    OutOfSync,
-}
-
 #[derive(Debug)]
 pub enum PreparedCheck {
     Check(PreparedCheckData),
@@ -143,16 +136,10 @@ impl Document {
         }
     }
 
-    pub(crate) fn incremental_update(
-        &mut self,
-        version: i32,
-        range: Range,
-        new_text: &str,
-    ) -> Option<DocumentChangeStatus> {
+    pub(crate) fn incremental_update(&mut self, version: i32, range: Range, new_text: &str) {
         match &mut self.kind {
             DocumentKind::Supported(document) => {
-                let status = document.incremental_update(version, range, new_text);
-                if status == DocumentChangeStatus::OutOfSync {
+                if !document.incremental_update(version, range, new_text) {
                     let uri = document.uri.clone();
                     let language = document.language;
                     self.kind = DocumentKind::OutOfSync(OutOfSyncDocument {
@@ -161,15 +148,12 @@ impl Document {
                         language,
                     });
                 }
-                Some(status)
-            }
-            DocumentKind::Unsupported(document) => {
-                document.version = version;
-                None
             }
             DocumentKind::OutOfSync(document) => {
                 document.version = version;
-                Some(DocumentChangeStatus::OutOfSync)
+            }
+            DocumentKind::Unsupported(document) => {
+                document.version = version;
             }
         }
     }
@@ -233,12 +217,7 @@ impl SupportedDocument {
         self.text = Arc::new(text);
     }
 
-    fn incremental_update(
-        &mut self,
-        version: i32,
-        range: Range,
-        new_text: &str,
-    ) -> DocumentChangeStatus {
+    fn incremental_update(&mut self, version: i32, range: Range, new_text: &str) -> bool {
         let Some((old_byte_range, old_utf16_range)) = self.index.edit_offsets(range) else {
             log::error!(
                 "Rejected incremental change for {} because range {:?} is outside valid UTF-16 boundaries",
@@ -246,7 +225,7 @@ impl SupportedDocument {
                 range
             );
             self.version = version;
-            return DocumentChangeStatus::OutOfSync;
+            return false;
         };
 
         let start_position = self.index.byte_position(old_byte_range.start);
@@ -279,7 +258,7 @@ impl SupportedDocument {
             .apply_edit(&old_byte_range, new_text.len(), &self.index, version);
 
         self.version = version;
-        DocumentChangeStatus::Incremental
+        true
     }
 
     fn prepare_check(&mut self, options_key: String) -> PreparedCheck {
@@ -380,13 +359,8 @@ mod tests {
     #[test]
     fn malformed_incremental_change_marks_document_out_of_sync() {
         let mut document = plaintext_document("a😀b");
-        let status = document.incremental_update(
-            2,
-            Range::new(Position::new(0, 2), Position::new(0, 2)),
-            "x",
-        );
+        document.incremental_update(2, Range::new(Position::new(0, 2), Position::new(0, 2)), "x");
 
-        assert_eq!(status, Some(DocumentChangeStatus::OutOfSync));
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
         assert!(matches!(
@@ -398,13 +372,8 @@ mod tests {
     #[test]
     fn reversed_incremental_change_marks_document_out_of_sync() {
         let mut document = plaintext_document("abc");
-        let status = document.incremental_update(
-            2,
-            Range::new(Position::new(0, 2), Position::new(0, 1)),
-            "x",
-        );
+        document.incremental_update(2, Range::new(Position::new(0, 2), Position::new(0, 1)), "x");
 
-        assert_eq!(status, Some(DocumentChangeStatus::OutOfSync));
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
     }
@@ -574,13 +543,12 @@ mod tests {
         ));
         assert_eq!(document.version(), 1);
 
-        let status = document.incremental_update(
+        document.incremental_update(
             2,
             Range::new(Position::new(0, 0), Position::new(0, 4)),
             "That",
         );
 
-        assert_eq!(status, None);
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
         assert!(matches!(
             document.prepare_check("test".to_string()),

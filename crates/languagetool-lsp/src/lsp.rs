@@ -4,9 +4,7 @@ use crate::diagnostics::{
     parse_diagnostic_data, SOURCE,
 };
 use crate::diagnostics_cache::CachedDiagnostic;
-use crate::document_cache::{
-    ChangeStatus, CompletedCheckBlock, DocumentCache, DocumentToken, PreparedCheck,
-};
+use crate::document_cache::{CompletedCheckBlock, DocumentCache, DocumentToken, PreparedCheck};
 use crate::languagetool::{
     Annotation, LanguageToolClient, LanguageToolError, LanguageToolMatch, LanguageToolResponse,
 };
@@ -45,7 +43,7 @@ impl Backend {
         }
     }
 
-    async fn options(&self) -> ClientOptions {
+    async fn options(&self) -> Arc<ClientOptions> {
         self.config.options().await
     }
 
@@ -114,7 +112,7 @@ impl Backend {
         &self,
         prepared: PreparedCheck,
         token: DocumentToken,
-        options: ClientOptions,
+        options: Arc<ClientOptions>,
     ) {
         match prepared {
             PreparedCheck::Check(data) => {
@@ -122,7 +120,6 @@ impl Backend {
                 let version = data.version;
                 let text = data.text;
                 let index = data.index;
-                let options = Arc::new(options);
 
                 log::debug!(
                     "Starting check for {uri} token={token:?} version={version:?} check_blocks={}",
@@ -144,7 +141,7 @@ impl Backend {
                     };
                     checks.spawn(async move {
                         let result = language_tool
-                            .check_annotated(&request.block.annotated, options.as_ref())
+                            .check_annotated(&request.block.annotated, &options)
                             .await;
                         (request, result)
                     });
@@ -403,28 +400,18 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        let had_changes = !params.content_changes.is_empty();
         log::debug!(
             "Received {} change(s) for {uri} version={}",
             params.content_changes.len(),
             params.text_document.version,
             uri = uri.as_str()
         );
-        let change_status = self.documents.apply_changes(
-            &uri,
-            params.text_document.version,
-            params.content_changes,
-        );
+        self.documents
+            .apply_changes(&uri, params.text_document.version, params.content_changes);
 
-        if change_status == ChangeStatus::OutOfSync {
-            self.clear_stale_diagnostics(&uri, Some(params.text_document.version))
-                .await;
-            return;
-        }
-
-        if had_changes && self.options().await.check_while_typing {
+        if self.options().await.check_while_typing {
             self.schedule_check(uri).await;
-        } else if had_changes {
+        } else {
             log::debug!(
                 "Skipping typing check for {uri}: check_while_typing=false",
                 uri = uri.as_str()

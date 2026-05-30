@@ -1,5 +1,5 @@
+use crate::document::Document;
 pub use crate::document::{CompletedCheckBlock, PreparedCheck};
-use crate::document::{Document, DocumentChangeStatus};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -8,6 +8,10 @@ use tower_lsp_server::ls_types::{
 };
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_document_id() -> u64 {
+    NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct DocumentCache {
@@ -26,17 +30,6 @@ pub struct DocumentToken {
     document_id: u64,
     version: i32,
     generation: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeStatus {
-    Applied,
-    OutOfSync,
-    Stale,
-}
-
-fn next_document_id() -> u64 {
-    NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl DocumentToken {
@@ -119,7 +112,7 @@ impl DocumentCache {
         version: i32,
         range: Range,
         new_text: &str,
-    ) -> Option<DocumentChangeStatus> {
+    ) {
         log::debug!(
             "Applying ranged document change for {uri} version={version:?} range={range:?} replacement_bytes={}",
             new_text.len(),
@@ -127,14 +120,13 @@ impl DocumentCache {
         );
         let key = uri.as_str().to_string();
         if let Some(entry) = documents.get_mut(&key) {
-            return entry.document.incremental_update(version, range, new_text);
+            entry.document.incremental_update(version, range, new_text);
+        } else {
+            log::error!(
+                "Received ranged change for uncached document {uri}",
+                uri = uri.as_str()
+            );
         }
-
-        log::error!(
-            "Received ranged change for uncached document {uri}; marking out of sync",
-            uri = uri.as_str()
-        );
-        Some(DocumentChangeStatus::OutOfSync)
     }
 
     pub fn apply_changes(
@@ -142,7 +134,7 @@ impl DocumentCache {
         uri: &Uri,
         version: i32,
         changes: Vec<TextDocumentContentChangeEvent>,
-    ) -> ChangeStatus {
+    ) {
         let key = uri.as_str().to_string();
         let mut documents = self.documents.write().expect("document cache poisoned");
         if documents
@@ -154,31 +146,20 @@ impl DocumentCache {
                 documents.get(&key).map(|entry| entry.document.version()),
                 uri = uri.as_str()
             );
-            return ChangeStatus::Stale;
+            return;
         }
 
-        let mut status = ChangeStatus::Applied;
         for change in changes {
-            let change_status = if let Some(range) = change.range {
+            if let Some(range) = change.range {
                 Self::incremental_update_locked(&mut documents, uri, version, range, &change.text)
             } else {
                 Self::full_update_locked(&mut documents, uri, version, change.text);
-                Some(DocumentChangeStatus::FullReplace)
             };
-            if change_status == Some(DocumentChangeStatus::OutOfSync) {
-                status = ChangeStatus::OutOfSync;
-            }
         }
-        status
     }
 
     #[cfg(test)]
-    pub fn apply_change(
-        &self,
-        uri: &Uri,
-        version: i32,
-        change: TextDocumentContentChangeEvent,
-    ) -> ChangeStatus {
+    pub fn apply_change(&self, uri: &Uri, version: i32, change: TextDocumentContentChangeEvent) {
         self.apply_changes(uri, version, vec![change])
     }
 
@@ -297,10 +278,10 @@ mod tests {
     }
 
     #[test]
-    fn ranged_change_for_uncached_document_marks_out_of_sync_without_caching() {
+    fn ranged_change_for_uncached_document_does_not_cache() {
         let cache = DocumentCache::default();
         let uri = "file:///tmp/missing.txt".parse::<Uri>().unwrap();
-        let status = cache.apply_change(
+        cache.apply_change(
             &uri,
             1,
             TextDocumentContentChangeEvent {
@@ -310,7 +291,6 @@ mod tests {
             },
         );
 
-        assert_eq!(status, ChangeStatus::OutOfSync);
         assert!(cache.token(&uri).is_none());
     }
 
@@ -320,12 +300,11 @@ mod tests {
         let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         cache.apply_change(&uri, 3, full_change("new text"));
 
-        let status = cache.apply_change(&uri, 2, full_change("old text"));
+        cache.apply_change(&uri, 2, full_change("old text"));
 
         let token = cache.token(&uri).unwrap();
         cache
             .with_bumped_entry_if_current(&uri, token, |entry| {
-                assert_eq!(status, ChangeStatus::Stale);
                 assert_eq!(entry.document.version(), 3);
                 assert_eq!(prepared_text(entry), "new text");
             })
@@ -338,7 +317,7 @@ mod tests {
         let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         cache.apply_change(&uri, 1, full_change("hello world"));
 
-        let status = cache.apply_changes(
+        cache.apply_changes(
             &uri,
             2,
             vec![
@@ -358,7 +337,6 @@ mod tests {
         let token = cache.token(&uri).unwrap();
         cache
             .with_bumped_entry_if_current(&uri, token, |entry| {
-                assert_eq!(status, ChangeStatus::Applied);
                 assert_eq!(entry.document.version(), 2);
                 assert_eq!(prepared_text(entry), "hi world!");
             })
