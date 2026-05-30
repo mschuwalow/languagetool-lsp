@@ -570,7 +570,7 @@ async fn malformed_incremental_change_clears_diagnostics() {
     ctx.initialize_with_options(json!({
         "checkOnOpen": false,
         "checkOnSave": false,
-        "checkWhileTyping": false,
+        "checkWhileTyping": true,
     }))
     .await;
     let uri = ctx.doc_uri("emoji.txt");

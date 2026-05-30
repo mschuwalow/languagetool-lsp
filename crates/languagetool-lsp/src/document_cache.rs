@@ -179,18 +179,6 @@ impl DocumentCache {
             .map(DocumentEntry::token)
     }
 
-    #[cfg(test)]
-    pub fn with_bumped_entry<R>(
-        &self,
-        uri: &Uri,
-        f: impl FnOnce(&mut DocumentEntry) -> R,
-    ) -> Option<R> {
-        let mut documents = self.documents.write().expect("document cache poisoned");
-        let entry = documents.get_mut(uri.as_str())?;
-        entry.generation += 1;
-        Some(f(entry))
-    }
-
     pub fn prepare_check(
         &self,
         uri: &Uri,
@@ -215,22 +203,6 @@ impl DocumentCache {
         }
         entry.generation += 1;
         Some((entry.document.prepare_check(options_key), entry.token()))
-    }
-
-    #[cfg(test)]
-    pub fn with_bumped_entry_if_current<R>(
-        &self,
-        uri: &Uri,
-        token: DocumentToken,
-        f: impl FnOnce(&mut DocumentEntry) -> R,
-    ) -> Option<R> {
-        let mut documents = self.documents.write().expect("document cache poisoned");
-        let entry = documents.get_mut(uri.as_str())?;
-        if entry.token() != token {
-            return None;
-        }
-        entry.generation += 1;
-        Some(f(entry))
     }
 
     pub fn complete_check_if_current(
@@ -269,14 +241,6 @@ mod tests {
         }
     }
 
-    fn prepared_text(entry: &mut DocumentEntry) -> String {
-        let PreparedCheck::Check(prepared) = entry.document.prepare_check("test".to_string())
-        else {
-            panic!("document should be checkable");
-        };
-        prepared.text.as_ref().clone()
-    }
-
     #[test]
     fn ranged_change_for_uncached_document_does_not_cache() {
         let cache = DocumentCache::default();
@@ -303,12 +267,14 @@ mod tests {
         cache.apply_change(&uri, 2, full_change("old text"));
 
         let token = cache.token(&uri).unwrap();
-        cache
-            .with_bumped_entry_if_current(&uri, token, |entry| {
-                assert_eq!(entry.document.version(), 3);
-                assert_eq!(prepared_text(entry), "new text");
-            })
+        let (prepared, _) = cache
+            .prepare_check_if_current(&uri, token, "test".to_string())
             .unwrap();
+        let PreparedCheck::Check(data) = prepared else {
+            panic!("document should be checkable");
+        };
+        assert_eq!(data.version, 3);
+        assert_eq!(data.text.as_ref(), "new text");
     }
 
     #[test]
@@ -335,12 +301,14 @@ mod tests {
         );
 
         let token = cache.token(&uri).unwrap();
-        cache
-            .with_bumped_entry_if_current(&uri, token, |entry| {
-                assert_eq!(entry.document.version(), 2);
-                assert_eq!(prepared_text(entry), "hi world!");
-            })
+        let (prepared, _) = cache
+            .prepare_check_if_current(&uri, token, "test".to_string())
             .unwrap();
+        let PreparedCheck::Check(data) = prepared else {
+            panic!("document should be checkable");
+        };
+        assert_eq!(data.version, 2);
+        assert_eq!(data.text.as_ref(), "hi world!");
     }
 
     #[test]
@@ -355,7 +323,7 @@ mod tests {
 
         assert_eq!(cache.token(&uri).unwrap().generation(), 0);
         assert!(cache
-            .with_bumped_entry_if_current(&uri, scheduled, |_| ())
+            .prepare_check_if_current(&uri, scheduled, "test".to_string())
             .is_none());
     }
 
@@ -364,25 +332,25 @@ mod tests {
         let cache = DocumentCache::default();
         let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         assert_eq!(cache.token(&uri), None);
-        assert!(cache
-            .with_bumped_entry(&uri, |entry| entry.token())
-            .is_none());
+        assert!(cache.prepare_check(&uri, "test".to_string()).is_none());
 
         cache.apply_change(&uri, 1, full_change("hello"));
         let initial = cache.token(&uri).unwrap();
         assert_eq!(initial.generation(), 0);
         assert_eq!(
             cache
-                .with_bumped_entry(&uri, |entry| entry.token())
+                .prepare_check(&uri, "test".to_string())
                 .unwrap()
+                .1
                 .generation(),
             1
         );
         assert_eq!(cache.token(&uri).unwrap().generation(), 1);
         assert_eq!(
             cache
-                .with_bumped_entry(&uri, |entry| entry.token())
+                .prepare_check(&uri, "test".to_string())
                 .unwrap()
+                .1
                 .generation(),
             2
         );
@@ -409,9 +377,7 @@ mod tests {
         };
 
         cache.insert(&first);
-        let first_token = cache
-            .with_bumped_entry(&uri, |entry| entry.token())
-            .unwrap();
+        let first_token = cache.prepare_check(&uri, "test".to_string()).unwrap().1;
         cache.insert(&second);
         let second_token = cache.token(&uri).unwrap();
 
