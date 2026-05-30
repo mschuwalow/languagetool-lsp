@@ -112,12 +112,13 @@ impl RuntimeConfig {
     async fn replace(&self, client_options: ClientOptions, project_config: ProjectConfig) {
         let options = Arc::new(project_config.merged_options(&client_options));
         let mut state = self.state.write().await;
-        let next_version = state.options_version + 1;
+        // Preserve the current version — `replace` is only called from
+        // `set_client_options` (initialization), not from a user-driven change.
         *state = RuntimeConfigState {
             client_options,
             project_config,
             options,
-            options_version: next_version,
+            options_version: state.options_version,
         };
     }
 }

@@ -37,7 +37,7 @@ impl DiagnosticsCache {
                 continue;
             }
 
-            if block.byte_range.start.0 >= edit.end.0 && block.byte_range.start.0 != edit.start.0 {
+            if block.byte_range.start.0 >= edit.end.0 {
                 shift_range(&mut block.byte_range, delta);
                 for diagnostic in &mut block.diagnostics {
                     shift_range(&mut diagnostic.doc_byte_range, delta);
@@ -97,7 +97,9 @@ impl DiagnosticsCache {
 
 fn edit_invalidates_block(block: &ByteRange, edit: &ByteRange) -> bool {
     if edit.start == edit.end {
-        return block.start <= edit.start && edit.start <= block.end;
+        // Pure insertion: only invalidates a block if the cursor is strictly
+        // inside it, not at its end boundary.
+        return block.start <= edit.start && edit.start < block.end;
     }
 
     ranges_overlap(block, edit)
@@ -217,15 +219,31 @@ mod tests {
     }
 
     #[test]
-    fn insertion_at_block_boundary_drops_block() {
+    fn insertion_after_block_does_not_drop_block() {
         let mut cache = DiagnosticsCache::default();
         cache.store_checked_block(CheckedBlock {
             byte_range: ByteRange::new(0, 10),
             diagnostics: vec![raw_diagnostic(2, 5)],
         });
 
+        // Insert 1 byte immediately after the block — should shift, not drop.
         let index = TextIndex::new("0123456789x");
         cache.apply_edit(&ByteRange::new(10, 10), 1, &index, 1);
+
+        assert!(cache.contains_block(&ByteRange::new(0, 10)));
+    }
+
+    #[test]
+    fn insertion_inside_block_drops_block() {
+        let mut cache = DiagnosticsCache::default();
+        cache.store_checked_block(CheckedBlock {
+            byte_range: ByteRange::new(0, 10),
+            diagnostics: vec![raw_diagnostic(2, 5)],
+        });
+
+        // Insert 1 byte strictly inside the block — should invalidate.
+        let index = TextIndex::new("01234x56789");
+        cache.apply_edit(&ByteRange::new(5, 5), 1, &index, 1);
 
         assert!(!cache.contains_block(&ByteRange::new(0, 10)));
     }

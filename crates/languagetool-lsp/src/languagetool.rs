@@ -4,14 +4,13 @@ use serde::Serialize;
 use thiserror::Error;
 
 pub type LanguageToolMatch = languagetool_client::models::CheckPost200ResponseMatchesInner;
+
 #[cfg(test)]
-pub type LanguageToolReplacement =
-    languagetool_client::models::CheckPost200ResponseMatchesInnerReplacementsInner;
-#[cfg(test)]
-pub type LanguageToolRule = languagetool_client::models::CheckPost200ResponseMatchesInnerRule;
-#[cfg(test)]
-pub type LanguageToolCategory =
-    languagetool_client::models::CheckPost200ResponseMatchesInnerRuleCategory;
+pub use languagetool_client::models::{
+    CheckPost200ResponseMatchesInnerReplacementsInner as LanguageToolReplacement,
+    CheckPost200ResponseMatchesInnerRule as LanguageToolRule,
+    CheckPost200ResponseMatchesInnerRuleCategory as LanguageToolCategory,
+};
 
 #[derive(Debug, Error)]
 pub enum LanguageToolError {

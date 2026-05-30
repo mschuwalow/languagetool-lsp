@@ -154,22 +154,22 @@ impl From<CommentTreeLanguage> for tree_sitter::Language {
     }
 }
 
-impl CommentTreeLanguage {
-    fn from_supported_language(value: SupportedLanguage) -> Self {
+impl TryFrom<SupportedLanguage> for CommentTreeLanguage {
+    type Error = ();
+
+    fn try_from(value: SupportedLanguage) -> Result<Self, Self::Error> {
         match value {
-            SupportedLanguage::Rust => Self::Rust,
-            SupportedLanguage::Scala => Self::Scala,
-            SupportedLanguage::Nix => Self::Nix,
-            SupportedLanguage::Java => Self::Java,
-            SupportedLanguage::Python => Self::Python,
-            SupportedLanguage::Javascript => Self::Javascript,
-            SupportedLanguage::Typescript => Self::Typescript,
-            SupportedLanguage::Tsx => Self::Tsx,
+            SupportedLanguage::Rust => Ok(Self::Rust),
+            SupportedLanguage::Scala => Ok(Self::Scala),
+            SupportedLanguage::Nix => Ok(Self::Nix),
+            SupportedLanguage::Java => Ok(Self::Java),
+            SupportedLanguage::Python => Ok(Self::Python),
+            SupportedLanguage::Javascript => Ok(Self::Javascript),
+            SupportedLanguage::Typescript => Ok(Self::Typescript),
+            SupportedLanguage::Tsx => Ok(Self::Tsx),
             SupportedLanguage::PlainText
             | SupportedLanguage::Markdown
-            | SupportedLanguage::Html => {
-                unreachable!("language is not comment-masked with Tree-sitter")
-            }
+            | SupportedLanguage::Html => Err(()),
         }
     }
 }
@@ -219,16 +219,12 @@ impl ParsedMask {
                 let tree = parse_tree_sitter_tree(&mut parser, text, None);
                 Self::Html { parser, tree }
             }
-            tree_sitter_compatible_language => {
-                let language =
-                    CommentTreeLanguage::from_supported_language(tree_sitter_compatible_language);
+            lang => {
+                let language = CommentTreeLanguage::try_from(lang)
+                    .expect("remaining SupportedLanguage variants are all Tree-sitter backed");
                 let mut parser = comment_tree_parser(language);
                 let tree = parse_tree_sitter_tree(&mut parser, text, None);
-                Self::CommentTree {
-                    tree,
-                    language,
-                    parser,
-                }
+                Self::CommentTree { tree, language, parser }
             }
         }
     }
@@ -486,19 +482,23 @@ fn annotations_from_skip_ranges(text: &str, skip_ranges: &mut [Range]) -> Vec<An
     annotations
 }
 
+/// Returns the text slice `text[start..end]` if the range is non-empty and
+/// lies on valid char boundaries; `None` otherwise.
+fn get_text_segment(text: &str, start: usize, end: usize) -> Option<&str> {
+    if start >= end {
+        return None;
+    }
+    text.get(start..end).filter(|s| !s.is_empty())
+}
+
 pub(super) fn push_annotation_text(
     text: &str,
     start: usize,
     end: usize,
     annotations: &mut Vec<Annotation>,
 ) {
-    if start >= end {
-        return;
-    }
-    if let Some(segment) = text.get(start..end) {
-        if !segment.is_empty() {
-            annotations.push(Annotation::text(segment.to_string()));
-        }
+    if let Some(segment) = get_text_segment(text, start, end) {
+        annotations.push(Annotation::text(segment.to_string()));
     }
 }
 
@@ -508,16 +508,11 @@ pub(super) fn push_annotation_markup(
     end: usize,
     annotations: &mut Vec<Annotation>,
 ) {
-    if start >= end {
-        return;
-    }
-    if let Some(segment) = text.get(start..end) {
-        if !segment.is_empty() {
-            annotations.push(Annotation::markup(
-                segment.to_string(),
-                interpret_as_for_markup(segment),
-            ));
-        }
+    if let Some(segment) = get_text_segment(text, start, end) {
+        annotations.push(Annotation::markup(
+            segment.to_string(),
+            interpret_as_for_markup(segment),
+        ));
     }
 }
 

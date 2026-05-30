@@ -153,10 +153,7 @@ impl ClientOptions {
     pub fn base_url(&self) -> String {
         let url = match self.backend {
             BackendKind::Custom => self.custom_backend_url.as_str(),
-            BackendKind::Cloud => {
-                let default_url = default_cloud_url();
-                return default_url.trim().trim_end_matches('/').to_string();
-            }
+            BackendKind::Cloud => return default_cloud_url(),
         };
         url.trim().trim_end_matches('/').to_string()
     }
@@ -187,9 +184,8 @@ impl ClientOptions {
     }
 
     pub fn is_ignored_word(&self, word: &str) -> bool {
-        self.ignored_words
-            .iter()
-            .any(|ignored| ignored.eq_ignore_ascii_case(word))
+        let word_lower = word.to_lowercase();
+        self.ignored_words.iter().any(|ignored| *ignored == word_lower)
     }
 }
 

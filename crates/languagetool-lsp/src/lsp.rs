@@ -48,7 +48,7 @@ impl Backend {
     }
 
     async fn schedule_check(&self, uri: Uri) {
-        let Some(token) = self.documents.token(&uri) else {
+        let Some(token) = self.documents.token(&uri).await else {
             log::debug!(
                 "Skipping check schedule for {uri}: document not cached",
                 uri = uri.as_str()
@@ -66,7 +66,8 @@ impl Backend {
             let (options, options_version) = backend.config.options_and_version().await;
             let prepared = backend
                 .documents
-                .prepare_check_if_current(&uri, token, options_version);
+                .prepare_check_if_current(&uri, token, options_version)
+                .await;
             if let Some((prepared, token)) = prepared {
                 log::debug!(
                     "Running debounced check for {uri} token={token:?}",
@@ -84,7 +85,7 @@ impl Backend {
 
     async fn check_uri_now(&self, uri: &Uri) {
         let (options, options_version) = self.config.options_and_version().await;
-        let Some(prepared) = self.documents.prepare_check(uri, options_version) else {
+        let Some(prepared) = self.documents.prepare_check(uri, options_version).await else {
             log::debug!(
                 "Skipping immediate check for {uri}: document not cached",
                 uri = uri.as_str()
@@ -129,34 +130,25 @@ impl Backend {
                 for block in data.blocks {
                     let language_tool = self.language_tool.clone();
                     let options = Arc::clone(&options);
-                    let request = CheckRequest {
-                        uri: uri.clone(),
-                        version,
-                        token,
-                        text: Arc::clone(&text),
-                        index: Arc::clone(&index),
-                        block,
-                    };
                     checks.spawn(async move {
                         let result = language_tool
-                            .check_annotated(&request.block.annotated, &options)
+                            .check_annotated(&block.annotated, &options)
                             .await;
-                        (request, result)
+                        (block, result)
                     });
                 }
 
                 let mut responses = Vec::new();
                 while let Some(result) = checks.join_next().await {
                     match result {
-                        Ok((request, Ok(response))) => {
+                        Ok((block, Ok(response))) => {
                             log::debug!(
-                                "LanguageTool returned {} match(es) for {} token={:?} block={:?}",
+                                "LanguageTool returned {} match(es) for {} token={token:?} block={:?}",
                                 response.matches.len(),
-                                request.uri.as_str(),
-                                request.token,
-                                request.block.byte_range
+                                uri.as_str(),
+                                block.byte_range
                             );
-                            responses.push((request, response));
+                            responses.push((block, response));
                         }
                         Ok((_, Err(err))) => {
                             self.log_check_error(options.as_ref(), err).await;
@@ -169,13 +161,14 @@ impl Backend {
                     }
                 }
 
-                responses.sort_by_key(|(request, _)| request.block.byte_range.start.0);
-                let checked_blocks = completed_blocks_from_responses(responses, options.as_ref());
-                self.complete_and_publish_check(uri, version, token, checked_blocks, false)
+                responses.sort_by_key(|(block, _)| block.byte_range.start.0);
+                let checked_blocks =
+                    completed_blocks_from_responses(responses, &text, &index, version, options.as_ref());
+                self.complete_and_publish_check(uri, version, token, checked_blocks)
                     .await;
             }
             PreparedCheck::ReuseCached { uri, version } => {
-                self.complete_and_publish_check(uri, version, token, Vec::new(), true)
+                self.complete_and_publish_check(uri, version, token, Vec::new())
                     .await;
             }
             PreparedCheck::Clear { uri, version } => {
@@ -194,41 +187,25 @@ impl Backend {
         version: i32,
         token: DocumentToken,
         checked_blocks: Vec<CheckedBlock>,
-        cached: bool,
     ) {
         let Some(diagnostics) =
             self.documents
                 .complete_check_if_current(&uri, token, checked_blocks)
+                .await
         else {
-            if cached {
-                log::debug!(
-                    "Discarding stale cached check result for {} token={:?}",
-                    uri.as_str(),
-                    token
-                );
-            } else {
-                log::debug!(
-                    "Discarding stale check result for {} token={:?}",
-                    uri.as_str(),
-                    token
-                );
-            }
+            log::debug!(
+                "Discarding stale check result for {} token={:?}",
+                uri.as_str(),
+                token
+            );
             return;
         };
 
-        if cached {
-            log::debug!(
-                "Publishing {} cached diagnostic(s) for {uri} token={token:?} version={version:?}",
-                diagnostics.len(),
-                uri = uri.as_str()
-            );
-        } else {
-            log::debug!(
-                "Publishing {} diagnostic(s) for {uri} token={token:?} version={version:?}",
-                diagnostics.len(),
-                uri = uri.as_str()
-            );
-        }
+        log::debug!(
+            "Publishing {} diagnostic(s) for {uri} token={token:?} version={version:?}",
+            diagnostics.len(),
+            uri = uri.as_str()
+        );
 
         self.client
             .publish_diagnostics(uri, diagnostics, Some(version))
@@ -251,7 +228,7 @@ impl Backend {
     }
 
     async fn recheck_all(&self) {
-        let urls = self.documents.urls();
+        let urls = self.documents.urls().await;
         log::info!("Rechecking {} open document(s)", urls.len());
         let mut tasks = tokio::task::JoinSet::new();
         for uri in urls {
@@ -388,7 +365,7 @@ impl LanguageServer for Backend {
             params.text_document.text.len(),
             uri = uri.as_str()
         );
-        self.documents.insert(&params.text_document);
+        self.documents.insert(&params.text_document).await;
         if self.options_and_version().await.0.check_on_open {
             self.check_uri_now(&uri).await;
         } else {
@@ -408,7 +385,8 @@ impl LanguageServer for Backend {
             uri = uri.as_str()
         );
         self.documents
-            .apply_changes(&uri, params.text_document.version, params.content_changes);
+            .apply_changes(&uri, params.text_document.version, params.content_changes)
+            .await;
 
         if self.options_and_version().await.0.check_while_typing {
             self.schedule_check(uri).await;
@@ -435,7 +413,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         log::info!("Closed document {}", params.text_document.uri.as_str());
-        self.documents.remove(&params.text_document.uri);
+        self.documents.remove(&params.text_document.uri).await;
         self.clear_stale_diagnostics(&params.text_document.uri, None)
             .await;
     }
@@ -571,15 +549,6 @@ impl LanguageServer for Backend {
     }
 }
 
-struct CheckRequest {
-    uri: Uri,
-    version: i32,
-    token: DocumentToken,
-    text: Arc<String>,
-    index: Arc<TextIndex>,
-    block: CheckBlock,
-}
-
 struct TextSegment<'a> {
     lt_utf16: Utf16Range,
     doc_byte: ByteRange,
@@ -587,47 +556,50 @@ struct TextSegment<'a> {
 }
 
 fn completed_blocks_from_responses(
-    responses: Vec<(CheckRequest, LanguageToolResponse)>,
+    responses: Vec<(CheckBlock, LanguageToolResponse)>,
+    text: &str,
+    index: &TextIndex,
+    version: i32,
     options: &ClientOptions,
 ) -> Vec<CheckedBlock> {
     responses
         .into_iter()
-        .map(|(request, response)| {
-            let diagnostics = diagnostics_for_request(&request, response.matches, options);
+        .map(|(block, response)| {
+            let diagnostics = diagnostics_for_block(&block, response.matches, text, index, version, options);
             CheckedBlock {
-                byte_range: request.block.byte_range,
+                byte_range: block.byte_range,
                 diagnostics,
             }
         })
         .collect()
 }
 
-fn diagnostics_for_request(
-    request: &CheckRequest,
+fn diagnostics_for_block(
+    block: &CheckBlock,
     matches: Vec<LanguageToolMatch>,
+    text: &str,
+    index: &TextIndex,
+    version: i32,
     options: &ClientOptions,
 ) -> Vec<RawDiagnostic> {
-    let segments = text_segments_for_block(&request.block);
+    let segments = text_segments_for_block(block);
     let diagnostics = matches
         .iter()
         .filter_map(|item| match_utf16_range(item).map(|range| (item, range)))
         .filter_map(|(item, lt_range)| {
             let doc_byte_range = map_lt_range_to_doc_bytes(&segments, lt_range)?;
-            let matched_text = request
-                .text
-                .get(doc_byte_range.start.0..doc_byte_range.end.0)?;
+            let matched_text = text.get(doc_byte_range.start.0..doc_byte_range.end.0)?;
             if matched_text.trim().is_empty() || options.is_ignored_word(matched_text) {
                 return None;
             }
 
-            let utf16_start = request.index.utf16_offset_for_byte(doc_byte_range.start);
-            let utf16_end = request.index.utf16_offset_for_byte(doc_byte_range.end);
+            let utf16_start = index.utf16_offset_for_byte(doc_byte_range.start);
+            let utf16_end = index.utf16_offset_for_byte(doc_byte_range.end);
             let range = Range {
-                start: request.index.position(utf16_start),
-                end: request.index.position(utf16_end),
+                start: index.position(utf16_start),
+                end: index.position(utf16_end),
             };
-            let data =
-                diagnostic_data_for_text(matched_text.to_string(), item, options, request.version);
+            let data = diagnostic_data_for_text(matched_text.to_string(), item, options, version);
             Some(RawDiagnostic {
                 doc_byte_range,
                 diagnostic: make_lsp_diagnostic_for_range(range, item, options),
@@ -636,9 +608,9 @@ fn diagnostics_for_request(
         })
         .collect::<Vec<_>>();
     log::debug!(
-        "Mapped LanguageTool matches to {} diagnostic(s) for {}",
+        "Mapped LanguageTool matches to {} diagnostic(s) for block {:?}",
         diagnostics.len(),
-        request.uri.as_str()
+        block.byte_range
     );
     diagnostics
 }
@@ -755,6 +727,8 @@ fn make_command(title: String, command: &str, argument: String) -> Command {
     }
 }
 
+// `root_uri` is deprecated in LSP in favour of `workspaceFolders`, but we
+// still fall back to it for clients that do not send workspace folders.
 #[allow(deprecated)]
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     params
@@ -778,7 +752,13 @@ mod tests {
         LanguageToolCategory, LanguageToolMatch, LanguageToolReplacement, LanguageToolRule,
     };
 
-    fn check_request_for_test(mut document: Document) -> CheckRequest {
+    struct TestRequest {
+        block: CheckBlock,
+        text: Arc<String>,
+        index: Arc<TextIndex>,
+    }
+
+    fn prepare_test_request(mut document: Document) -> TestRequest {
         let PreparedCheck::Check(prepared) = document.prepare_check(0) else {
             panic!("document should be checkable");
         };
@@ -787,13 +767,10 @@ mod tests {
             .into_iter()
             .next()
             .expect("document should have a check block");
-        CheckRequest {
-            uri: prepared.uri,
-            version: prepared.version,
-            token: DocumentToken::new_for_test(0, prepared.version, 0),
+        TestRequest {
+            block,
             text: prepared.text,
             index: prepared.index,
-            block,
         }
     }
     #[test]
@@ -805,7 +782,7 @@ mod tests {
             "This are a tset.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(document);
+        let request = prepare_test_request(document);
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
             short_message: None,
@@ -829,7 +806,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_request(&request, vec![item], &options);
+        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 11));
         assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 15));
@@ -844,7 +821,7 @@ mod tests {
             "let value = 1; // This are a comment.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(document);
+        let request = prepare_test_request(document);
         let item = LanguageToolMatch {
             message: "The singular demonstrative pronoun does not agree.".to_string(),
             short_message: None,
@@ -863,7 +840,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_request(&request, vec![item], &options);
+        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 18));
         assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 22));
@@ -878,7 +855,7 @@ mod tests {
             "let typoo = 1; // This are a comment.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(document);
+        let request = prepare_test_request(document);
         let item = LanguageToolMatch {
             message: "Possible spelling mistake found.".to_string(),
             short_message: None,
@@ -900,7 +877,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_request(&request, vec![item], &options);
+        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
         assert!(diagnostics.is_empty());
     }
 
@@ -913,7 +890,7 @@ mod tests {
             "😀 This are a tset.".to_string(),
         );
         let options = ClientOptions::default();
-        let request = check_request_for_test(document);
+        let request = prepare_test_request(document);
         let item = LanguageToolMatch {
             message: "The verb 'are' is plural.".to_string(),
             short_message: None,
@@ -935,7 +912,7 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_request(&request, vec![item], &options);
+        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 3));
         assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 11));

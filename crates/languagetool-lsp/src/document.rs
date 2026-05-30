@@ -125,8 +125,9 @@ impl Document {
                 };
             }
             DocumentKind::Unsupported(document) => {
-                let uri = document.uri.clone();
-                *self = Self::new(uri, version, None, text);
+                // An unsupported document has no text buffer; it can never
+                // become supported after open. Just advance the version.
+                document.version = version;
             }
         }
     }
@@ -556,8 +557,26 @@ mod tests {
         );
 
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
-        document.full_update(2, "This are checked.".to_string());
+        document.full_update(2, "This are still ignored.".to_string());
+        // Stays unsupported; only the version advances.
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
+        assert_eq!(document.version(), 2);
+    }
+
+    #[test]
+    fn unsupported_full_update_becomes_supported_if_language_id_recognized() {
+        let mut document = Document::new(
+            "untitled:notes".parse::<Uri>().unwrap(),
+            1,
+            Some("plaintext".to_string()),
+            "This are ignored.".to_string(),
+        );
+
+        // Despite the unsupported URI, the stored language_id should be
+        // replayed on full_update, making the document supported.
+        assert!(matches!(&document.kind, DocumentKind::Supported(_)));
+        document.full_update(2, "This are checked.".to_string());
+        assert!(matches!(&document.kind, DocumentKind::Supported(_)));
     }
 
     #[test]
