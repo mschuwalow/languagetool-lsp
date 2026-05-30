@@ -5,7 +5,7 @@ use crate::languagetool::{AnnotatedText, Annotation};
 use crate::text_index::{BytePosition, ByteRange};
 use comment_blocks::{merge_comment_blocks, CommentBlock};
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
-use tree_sitter_md_025::{MarkdownParser, MarkdownTree};
+use tree_sitter_md::{MarkdownParser, MarkdownTree};
 
 /// Maintains parser-backed masking state for a document and produces checkable text ranges.
 pub struct Masker {
