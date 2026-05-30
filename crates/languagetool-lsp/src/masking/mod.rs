@@ -224,7 +224,11 @@ impl ParsedMask {
                     .expect("remaining SupportedLanguage variants are all Tree-sitter backed");
                 let mut parser = comment_tree_parser(language);
                 let tree = parse_tree_sitter_tree(&mut parser, text, None);
-                Self::CommentTree { tree, language, parser }
+                Self::CommentTree {
+                    tree,
+                    language,
+                    parser,
+                }
             }
         }
     }

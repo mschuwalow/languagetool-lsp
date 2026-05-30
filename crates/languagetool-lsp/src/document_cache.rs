@@ -353,9 +353,15 @@ mod tests {
         cache.apply_change(&uri, 1, full_change("hello")).await;
         let initial = cache.token(&uri).await.unwrap();
         assert_eq!(initial.generation(), 0);
-        assert_eq!(cache.prepare_check(&uri, 0).await.unwrap().1.generation(), 1);
+        assert_eq!(
+            cache.prepare_check(&uri, 0).await.unwrap().1.generation(),
+            1
+        );
         assert_eq!(cache.token(&uri).await.unwrap().generation(), 1);
-        assert_eq!(cache.prepare_check(&uri, 0).await.unwrap().1.generation(), 2);
+        assert_eq!(
+            cache.prepare_check(&uri, 0).await.unwrap().1.generation(),
+            2
+        );
 
         cache.remove(&uri).await;
         assert_eq!(cache.token(&uri).await, None);

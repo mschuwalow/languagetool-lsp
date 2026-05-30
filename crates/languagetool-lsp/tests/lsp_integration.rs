@@ -23,20 +23,10 @@ struct TestContext {
 impl TestContext {
     fn new() -> Self {
         let workspace = TempDir::new().expect("test workspace should be created");
-        Self::new_with_workspace_and_backend_root(workspace, None)
-    }
-
-    fn new_with_backend_root(root: PathBuf) -> Self {
-        let workspace = TempDir::new().expect("test workspace should be created");
-        Self::new_with_workspace_and_backend_root(workspace, Some(root))
-    }
-
-    fn new_with_workspace_and_backend_root(workspace: TempDir, root: Option<PathBuf>) -> Self {
-        let root = root.unwrap_or_else(|| workspace.path().to_path_buf());
         let (request_tx, server_rx) = duplex(1024 * 1024);
         let (server_tx, response_rx) = duplex(1024 * 1024);
         let response_rx = BufReader::new(response_rx);
-        let (service, socket) = LspService::new(|client| Backend::new(client, root.clone()));
+        let (service, socket) = LspService::new(Backend::new);
         let server = tokio::spawn(Server::new(server_rx, server_tx, socket).serve(service));
 
         Self {
@@ -599,8 +589,7 @@ async fn malformed_incremental_change_clears_diagnostics() {
 
 #[tokio::test]
 async fn initialize_workspace_root_controls_project_config_location() {
-    let backend_root = TempDir::new().expect("backend root should be created");
-    let mut ctx = TestContext::new_with_backend_root(backend_root.path().to_path_buf());
+    let mut ctx = TestContext::new();
     ctx.initialize().await;
 
     let result = ctx
@@ -615,7 +604,6 @@ async fn initialize_workspace_root_controls_project_config_location() {
 
     assert_eq!(result, Value::Null);
     assert!(ctx.project_config_path().exists());
-    assert!(!backend_root.path().join(".zed/languagetool.json").exists());
 }
 
 #[tokio::test]

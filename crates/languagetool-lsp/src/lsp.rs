@@ -26,6 +26,8 @@ const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace"
 #[derive(Clone)]
 pub struct Backend {
     client: Client,
+    /// Workspace root. Defaults to `"."` and is updated once during
+    /// `initialize` from the LSP workspace folders / root URI.
     root: Arc<RwLock<PathBuf>>,
     documents: DocumentCache,
     config: RuntimeConfig,
@@ -33,10 +35,10 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn new(client: Client, root: PathBuf) -> Self {
+    pub fn new(client: Client) -> Self {
         Self {
             client,
-            root: Arc::new(RwLock::new(root)),
+            root: Arc::new(RwLock::new(PathBuf::from("."))),
             documents: DocumentCache::default(),
             config: RuntimeConfig::default(),
             language_tool: LanguageToolClient::new(),
@@ -162,8 +164,13 @@ impl Backend {
                 }
 
                 responses.sort_by_key(|(block, _)| block.byte_range.start.0);
-                let checked_blocks =
-                    completed_blocks_from_responses(responses, &text, &index, version, options.as_ref());
+                let checked_blocks = completed_blocks_from_responses(
+                    responses,
+                    &text,
+                    &index,
+                    version,
+                    options.as_ref(),
+                );
                 self.complete_and_publish_check(uri, version, token, checked_blocks)
                     .await;
             }
@@ -188,10 +195,10 @@ impl Backend {
         token: DocumentToken,
         checked_blocks: Vec<CheckedBlock>,
     ) {
-        let Some(diagnostics) =
-            self.documents
-                .complete_check_if_current(&uri, token, checked_blocks)
-                .await
+        let Some(diagnostics) = self
+            .documents
+            .complete_check_if_current(&uri, token, checked_blocks)
+            .await
         else {
             log::debug!(
                 "Discarding stale check result for {} token={:?}",
@@ -239,8 +246,9 @@ impl Backend {
     }
 
     async fn project_config_path(&self) -> PathBuf {
-        let root = self.root.read().await.clone();
-        self.config.project_config_path(&root).await
+        self.config
+            .project_config_path(&self.root.read().await)
+            .await
     }
 
     async fn project_config_display_path(&self) -> String {
@@ -291,9 +299,11 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
         if let Some(root) = workspace_root(&params) {
             *self.root.write().await = root;
+        } else {
+            log::warn!("Client sent no workspace folder; using current directory as root");
         }
+        let root = self.root.read().await;
         let client_options = ClientOptions::from_value(params.initialization_options);
-        let root = self.root.read().await.clone();
         self.config.set_client_options(client_options, &root).await;
         let options = self.options_and_version().await.0;
         log::info!(
@@ -498,10 +508,9 @@ impl LanguageServer for Backend {
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if params.settings != Value::Null {
             log::info!("LanguageTool configuration changed; reloading options and project config");
-            let root = self.root.read().await.clone();
             if let Err(err) = self
                 .config
-                .update_client_options(params.settings, &root)
+                .update_client_options(params.settings, &self.root.read().await)
                 .await
             {
                 let message = format!(
@@ -565,7 +574,8 @@ fn completed_blocks_from_responses(
     responses
         .into_iter()
         .map(|(block, response)| {
-            let diagnostics = diagnostics_for_block(&block, response.matches, text, index, version, options);
+            let diagnostics =
+                diagnostics_for_block(&block, response.matches, text, index, version, options);
             CheckedBlock {
                 byte_range: block.byte_range,
                 diagnostics,
@@ -727,8 +737,8 @@ fn make_command(title: String, command: &str, argument: String) -> Command {
     }
 }
 
-// `root_uri` is deprecated in LSP in favour of `workspaceFolders`, but we
-// still fall back to it for clients that do not send workspace folders.
+// `root_uri` and `root_path` are deprecated in LSP in favour of
+// `workspaceFolders`, but we fall back to them for older clients.
 #[allow(deprecated)]
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     params
@@ -742,6 +752,7 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
                 .as_ref()
                 .and_then(|uri| uri.to_file_path().map(|path| path.into_owned()))
         })
+        .or_else(|| params.root_path.as_deref().map(PathBuf::from))
 }
 
 #[cfg(test)]
@@ -806,7 +817,14 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 11));
         assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 15));
@@ -840,7 +858,14 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 18));
         assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 22));
@@ -877,7 +902,14 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
         assert!(diagnostics.is_empty());
     }
 
@@ -912,7 +944,14 @@ mod tests {
             })),
         };
 
-        let diagnostics = diagnostics_for_block(&request.block, vec![item], &request.text, &request.index, 1, &options);
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 3));
         assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 11));

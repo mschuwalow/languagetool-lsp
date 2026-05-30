@@ -185,7 +185,7 @@ impl ClientOptions {
 
     pub fn is_ignored_word(&self, word: &str) -> bool {
         let word_lower = word.to_lowercase();
-        self.ignored_words.iter().any(|ignored| *ignored == word_lower)
+        self.ignored_words.contains(&word_lower)
     }
 }
 
