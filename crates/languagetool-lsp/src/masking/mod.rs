@@ -8,16 +8,9 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 use tree_sitter_md::{MarkdownParser, MarkdownTree};
 
 /// Maintains parser-backed masking state for a document and produces checkable text ranges.
+#[derive(Debug)]
 pub struct Masker {
     parsed: ParsedMask,
-}
-
-impl std::fmt::Debug for Masker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Masker")
-            .field("parsed", &self.parsed)
-            .finish()
-    }
 }
 
 impl Masker {
