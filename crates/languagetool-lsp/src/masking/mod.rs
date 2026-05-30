@@ -8,9 +8,16 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 use tree_sitter_md_025::{MarkdownParser, MarkdownTree};
 
 /// Maintains parser-backed masking state for a document and produces checkable text ranges.
-#[derive(Debug, Clone)]
 pub struct Masker {
     parsed: ParsedMask,
+}
+
+impl std::fmt::Debug for Masker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Masker")
+            .field("parsed", &self.parsed)
+            .finish()
+    }
 }
 
 impl Masker {
@@ -66,7 +73,7 @@ impl Masker {
                     annotated,
                 }]
             }
-            ParsedMask::Html(tree) => {
+            ParsedMask::Html { tree, .. } => {
                 let mut skip_ranges = Vec::new();
                 collect_html_skip_ranges(tree.root_node(), &mut skip_ranges);
                 let annotation = annotations_from_skip_ranges(text, &mut skip_ranges);
@@ -79,7 +86,7 @@ impl Masker {
                     annotated,
                 }]
             }
-            ParsedMask::Markdown(tree) => {
+            ParsedMask::Markdown { tree, .. } => {
                 let mut skip_ranges = Vec::new();
                 collect_markdown_skip_ranges(tree.block_tree().root_node(), &mut skip_ranges);
                 for inline_tree in tree.inline_trees() {
@@ -95,7 +102,7 @@ impl Masker {
                     annotated,
                 }]
             }
-            ParsedMask::CommentTree { language, tree } => {
+            ParsedMask::CommentTree { language, tree, .. } => {
                 let mut comment_blocks = Vec::new();
                 collect_comment_blocks(text, *language, tree.root_node(), &mut comment_blocks);
                 merge_comment_blocks(text, &comment_blocks)
@@ -167,15 +174,35 @@ impl CommentTreeLanguage {
     }
 }
 
-#[derive(Debug, Clone)]
 enum ParsedMask {
     CommentTree {
         language: CommentTreeLanguage,
+        parser: Parser,
         tree: Tree,
     },
-    Html(Tree),
-    Markdown(MarkdownTree),
+    Html {
+        parser: Parser,
+        tree: Tree,
+    },
+    Markdown {
+        parser: MarkdownParser,
+        tree: MarkdownTree,
+    },
     PlainText,
+}
+
+impl std::fmt::Debug for ParsedMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CommentTree { language, .. } => f
+                .debug_struct("CommentTree")
+                .field("language", language)
+                .finish(),
+            Self::Html { .. } => f.debug_struct("Html").finish(),
+            Self::Markdown { .. } => f.debug_struct("Markdown").finish(),
+            Self::PlainText => write!(f, "PlainText"),
+        }
+    }
 }
 
 impl ParsedMask {
@@ -184,20 +211,23 @@ impl ParsedMask {
             SupportedLanguage::PlainText => Self::PlainText,
             SupportedLanguage::Markdown => {
                 let mut parser = MarkdownParser::default();
-                Self::Markdown(parse_markdown_tree(&mut parser, text, None))
+                let tree = parse_markdown_tree(&mut parser, text, None);
+                Self::Markdown { parser, tree }
             }
             SupportedLanguage::Html => {
                 let mut parser = html_parser();
-                Self::Html(parse_tree_sitter_tree(&mut parser, text, None))
+                let tree = parse_tree_sitter_tree(&mut parser, text, None);
+                Self::Html { parser, tree }
             }
             tree_sitter_compatible_language => {
-                let comment_language =
+                let language =
                     CommentTreeLanguage::from_supported_language(tree_sitter_compatible_language);
-                let mut parser = comment_tree_parser(comment_language);
+                let mut parser = comment_tree_parser(language);
                 let tree = parse_tree_sitter_tree(&mut parser, text, None);
                 Self::CommentTree {
                     tree,
-                    language: comment_language,
+                    language,
+                    parser,
                 }
             }
         }
@@ -205,20 +235,17 @@ impl ParsedMask {
 
     fn apply_edit(&mut self, edit: &InputEdit, text: &str) {
         match self {
-            Self::Markdown(tree) => {
+            Self::Markdown { parser, tree } => {
                 tree.edit(edit);
-                let mut parser = MarkdownParser::default();
-                *tree = parse_markdown_tree(&mut parser, text, Some(tree));
+                *tree = parse_markdown_tree(parser, text, Some(tree));
             }
-            Self::Html(tree) => {
+            Self::Html { parser, tree } => {
                 tree.edit(edit);
-                let mut parser = html_parser();
-                *tree = parse_tree_sitter_tree(&mut parser, text, Some(tree));
+                *tree = parse_tree_sitter_tree(parser, text, Some(tree));
             }
-            Self::CommentTree { tree, language } => {
+            Self::CommentTree { parser, tree, .. } => {
                 tree.edit(edit);
-                let mut parser = comment_tree_parser(*language);
-                *tree = parse_tree_sitter_tree(&mut parser, text, Some(tree));
+                *tree = parse_tree_sitter_tree(parser, text, Some(tree));
             }
             Self::PlainText => {}
         }
@@ -459,7 +486,12 @@ fn annotations_from_skip_ranges(text: &str, skip_ranges: &mut [Range]) -> Vec<An
     annotations
 }
 
-fn push_annotation_text(text: &str, start: usize, end: usize, annotations: &mut Vec<Annotation>) {
+pub(super) fn push_annotation_text(
+    text: &str,
+    start: usize,
+    end: usize,
+    annotations: &mut Vec<Annotation>,
+) {
     if start >= end {
         return;
     }
@@ -470,7 +502,12 @@ fn push_annotation_text(text: &str, start: usize, end: usize, annotations: &mut 
     }
 }
 
-fn push_annotation_markup(text: &str, start: usize, end: usize, annotations: &mut Vec<Annotation>) {
+pub(super) fn push_annotation_markup(
+    text: &str,
+    start: usize,
+    end: usize,
+    annotations: &mut Vec<Annotation>,
+) {
     if start >= end {
         return;
     }
@@ -484,7 +521,7 @@ fn push_annotation_markup(text: &str, start: usize, end: usize, annotations: &mu
     }
 }
 
-fn interpret_as_for_markup(markup: &str) -> Option<String> {
+pub(super) fn interpret_as_for_markup(markup: &str) -> Option<String> {
     let line_breaks = markup
         .chars()
         .filter(|ch| matches!(ch, '\n' | '\r'))

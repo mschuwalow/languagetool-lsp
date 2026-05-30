@@ -1,23 +1,24 @@
-use crate::diagnostics_cache::{CachedDiagnostic, DiagnosticsCache};
+use crate::diagnostics::CheckedBlock;
+use crate::diagnostics_cache::DiagnosticsCache;
 use crate::language::{DocumentLanguage, SupportedLanguage};
 use crate::masking::{CheckBlock, Masker};
-use crate::text_index::{ByteOffset, ByteRange, TextIndex};
+use crate::text_index::{ByteOffset, TextIndex};
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{Diagnostic, Range, TextDocumentItem, Uri};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Document {
     kind: DocumentKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum DocumentKind {
     Supported(Box<SupportedDocument>),
     Unsupported(UnsupportedDocument),
     OutOfSync(OutOfSyncDocument),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SupportedDocument {
     uri: Uri,
     version: i32,
@@ -28,13 +29,13 @@ struct SupportedDocument {
     diagnostics_cache: DiagnosticsCache,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct UnsupportedDocument {
     uri: Uri,
     version: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct OutOfSyncDocument {
     uri: Uri,
     version: i32,
@@ -55,12 +56,6 @@ pub struct PreparedCheckData {
     pub text: Arc<String>,
     pub index: Arc<TextIndex>,
     pub blocks: Vec<CheckBlock>,
-}
-
-#[derive(Debug)]
-pub struct CompletedCheckBlock {
-    pub byte_range: ByteRange,
-    pub diagnostics: Vec<CachedDiagnostic>,
 }
 
 impl Document {
@@ -158,20 +153,17 @@ impl Document {
         }
     }
 
-    pub(crate) fn prepare_check(&mut self, options_key: String) -> PreparedCheck {
+    pub(crate) fn prepare_check(&mut self, options_version: u64) -> PreparedCheck {
         let Some(document) = self.supported_mut() else {
             return PreparedCheck::Clear {
                 uri: self.uri().clone(),
                 version: self.version(),
             };
         };
-        document.prepare_check(options_key)
+        document.prepare_check(options_version)
     }
 
-    pub(crate) fn complete_check(
-        &mut self,
-        checked_blocks: Vec<CompletedCheckBlock>,
-    ) -> Vec<Diagnostic> {
+    pub(crate) fn complete_check(&mut self, checked_blocks: Vec<CheckedBlock>) -> Vec<Diagnostic> {
         let Some(document) = self.supported_mut() else {
             return Vec::new();
         };
@@ -261,7 +253,7 @@ impl SupportedDocument {
         true
     }
 
-    fn prepare_check(&mut self, options_key: String) -> PreparedCheck {
+    fn prepare_check(&mut self, options_version: u64) -> PreparedCheck {
         let check_blocks = self.mask.check_blocks(&self.text);
         if check_blocks.is_empty() {
             log::debug!(
@@ -276,7 +268,8 @@ impl SupportedDocument {
             };
         }
 
-        self.diagnostics_cache.reset_if_options_changed(options_key);
+        self.diagnostics_cache
+            .reset_if_options_changed(options_version);
         let blocks: Vec<CheckBlock> = self
             .diagnostics_cache
             .retain_current_and_collect_uncached(check_blocks, |block| &block.byte_range)
@@ -299,10 +292,9 @@ impl SupportedDocument {
         })
     }
 
-    fn complete_check(&mut self, checked_blocks: Vec<CompletedCheckBlock>) -> Vec<Diagnostic> {
+    fn complete_check(&mut self, checked_blocks: Vec<CheckedBlock>) -> Vec<Diagnostic> {
         for checked in checked_blocks {
-            self.diagnostics_cache
-                .store_checked_block(checked.byte_range, checked.diagnostics);
+            self.diagnostics_cache.store_checked_block(checked);
         }
 
         self.diagnostics_cache.diagnostics()
@@ -314,11 +306,8 @@ mod tests {
     use super::*;
     use indoc::indoc;
     use tower_lsp_server::ls_types::Position;
-    fn supported_document(document: &Document) -> SupportedDocument {
-        document
-            .supported()
-            .expect("document should be supported")
-            .clone()
+    fn supported_document(document: &Document) -> &SupportedDocument {
+        document.supported().expect("document should be supported")
     }
 
     fn plaintext_document(text: &str) -> Document {
@@ -364,7 +353,7 @@ mod tests {
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
         assert!(matches!(
-            document.prepare_check("test".to_string()),
+            document.prepare_check(0),
             PreparedCheck::Clear { .. }
         ));
     }
@@ -538,7 +527,7 @@ mod tests {
 
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
         assert!(matches!(
-            document.prepare_check("test".to_string()),
+            document.prepare_check(0),
             PreparedCheck::Clear { .. }
         ));
         assert_eq!(document.version(), 1);
@@ -551,7 +540,7 @@ mod tests {
 
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
         assert!(matches!(
-            document.prepare_check("test".to_string()),
+            document.prepare_check(0),
             PreparedCheck::Clear { .. }
         ));
         assert_eq!(document.version(), 2);

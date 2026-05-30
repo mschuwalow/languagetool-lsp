@@ -197,7 +197,9 @@ impl TextIndex {
         let old_window_byte_end = self
             .byte_offset_for_utf16_raw(window_utf16_end)
             .expect("line starts are valid UTF-16 offsets");
-        let new_window_byte_end = (old_window_byte_end as isize + byte_delta) as usize;
+        let new_window_byte_end = old_window_byte_end
+            .checked_add_signed(byte_delta)
+            .expect("byte offset overflow in apply_edit window");
         let include_trailing_line = line_replace_end == self.line_starts_utf16.len();
 
         self.apply_checkpoint_edit(byte_start, byte_end, utf16_start, utf16_end, new_text);
@@ -215,8 +217,14 @@ impl TextIndex {
                 utf16_delta,
             },
         );
-        self.total_utf16 = (self.total_utf16 as isize + utf16_delta) as usize;
-        self.total_bytes = (self.total_bytes as isize + byte_delta) as usize;
+        self.total_utf16 = self
+            .total_utf16
+            .checked_add_signed(utf16_delta)
+            .expect("utf16 offset overflow in apply_edit");
+        self.total_bytes = self
+            .total_bytes
+            .checked_add_signed(byte_delta)
+            .expect("byte offset overflow in apply_edit");
     }
 
     pub fn position(&self, offset: Utf16Offset) -> Position {
@@ -363,8 +371,12 @@ impl TextIndex {
         }
 
         for (cu, cb) in &mut self.checkpoints[cp_last..] {
-            *cu = (*cu as isize + utf16_delta) as usize;
-            *cb = (*cb as isize + byte_delta) as usize;
+            *cu = cu
+                .checked_add_signed(utf16_delta)
+                .expect("utf16 checkpoint overflow");
+            *cb = cb
+                .checked_add_signed(byte_delta)
+                .expect("byte checkpoint overflow");
         }
         self.checkpoints.splice(cp_first..cp_last, new_cps);
     }
@@ -393,7 +405,9 @@ impl TextIndex {
         }
 
         for offset in &mut self.invalid_utf16_offsets[invalid_last..] {
-            *offset = (*offset as isize + utf16_delta) as usize;
+            *offset = offset
+                .checked_add_signed(utf16_delta)
+                .expect("utf16 invalid offset overflow");
         }
         self.invalid_utf16_offsets
             .splice(invalid_first..invalid_last, new_invalid);
@@ -405,10 +419,14 @@ impl TextIndex {
             line_tables_for_segment(segment, window.utf16_start, window.include_trailing_line);
 
         for start in &mut self.line_starts_utf16[window.line_replace_end..] {
-            *start = (*start as isize + window.utf16_delta) as usize;
+            *start = start
+                .checked_add_signed(window.utf16_delta)
+                .expect("utf16 line start overflow");
         }
         for end in &mut self.line_ends_utf16[window.line_replace_end..] {
-            *end = (*end as isize + window.utf16_delta) as usize;
+            *end = end
+                .checked_add_signed(window.utf16_delta)
+                .expect("utf16 line end overflow");
         }
         self.line_starts_utf16
             .splice(window.line_first..window.line_replace_end, new_starts);
@@ -429,7 +447,9 @@ impl TextIndex {
         let last = self.line_starts_bytes.partition_point(|&ls| ls <= byte_end);
 
         for start in &mut self.line_starts_bytes[last..] {
-            *start = (*start as isize + byte_delta) as usize;
+            *start = start
+                .checked_add_signed(byte_delta)
+                .expect("byte line start overflow");
         }
 
         let new_starts = new_text

@@ -1,4 +1,4 @@
-use super::CheckBlock;
+use super::{push_annotation_markup, push_annotation_text, CheckBlock};
 use crate::languagetool::{AnnotatedText, Annotation};
 use crate::text_index::ByteRange;
 
@@ -130,45 +130,6 @@ fn annotations_for_comment_group(
     }
     push_annotation_markup(text, cursor, block_end, &mut annotations);
     annotations
-}
-
-fn push_annotation_text(text: &str, start: usize, end: usize, annotations: &mut Vec<Annotation>) {
-    if start >= end {
-        return;
-    }
-    if let Some(segment) = text.get(start..end) {
-        if !segment.is_empty() {
-            annotations.push(Annotation::text(segment.to_string()));
-        }
-    }
-}
-
-fn push_annotation_markup(text: &str, start: usize, end: usize, annotations: &mut Vec<Annotation>) {
-    if start >= end {
-        return;
-    }
-    if let Some(segment) = text.get(start..end) {
-        if !segment.is_empty() {
-            annotations.push(Annotation::markup(
-                segment.to_string(),
-                interpret_as_for_markup(segment),
-            ));
-        }
-    }
-}
-
-fn interpret_as_for_markup(markup: &str) -> Option<String> {
-    let line_breaks = markup
-        .chars()
-        .filter(|ch| matches!(ch, '\n' | '\r'))
-        .collect::<String>();
-    if !line_breaks.is_empty() {
-        Some(line_breaks)
-    } else if markup.chars().any(char::is_whitespace) {
-        Some(" ".to_string())
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

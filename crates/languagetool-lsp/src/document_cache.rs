@@ -1,5 +1,6 @@
+pub use crate::diagnostics::CheckedBlock;
 use crate::document::Document;
-pub use crate::document::{CompletedCheckBlock, PreparedCheck};
+pub use crate::document::PreparedCheck;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -80,8 +81,15 @@ impl DocumentCache {
             document.version()
         );
         let mut documents = self.documents.write().expect("document cache poisoned");
+        let key = document.uri().as_str().to_string();
+        if documents.contains_key(&key) {
+            log::warn!(
+                "Document {} is already cached; replacing with new entry",
+                document.uri().as_str()
+            );
+        }
         let entry = DocumentEntry::new(document);
-        documents.insert(entry.document.uri().as_str().to_string(), entry);
+        documents.insert(key, entry);
     }
 
     fn full_update_locked(
@@ -182,19 +190,19 @@ impl DocumentCache {
     pub fn prepare_check(
         &self,
         uri: &Uri,
-        options_key: String,
+        options_version: u64,
     ) -> Option<(PreparedCheck, DocumentToken)> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
         entry.generation += 1;
-        Some((entry.document.prepare_check(options_key), entry.token()))
+        Some((entry.document.prepare_check(options_version), entry.token()))
     }
 
     pub fn prepare_check_if_current(
         &self,
         uri: &Uri,
         token: DocumentToken,
-        options_key: String,
+        options_version: u64,
     ) -> Option<(PreparedCheck, DocumentToken)> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
@@ -202,14 +210,14 @@ impl DocumentCache {
             return None;
         }
         entry.generation += 1;
-        Some((entry.document.prepare_check(options_key), entry.token()))
+        Some((entry.document.prepare_check(options_version), entry.token()))
     }
 
     pub fn complete_check_if_current(
         &self,
         uri: &Uri,
         token: DocumentToken,
-        checked_blocks: Vec<CompletedCheckBlock>,
+        checked_blocks: Vec<CheckedBlock>,
     ) -> Option<Vec<Diagnostic>> {
         let mut documents = self.documents.write().expect("document cache poisoned");
         let entry = documents.get_mut(uri.as_str())?;
@@ -267,9 +275,7 @@ mod tests {
         cache.apply_change(&uri, 2, full_change("old text"));
 
         let token = cache.token(&uri).unwrap();
-        let (prepared, _) = cache
-            .prepare_check_if_current(&uri, token, "test".to_string())
-            .unwrap();
+        let (prepared, _) = cache.prepare_check_if_current(&uri, token, 0).unwrap();
         let PreparedCheck::Check(data) = prepared else {
             panic!("document should be checkable");
         };
@@ -301,9 +307,7 @@ mod tests {
         );
 
         let token = cache.token(&uri).unwrap();
-        let (prepared, _) = cache
-            .prepare_check_if_current(&uri, token, "test".to_string())
-            .unwrap();
+        let (prepared, _) = cache.prepare_check_if_current(&uri, token, 0).unwrap();
         let PreparedCheck::Check(data) = prepared else {
             panic!("document should be checkable");
         };
@@ -322,9 +326,7 @@ mod tests {
         cache.apply_change(&uri, 2, full_change("second"));
 
         assert_eq!(cache.token(&uri).unwrap().generation(), 0);
-        assert!(cache
-            .prepare_check_if_current(&uri, scheduled, "test".to_string())
-            .is_none());
+        assert!(cache.prepare_check_if_current(&uri, scheduled, 0).is_none());
     }
 
     #[test]
@@ -332,28 +334,14 @@ mod tests {
         let cache = DocumentCache::default();
         let uri = "file:///tmp/test.txt".parse::<Uri>().unwrap();
         assert_eq!(cache.token(&uri), None);
-        assert!(cache.prepare_check(&uri, "test".to_string()).is_none());
+        assert!(cache.prepare_check(&uri, 0).is_none());
 
         cache.apply_change(&uri, 1, full_change("hello"));
         let initial = cache.token(&uri).unwrap();
         assert_eq!(initial.generation(), 0);
-        assert_eq!(
-            cache
-                .prepare_check(&uri, "test".to_string())
-                .unwrap()
-                .1
-                .generation(),
-            1
-        );
+        assert_eq!(cache.prepare_check(&uri, 0).unwrap().1.generation(), 1);
         assert_eq!(cache.token(&uri).unwrap().generation(), 1);
-        assert_eq!(
-            cache
-                .prepare_check(&uri, "test".to_string())
-                .unwrap()
-                .1
-                .generation(),
-            2
-        );
+        assert_eq!(cache.prepare_check(&uri, 0).unwrap().1.generation(), 2);
 
         cache.remove(&uri);
         assert_eq!(cache.token(&uri), None);
@@ -377,7 +365,7 @@ mod tests {
         };
 
         cache.insert(&first);
-        let first_token = cache.prepare_check(&uri, "test".to_string()).unwrap().1;
+        let first_token = cache.prepare_check(&uri, 0).unwrap().1;
         cache.insert(&second);
         let second_token = cache.token(&uri).unwrap();
 

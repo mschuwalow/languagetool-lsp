@@ -14,6 +14,9 @@ struct RuntimeConfigState {
     client_options: ClientOptions,
     project_config: ProjectConfig,
     options: Arc<ClientOptions>,
+    /// Monotonically incremented every time `options` changes. Used as a cheap
+    /// cache-invalidation key instead of serializing `ClientOptions` to JSON.
+    options_version: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -26,14 +29,18 @@ impl Default for RuntimeConfig {
                 client_options,
                 project_config,
                 options,
+                options_version: 0,
             })),
         }
     }
 }
 
 impl RuntimeConfig {
-    pub(crate) async fn options(&self) -> Arc<ClientOptions> {
-        self.state.read().await.options.clone()
+    /// Returns the current options and their version counter in a single lock
+    /// acquisition, guaranteeing the two values are always consistent.
+    pub(crate) async fn options_and_version(&self) -> (Arc<ClientOptions>, u64) {
+        let state = self.state.read().await;
+        (state.options.clone(), state.options_version)
     }
 
     pub(crate) async fn project_config_path(&self, root: &Path) -> PathBuf {
@@ -75,6 +82,7 @@ impl RuntimeConfig {
         state.options = Arc::new(project_config.merged_options(&client_options));
         state.client_options = client_options;
         state.project_config = project_config;
+        state.options_version += 1;
         Ok(())
     }
 
@@ -97,15 +105,19 @@ impl RuntimeConfig {
 
         state.options = Arc::new(next_config.merged_options(&state.client_options));
         state.project_config = next_config;
+        state.options_version += 1;
         Ok(true)
     }
 
     async fn replace(&self, client_options: ClientOptions, project_config: ProjectConfig) {
         let options = Arc::new(project_config.merged_options(&client_options));
-        *self.state.write().await = RuntimeConfigState {
+        let mut state = self.state.write().await;
+        let next_version = state.options_version + 1;
+        *state = RuntimeConfigState {
             client_options,
             project_config,
             options,
+            options_version: next_version,
         };
     }
 }

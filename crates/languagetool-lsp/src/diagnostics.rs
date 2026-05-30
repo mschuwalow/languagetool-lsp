@@ -1,6 +1,6 @@
 use crate::config::ClientOptions;
 use crate::languagetool::LanguageToolMatch;
-use crate::text_index::Utf16Range;
+use crate::text_index::{ByteRange, Utf16Range};
 use serde::{Deserialize, Serialize};
 use tower_lsp_server::ls_types::{
     CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Range, Uri,
@@ -16,14 +16,39 @@ pub struct DiagnosticData {
     pub issue_type: Option<String>,
     pub replacements: Vec<String>,
     pub matched_text: String,
-    #[serde(default)]
-    pub document_version: Option<i32>,
+    pub document_version: i32,
+}
+
+/// A diagnostic before it enters the cache, and while it lives in the cache.
+///
+/// `diagnostic` holds all fields except `data` (its `data` field is `None`).
+/// `data` is kept in deserialized form so it can be cheaply updated on edits
+/// and serialized exactly once at publish time via [`RawDiagnostic::finalize`].
+#[derive(Debug, Clone)]
+pub struct RawDiagnostic {
+    pub doc_byte_range: ByteRange,
+    pub diagnostic: Diagnostic,
+    pub data: DiagnosticData,
+}
+
+impl RawDiagnostic {
+    /// Serialize `data` into `diagnostic.data` and return the publishable [`Diagnostic`].
+    pub fn finalize(&self) -> Diagnostic {
+        let mut diagnostic = self.diagnostic.clone();
+        diagnostic.data = serde_json::to_value(&self.data).ok();
+        diagnostic
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckedBlock {
+    pub byte_range: ByteRange,
+    pub diagnostics: Vec<RawDiagnostic>,
 }
 
 pub fn make_lsp_diagnostic_for_range(
     range: Range,
     item: &LanguageToolMatch,
-    data: DiagnosticData,
     options: &ClientOptions,
 ) -> Diagnostic {
     let rule_id = item.rule.as_ref().map(|rule| rule.id.as_str());
@@ -36,7 +61,7 @@ pub fn make_lsp_diagnostic_for_range(
         message: item.message.clone(),
         related_information: None,
         tags: None,
-        data: serde_json::to_value(data).ok(),
+        data: None,
     }
 }
 
@@ -44,7 +69,7 @@ pub fn diagnostic_data_for_text(
     matched_text: String,
     item: &LanguageToolMatch,
     options: &ClientOptions,
-    document_version: Option<i32>,
+    document_version: i32,
 ) -> DiagnosticData {
     let rule = item.rule.as_deref();
     let category_id = rule.and_then(|rule| rule.category.id.clone());
@@ -103,10 +128,13 @@ pub fn is_spelling_rule(rule_id: &str) -> bool {
 }
 
 pub fn parse_diagnostic_data(diagnostic: &Diagnostic) -> Option<DiagnosticData> {
-    diagnostic
-        .data
-        .as_ref()
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    diagnostic.data.as_ref().and_then(|value| {
+        serde_json::from_value(value.clone())
+            .map_err(|err| {
+                log::debug!("Failed to parse diagnostic data: {err}");
+            })
+            .ok()
+    })
 }
 
 fn code_description(rule_id: &str, language: &str) -> Option<CodeDescription> {
