@@ -1,7 +1,7 @@
 use crate::config::{BackendKind, ClientOptions, ProjectConfig};
 use crate::diagnostics::{
-    diagnostic_data_for_text, make_lsp_diagnostic_for_range, match_utf16_range,
-    parse_diagnostic_data, RawDiagnostic, SOURCE,
+    RawDiagnostic, SOURCE, diagnostic_data_for_text, make_lsp_diagnostic_for_range,
+    match_utf16_range, parse_diagnostic_data,
 };
 use crate::document_cache::{CheckedBlock, DocumentCache, DocumentToken, PreparedCheck};
 use crate::languagetool::{

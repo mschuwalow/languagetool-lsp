@@ -3,7 +3,7 @@ mod comment_blocks;
 use crate::language::SupportedLanguage;
 use crate::languagetool::{AnnotatedText, Annotation};
 use crate::text_index::{BytePosition, ByteRange};
-use comment_blocks::{merge_comment_blocks, CommentBlock};
+use comment_blocks::{CommentBlock, merge_comment_blocks};
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 use tree_sitter_md::{MarkdownParser, MarkdownTree};
 
@@ -535,11 +535,11 @@ fn merge_ranges(ranges: &mut [Range]) -> Vec<Range> {
         .copied()
         .filter(|range| range.start < range.end)
     {
-        if let Some(last) = merged.last_mut() {
-            if range.start <= last.end {
-                last.end = last.end.max(range.end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
         }
         merged.push(range);
     }

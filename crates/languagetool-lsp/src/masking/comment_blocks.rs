@@ -1,4 +1,4 @@
-use super::{push_annotation_markup, push_annotation_text, CheckBlock};
+use super::{CheckBlock, push_annotation_markup, push_annotation_text};
 use crate::languagetool::{AnnotatedText, Annotation};
 use crate::text_index::ByteRange;
 

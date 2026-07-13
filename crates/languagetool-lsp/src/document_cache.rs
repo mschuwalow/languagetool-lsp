@@ -2,8 +2,8 @@ pub use crate::diagnostics::CheckedBlock;
 use crate::document::Document;
 pub use crate::document::PreparedCheck;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
     Diagnostic, Range, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
@@ -337,10 +337,12 @@ mod tests {
         cache.apply_change(&uri, 2, full_change("second")).await;
 
         assert_eq!(cache.token(&uri).await.unwrap().generation(), 0);
-        assert!(cache
-            .prepare_check_if_current(&uri, scheduled, 0)
-            .await
-            .is_none());
+        assert!(
+            cache
+                .prepare_check_if_current(&uri, scheduled, 0)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

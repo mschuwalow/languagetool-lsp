@@ -1,7 +1,7 @@
 [package]
 name = "languagetool-lsp"
 version = "0.2.2"
-edition = "2021"
+edition = "2024"
 authors = ["Maxim Schuwalow"]
 description = "LanguageTool language server for editors."
 license = "MIT"

@@ -1,10 +1,10 @@
 use httpmock::prelude::*;
 use languagetool_lsp::lsp::Backend;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::{duplex, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
 use tower_lsp_server::ls_types::Uri;
 use tower_lsp_server::{LspService, Server};
 
@@ -71,30 +71,28 @@ impl TestContext {
         });
         merge_json(&mut initialization_options, extra_options);
 
-        let response = self
-            .request(
-                "initialize",
-                json!({
-                    "capabilities": {
-                        "textDocument": {
-                            "codeAction": {
-                                "codeActionLiteralSupport": {
-                                    "codeActionKind": { "valueSet": ["quickfix"] }
-                                },
-                                "dataSupport": true
+        self.request(
+            "initialize",
+            json!({
+                "capabilities": {
+                    "textDocument": {
+                        "codeAction": {
+                            "codeActionLiteralSupport": {
+                                "codeActionKind": { "valueSet": ["quickfix"] }
                             },
-                            "publishDiagnostics": { "versionSupport": true }
+                            "dataSupport": true
                         },
-                        "workspace": { "executeCommand": { "dynamicRegistration": false } }
+                        "publishDiagnostics": { "versionSupport": true }
                     },
-                    "processId": null,
-                    "rootUri": root_uri,
-                    "workspaceFolders": [{ "name": "test", "uri": root_uri }],
-                    "initializationOptions": initialization_options
-                }),
-            )
-            .await;
-        response
+                    "workspace": { "executeCommand": { "dynamicRegistration": false } }
+                },
+                "processId": null,
+                "rootUri": root_uri,
+                "workspaceFolders": [{ "name": "test", "uri": root_uri }],
+                "initializationOptions": initialization_options
+            }),
+        )
+        .await
     }
 
     async fn open_document(&mut self, uri: &Uri, language_id: &str, text: &str) {
@@ -835,11 +833,12 @@ async fn partial_configuration_change_preserves_existing_options() {
 
     assert_eq!(result, Value::Null);
     assert!(!ctx.project_config_path().exists());
-    assert!(ctx
-        .workspace
-        .path()
-        .join(".idea/languagetool.json")
-        .exists());
+    assert!(
+        ctx.workspace
+            .path()
+            .join(".idea/languagetool.json")
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -867,11 +866,12 @@ async fn invalid_configuration_change_keeps_previous_options() {
 
     assert_eq!(result, Value::Null);
     assert!(!ctx.project_config_path().exists());
-    assert!(ctx
-        .workspace
-        .path()
-        .join(".idea/languagetool.json")
-        .exists());
+    assert!(
+        ctx.workspace
+            .path()
+            .join(".idea/languagetool.json")
+            .exists()
+    );
 }
 
 #[tokio::test]

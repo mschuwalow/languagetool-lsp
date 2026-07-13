@@ -76,10 +76,10 @@ impl DocumentLanguage {
     }
 
     pub fn from_lsp_or_uri(language_id: Option<&str>, uri: &Uri) -> Self {
-        if let Some(language_id) = language_id.filter(|value| !value.trim().is_empty()) {
-            if let Some(language) = SupportedLanguage::from_language_id(language_id) {
-                return Self::Supported(language);
-            }
+        if let Some(language_id) = language_id.filter(|value| !value.trim().is_empty())
+            && let Some(language) = SupportedLanguage::from_language_id(language_id)
+        {
+            return Self::Supported(language);
         }
 
         uri.to_file_path()

@@ -97,34 +97,17 @@ pub fn match_utf16_range(item: &LanguageToolMatch) -> Option<Utf16Range> {
 }
 
 pub fn severity_for(item: &LanguageToolMatch, options: &ClientOptions) -> DiagnosticSeverity {
-    if !options.diagnostic_severity_auto {
-        return options.configured_severity();
-    }
+    let default_severity = options.default_diagnostic_severity.as_lsp();
 
-    let Some(rule) = item.rule.as_deref() else {
-        return options.configured_severity();
+    let Some(category_id) = item.rule.as_ref().and_then(|r| r.category.id.clone()) else {
+        return default_severity;
     };
 
-    if is_spelling_rule(&rule.id) {
-        return DiagnosticSeverity::WARNING;
-    }
-
-    match rule.category.id.as_deref() {
-        Some("GRAMMAR" | "PUNCTUATION" | "TYPOGRAPHY") => DiagnosticSeverity::WARNING,
-        _ => options.configured_severity(),
-    }
-}
-
-pub fn is_spelling_rule(rule_id: &str) -> bool {
-    [
-        "MORFOLOGIK_RULE",
-        "SPELLER_RULE",
-        "HUNSPELL_NO_SUGGEST_RULE",
-        "HUNSPELL_RULE",
-        "FR_SPELLING_RULE",
-    ]
-    .iter()
-    .any(|marker| rule_id.contains(marker))
+    options
+        .diagnostic_severity_overrides
+        .get(&category_id)
+        .map(|s| s.as_lsp())
+        .unwrap_or(default_severity)
 }
 
 pub fn parse_diagnostic_data(diagnostic: &Diagnostic) -> Option<DiagnosticData> {
@@ -178,18 +161,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_spelling_rules() {
-        assert!(is_spelling_rule("MORFOLOGIK_RULE_EN_US"));
-        assert!(is_spelling_rule("HUNSPELL_RULE"));
-        assert!(!is_spelling_rule("THIS_NNS"));
-    }
-
-    #[test]
-    fn maps_grammar_to_warning() {
+    fn maps_grammar_to_hint() {
         let options = ClientOptions::default();
         assert_eq!(
             severity_for(&lt_match("THIS_NNS", "GRAMMAR"), &options),
-            DiagnosticSeverity::WARNING
+            DiagnosticSeverity::HINT
         );
     }
 }

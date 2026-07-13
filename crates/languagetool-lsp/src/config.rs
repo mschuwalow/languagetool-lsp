@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tower_lsp_server::ls_types::DiagnosticSeverity;
@@ -42,8 +42,8 @@ impl BackendKind {
 pub enum DiagnosticSeverityConfig {
     Error,
     Warning,
-    #[default]
     Information,
+    #[default]
     Hint,
 }
 
@@ -94,8 +94,8 @@ pub struct ClientOptions {
     pub check_on_save: bool,
     pub check_while_typing: bool,
     pub debounce_ms: u64,
-    pub diagnostic_severity: DiagnosticSeverityConfig,
-    pub diagnostic_severity_auto: bool,
+    pub default_diagnostic_severity: DiagnosticSeverityConfig,
+    pub diagnostic_severity_overrides: HashMap<String, DiagnosticSeverityConfig>,
     pub max_replacements: usize,
     pub ignored_words: Vec<String>,
     pub project_config_path: String,
@@ -120,8 +120,8 @@ impl Default for ClientOptions {
             check_on_save: true,
             check_while_typing: true,
             debounce_ms: 750,
-            diagnostic_severity: DiagnosticSeverityConfig::Information,
-            diagnostic_severity_auto: true,
+            default_diagnostic_severity: DiagnosticSeverityConfig::Hint,
+            diagnostic_severity_overrides: HashMap::new(),
             max_replacements: 8,
             ignored_words: Vec::new(),
             project_config_path: default_project_config_path(),
@@ -177,10 +177,6 @@ impl ClientOptions {
 
     pub fn project_config_display_path(&self) -> String {
         self.project_config_path.trim().to_string()
-    }
-
-    pub fn configured_severity(&self) -> DiagnosticSeverity {
-        self.diagnostic_severity.as_lsp()
     }
 
     pub fn is_ignored_word(&self, word: &str) -> bool {
@@ -342,7 +338,7 @@ mod tests {
             "level": "picky",
             "checkOnSave": false,
             "projectConfigPath": ".config/languagetool/project.json",
-            "diagnosticSeverity": "warning"
+            "defaultDiagnosticSeverity": "warning"
         })));
         assert_eq!(options.backend, BackendKind::Cloud);
         assert_eq!(options.custom_backend_url, default_custom_url());
@@ -356,7 +352,26 @@ mod tests {
             options.project_config_path,
             ".config/languagetool/project.json"
         );
-        assert_eq!(options.configured_severity(), DiagnosticSeverity::WARNING);
+        assert_eq!(
+            options.default_diagnostic_severity,
+            DiagnosticSeverityConfig::Warning
+        );
+    }
+
+    #[test]
+    fn parses_diagnostic_severity_overrides() {
+        let options = ClientOptions::from_value(Some(serde_json::json!({
+            "diagnosticSeverityOverrides": {
+                "MORFOLOGIK_RULE": "warning"
+            }
+        })));
+        assert_eq!(
+            options.diagnostic_severity_overrides,
+            HashMap::from([(
+                "MORFOLOGIK_RULE".to_string(),
+                DiagnosticSeverityConfig::Warning
+            )])
+        );
     }
 
     #[test]
