@@ -29,6 +29,8 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          cmd-format: nix develop -c {0}
 
       - name: Run CI checks
         run: nix develop -c cargo make ci
@@ -99,22 +101,31 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: languagetool-lsp-x86_64-unknown-linux-musl.tar.gz
+            toolchain: nix
           - os: macos-latest
             target: x86_64-apple-darwin
             asset: languagetool-lsp-x86_64-apple-darwin.tar.gz
+            toolchain: nix
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: languagetool-lsp-aarch64-apple-darwin.tar.gz
+            toolchain: nix
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: languagetool-lsp-x86_64-pc-windows-msvc.zip
+            toolchain: rustup
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.create-release.outputs.tag }}
 
-      - name: Setup Rust
+      - name: Install Nix
+        if: matrix.toolchain == 'nix'
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Rust (rustup)
+        if: matrix.toolchain == 'rustup'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -123,8 +134,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          cmd-format: ${{ matrix.toolchain == 'nix' && 'nix develop -c {0}' || '{0}' }}
 
-      - name: Setup Python
+      - name: Setup Python (rustup)
+        if: matrix.toolchain == 'rustup'
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -133,10 +146,42 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Build binary
+      - name: Build binary (nix)
+        if: matrix.toolchain == 'nix'
+        run: nix develop -c cargo build -p languagetool-lsp --release --target ${{ matrix.target }}
+
+      - name: Build binary (rustup)
+        if: matrix.toolchain == 'rustup'
         run: cargo build -p languagetool-lsp --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Package binary (nix)
+        if: matrix.toolchain == 'nix'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          nix develop -c python <<'PY'
+          import os
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          target = os.environ["TARGET"]
+          asset = os.environ["ASSET"]
+          binary_name = "languagetool-lsp.exe" if "windows" in target else "languagetool-lsp"
+          binary = Path("target") / target / "release" / binary_name
+
+          if asset.endswith(".zip"):
+              with zipfile.ZipFile(asset, "w", zipfile.ZIP_DEFLATED) as archive:
+                  archive.write(binary, binary_name)
+          else:
+              with tarfile.open(asset, "w:gz") as archive:
+                  archive.add(binary, arcname=binary_name)
+          PY
+
+      - name: Package binary (rustup)
+        if: matrix.toolchain == 'rustup'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}

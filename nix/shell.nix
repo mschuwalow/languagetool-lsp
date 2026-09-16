@@ -4,6 +4,7 @@
   cargo-make,
   cargo-release,
   nodejs,
+  python3,
 }:
 
 let
@@ -14,6 +15,14 @@ let
       "clippy"
       "rust-analyzer"
     ];
+    # Extra std libs needed to cross-build release binaries for macOS
+    # targets from either macOS host arch, and for the musl release
+    # target, while still linking via the runner's own system toolchain.
+    targets = [
+      "x86_64-unknown-linux-musl"
+      "x86_64-apple-darwin"
+      "aarch64-apple-darwin"
+    ];
   };
 in
 
@@ -23,5 +32,6 @@ mkShell {
     cargo-make
     cargo-release
     nodejs
+    python3
   ];
 }
