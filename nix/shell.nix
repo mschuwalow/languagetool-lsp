@@ -39,8 +39,11 @@ mkShell (
       cargo-release
       nodejs
       python3
-      openssl
     ] ++ lib.optionals stdenv.hostPlatform.isLinux [ musl-cc ];
+
+    buildInputs = [
+      openssl
+    ];
   }
   // lib.optionalAttrs stdenv.hostPlatform.isLinux {
     CC_x86_64_unknown_linux_musl = "${musl-cc}/bin/${musl-cc.targetPrefix}cc";

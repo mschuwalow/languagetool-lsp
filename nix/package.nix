@@ -2,6 +2,7 @@
   lib,
   makeRustPlatform,
   rust-bin,
+  openssl
 }:
 
 let
@@ -20,6 +21,10 @@ rustPlatform.buildRustPackage {
     root = ../.;
     fileset = lib.fileset.gitTracked ../.;
   };
+
+  buildInputs = [
+    openssl
+  ];
 
   cargoLock.lockFile = ../Cargo.lock;
 
