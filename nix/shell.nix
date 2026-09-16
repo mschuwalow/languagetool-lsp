@@ -8,7 +8,8 @@
   cargo-release,
   nodejs,
   python3,
-  openssl
+  openssl,
+  pkg-config
 }:
 
 let
@@ -39,6 +40,7 @@ mkShell (
       cargo-release
       nodejs
       python3
+      pkg-config
     ] ++ lib.optionals stdenv.hostPlatform.isLinux [ musl-cc ];
 
     buildInputs = [

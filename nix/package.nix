@@ -2,7 +2,8 @@
   lib,
   makeRustPlatform,
   rust-bin,
-  openssl
+  openssl,
+  pkg-config
 }:
 
 let
@@ -21,6 +22,10 @@ rustPlatform.buildRustPackage {
     root = ../.;
     fileset = lib.fileset.gitTracked ../.;
   };
+
+  nativeBuildInputs = [
+    pkg-config
+  ];
 
   buildInputs = [
     openssl
