@@ -8,6 +8,7 @@
   cargo-release,
   nodejs,
   python3,
+  openssl
 }:
 
 let
@@ -38,6 +39,7 @@ mkShell (
       cargo-release
       nodejs
       python3
+      openssl
     ] ++ lib.optionals stdenv.hostPlatform.isLinux [ musl-cc ];
   }
   // lib.optionalAttrs stdenv.hostPlatform.isLinux {
