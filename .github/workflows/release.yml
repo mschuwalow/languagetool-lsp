@@ -142,10 +142,6 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install Linux musl tools
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - name: Configure toolchain wrapper
         shell: bash
         run: |
