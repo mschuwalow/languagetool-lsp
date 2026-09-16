@@ -146,48 +146,27 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Build binary (nix)
-        if: matrix.toolchain == 'nix'
-        run: nix develop -c cargo build -p languagetool-lsp --release --target ${{ matrix.target }}
+      - name: Configure toolchain wrapper
+        shell: bash
+        run: |
+          if [ "${{ matrix.toolchain }}" = "nix" ]; then
+            printf '%s\n' '#!/usr/bin/env bash' 'exec nix develop -c "$@"' > with-toolchain.sh
+          else
+            printf '%s\n' '#!/usr/bin/env bash' 'exec "$@"' > with-toolchain.sh
+          fi
+          chmod +x with-toolchain.sh
 
-      - name: Build binary (rustup)
-        if: matrix.toolchain == 'rustup'
-        run: cargo build -p languagetool-lsp --release --target ${{ matrix.target }}
+      - name: Build binary
+        shell: bash
+        run: ./with-toolchain.sh cargo build -p languagetool-lsp --release --target ${{ matrix.target }}
 
-      - name: Package binary (nix)
-        if: matrix.toolchain == 'nix'
+      - name: Package binary
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           ASSET: ${{ matrix.asset }}
         run: |
-          nix develop -c python <<'PY'
-          import os
-          import tarfile
-          import zipfile
-          from pathlib import Path
-
-          target = os.environ["TARGET"]
-          asset = os.environ["ASSET"]
-          binary_name = "languagetool-lsp.exe" if "windows" in target else "languagetool-lsp"
-          binary = Path("target") / target / "release" / binary_name
-
-          if asset.endswith(".zip"):
-              with zipfile.ZipFile(asset, "w", zipfile.ZIP_DEFLATED) as archive:
-                  archive.write(binary, binary_name)
-          else:
-              with tarfile.open(asset, "w:gz") as archive:
-                  archive.add(binary, arcname=binary_name)
-          PY
-
-      - name: Package binary (rustup)
-        if: matrix.toolchain == 'rustup'
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-          ASSET: ${{ matrix.asset }}
-        run: |
-          python <<'PY'
+          ./with-toolchain.sh python <<'PY'
           import os
           import tarfile
           import zipfile
