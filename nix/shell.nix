@@ -2,6 +2,8 @@
   mkShell,
   rust-bin,
   cargo-make,
+  cargo-release,
+  nodejs,
 }:
 
 let
@@ -19,5 +21,7 @@ mkShell {
   nativeBuildInputs = [
     rust-toolchain
     cargo-make
+    cargo-release
+    nodejs
   ];
 }

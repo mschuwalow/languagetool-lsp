@@ -24,24 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-make
-        uses: davidB/rust-cargo-make@v1
-
       - name: Run CI checks
-        run: cargo make ci
+        run: nix develop -c cargo make ci
 
   create-release:
     name: Create GitHub Release
@@ -57,8 +47,8 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
 
       - name: Read release version
         id: version
@@ -74,9 +64,6 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
-      - name: Install cargo-release
-        run: cargo install cargo-release --locked
-
       - name: Configure Git author
         run: |
           git config user.name "github-actions[bot]"
@@ -84,7 +71,7 @@ jobs:
 
       - name: Bump versions, commit, tag, and push
         run: >-
-          cargo release "${{ steps.version.outputs.version }}"
+          nix develop -c cargo release "${{ steps.version.outputs.version }}"
           --workspace
           --execute
           --no-confirm

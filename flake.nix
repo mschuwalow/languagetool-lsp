@@ -23,6 +23,8 @@
             ];
           };
 
+          packages.default = pkgs.callPackage ./nix/package.nix { };
+
           devShells.default = pkgs.callPackage ./nix/shell.nix { };
         };
 
