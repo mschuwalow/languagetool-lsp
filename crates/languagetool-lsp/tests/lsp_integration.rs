@@ -861,18 +861,32 @@ async fn execute_command_uses_configured_project_config_path() {
 }
 
 #[tokio::test]
-async fn partial_configuration_change_preserves_existing_options() {
+async fn dropped_configuration_settings_revert_to_defaults() {
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
         "projectConfigPath": ".idea/languagetool.json"
     }))
     .await;
 
+    let uri = ctx.doc_uri("document.txt");
+    ctx.open_document(&uri, "plaintext", "hello world").await;
+    // Consume the open-triggered diagnostics notification so it isn't
+    // confused with the one triggered by the config change below.
+    ctx.wait_notification("textDocument/publishDiagnostics")
+        .await;
+
     ctx.notify(
         "workspace/didChangeConfiguration",
         json!({ "settings": { "debounceMs": 100 } }),
     )
     .await;
+    // `recheck_all` (triggered by the config change) only publishes
+    // diagnostics after installing the new backend, so waiting for this
+    // notification guarantees the swap has already happened by the time
+    // the request below is sent.
+    ctx.wait_notification("textDocument/publishDiagnostics")
+        .await;
+
     let result = ctx
         .request(
             "workspace/executeCommand",
@@ -884,13 +898,17 @@ async fn partial_configuration_change_preserves_existing_options() {
         .await;
 
     assert_eq!(result, Value::Null);
-    assert!(!ctx.project_config_path().exists());
+    // The `didChangeConfiguration` settings only mentioned `debounceMs`, so
+    // `projectConfigPath` (set at `initialize`) is *not* preserved — it
+    // reverts to the default, since settings are parsed fresh rather than
+    // merged with the previous options.
     assert!(
-        ctx.workspace
+        !ctx.workspace
             .path()
             .join(".idea/languagetool.json")
             .exists()
     );
+    assert!(ctx.project_config_path().exists());
 }
 
 #[tokio::test]

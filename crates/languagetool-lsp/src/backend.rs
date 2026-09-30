@@ -121,11 +121,13 @@ impl LanguageServerBackend {
         }
     }
 
-    /// Merges `settings` into the current [`ClientOptions`] (real clients
-    /// send `workspace/didChangeConfiguration` payloads containing only
-    /// whatever fields the user configured, not a full mirror of every
-    /// option — see [`ClientOptions::merged_with_value`]) and rebuilds
-    /// everything derived from the result via [`Self::with_new_config`].
+    /// Parses `settings` as a full replacement [`ClientOptions`] value and
+    /// rebuilds everything derived from it via [`Self::with_new_config`].
+    /// This does *not* merge with the previous options: any field the
+    /// payload doesn't mention falls back to its `#[serde(default)]`, not
+    /// whatever was set at `initialize` or by an earlier config change —
+    /// if a user drops a setting from their config, they expect the
+    /// default to take effect, not for a stale value to linger.
     /// Returns `None` for a `null` notification (nothing changed) or a
     /// value that fails to parse (reported to the client, previous options
     /// kept as-is); the caller should install and recheck against `Some`.
@@ -135,7 +137,7 @@ impl LanguageServerBackend {
             return None;
         }
 
-        let client_options = match self.client_options.merged_with_value(settings) {
+        let client_options = match ClientOptions::parse_value(settings) {
             Ok(client_options) => client_options,
             Err(err) => {
                 let message = format!(

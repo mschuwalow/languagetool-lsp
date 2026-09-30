@@ -199,28 +199,6 @@ impl ClientOptions {
         serde_json::from_value(value)
     }
 
-    /// Merges a JSON patch into these options. Real clients (e.g. Zed's
-    /// `lsp.<server>.settings`) send `workspace/didChangeConfiguration`
-    /// payloads containing only whatever fields the user actually
-    /// configured, not a full mirror of every option — so unset fields
-    /// must keep their previous value rather than resetting to defaults.
-    ///
-    /// `backend` is replaced wholesale rather than merged field-by-field:
-    /// `Custom` and `Cloud` don't share fields, so recursively merging
-    /// (e.g. switching backends without specifying `timeoutMs`) could
-    /// otherwise leak a field from the old variant into the new one.
-    pub fn merged_with_value(&self, mut value: Value) -> serde_json::Result<Self> {
-        let mut merged = serde_json::to_value(self)?;
-        let backend = value.as_object_mut().and_then(|obj| obj.remove("backend"));
-        merge_json_value(&mut merged, value);
-        if let Some(backend) = backend
-            && let Some(merged) = merged.as_object_mut()
-        {
-            merged.insert("backend".to_string(), backend);
-        }
-        Self::parse_value(merged)
-    }
-
     pub fn base_url(&self) -> String {
         match &self.backend {
             LanguageToolBackend::Custom { url, .. } => url.trim().trim_end_matches('/').to_string(),
@@ -331,22 +309,6 @@ impl ProjectConfig {
             return false;
         }
         push_unique_sorted(&mut self.disabled_categories, category_id)
-    }
-}
-
-fn merge_json_value(base: &mut Value, update: Value) {
-    match (base, update) {
-        (Value::Object(base), Value::Object(update)) => {
-            for (key, value) in update {
-                match base.get_mut(&key) {
-                    Some(base_value) => merge_json_value(base_value, value),
-                    None => {
-                        base.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base, update) => *base = update,
     }
 }
 
@@ -506,70 +468,50 @@ mod tests {
     }
 
     #[test]
-    fn merges_partial_option_updates() {
-        let options = ClientOptions {
-            backend: LanguageToolBackend::Cloud {
-                username: None,
-                api_key: None,
-                timeout_ms: default_cloud_timeout_ms(),
+    fn from_value_ignores_previous_options_dropped_settings_revert_to_default() {
+        // `workspace/didChangeConfiguration` settings are parsed as a full
+        // replacement, not merged with whatever was active before. This
+        // matters specifically when a user *drops* a setting from their
+        // config: the expectation is that it reverts to the server
+        // default, not that a stale value from an earlier config lingers.
+        let first = ClientOptions::from_value(Some(serde_json::json!({
+            "backend": {
+                "type": "custom",
+                "url": "https://old.example.test",
+                "timeoutMs": 5_000
             },
-            language: "de-DE".to_string(),
-            debounce_ms: 750,
-            check_on_save: false,
-            ..Default::default()
-        };
+            "language": "de-DE",
+            "debounceMs": 100,
+            "checkOnSave": false
+        })));
+        assert_eq!(first.language, "de-DE");
+        assert_eq!(first.debounce_ms, 100);
+        assert!(!first.check_on_save);
 
-        let options = options
-            .merged_with_value(serde_json::json!({ "debounceMs": 100 }))
-            .unwrap();
-
-        assert!(matches!(options.backend, LanguageToolBackend::Cloud { .. }));
-        assert_eq!(options.language, "de-DE");
-        assert_eq!(options.debounce_ms, 100);
-        assert!(!options.check_on_save);
-    }
-
-    #[test]
-    fn merges_backend_option_updates() {
-        let options = ClientOptions {
-            backend: LanguageToolBackend::Custom {
-                url: "https://old.example.test".to_string(),
-                timeout_ms: default_custom_timeout_ms(),
-            },
-            ..Default::default()
-        };
-
-        let options = options
-            .merged_with_value(serde_json::json!({
-                "backend": { "type": "custom", "url": "https://new.example.test" }
-            }))
-            .unwrap();
+        // A later config drops `language`/`checkOnSave`/`backend.url`
+        // entirely (e.g. the user removed those lines) and switches
+        // backends without specifying `timeoutMs`.
+        let second = ClientOptions::from_value(Some(serde_json::json!({
+            "backend": { "type": "cloud" },
+            "debounceMs": 200
+        })));
         assert_eq!(
-            options.backend,
-            LanguageToolBackend::Custom {
-                url: "https://new.example.test".to_string(),
-                timeout_ms: default_custom_timeout_ms(),
-            }
-        );
-        assert_eq!(options.base_url(), "https://new.example.test");
-
-        let options = options
-            .merged_with_value(serde_json::json!({
-                "backend": { "type": "cloud" }
-            }))
-            .unwrap();
-        // Switching backends without specifying `timeoutMs` should pick up
-        // `Cloud`'s own default, not leak `Custom`'s leftover `timeoutMs` or
-        // `url` field through a field-by-field merge.
-        assert_eq!(
-            options.backend,
+            second.backend,
             LanguageToolBackend::Cloud {
                 username: None,
                 api_key: None,
                 timeout_ms: default_cloud_timeout_ms(),
-            }
+            },
+            "switching backends without a `timeoutMs` should use `Cloud`'s \
+             own default, not `Custom`'s leftover value"
         );
-        assert_eq!(options.base_url(), default_cloud_url());
+        assert_eq!(second.debounce_ms, 200);
+        assert_eq!(
+            second.language,
+            ClientOptions::default().language,
+            "a dropped setting should revert to the default, not `first`'s value"
+        );
+        assert!(second.check_on_save);
     }
 
     #[test]
