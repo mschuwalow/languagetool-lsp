@@ -59,6 +59,18 @@ impl TestContext {
 
     async fn initialize_with_options(&mut self, extra_options: Value) -> Value {
         let root_uri = self.root_uri();
+        self.initialize_with_root(Some(root_uri), extra_options)
+            .await
+    }
+
+    /// Initializes without a workspace root, simulating a client that opened
+    /// a single file with no folder (legal per the LSP spec: `rootUri` and
+    /// `workspaceFolders` may both be `null`).
+    async fn initialize_without_workspace_folder(&mut self) -> Value {
+        self.initialize_with_root(None, json!({})).await
+    }
+
+    async fn initialize_with_root(&mut self, root_uri: Option<Uri>, extra_options: Value) -> Value {
         let mut initialization_options = json!({
             "backend": "custom",
             "customBackendUrl": "http://localhost:8081",
@@ -88,7 +100,7 @@ impl TestContext {
                 },
                 "processId": null,
                 "rootUri": root_uri,
-                "workspaceFolders": [{ "name": "test", "uri": root_uri }],
+                "workspaceFolders": root_uri.map(|uri| vec![json!({ "name": "test", "uri": uri })]),
                 "initializationOptions": initialization_options
             }),
         )
@@ -624,6 +636,25 @@ async fn initialize_workspace_root_controls_project_config_location() {
 
     assert_eq!(result, Value::Null);
     assert!(ctx.project_config_path().exists());
+}
+
+#[tokio::test]
+async fn initialize_without_workspace_folder_disables_relative_project_config() {
+    let mut ctx = TestContext::new();
+    ctx.initialize_without_workspace_folder().await;
+
+    let error = ctx
+        .request_error(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+
+    assert_eq!(error["code"], -32602);
+    assert!(!ctx.project_config_path().exists());
 }
 
 #[tokio::test]

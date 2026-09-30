@@ -166,12 +166,17 @@ impl ClientOptions {
         format!("{}/check", self.api_base_url())
     }
 
-    pub fn project_config_path(&self, root: &Path) -> PathBuf {
+    /// Resolves the configured `projectConfigPath` against the workspace
+    /// root. `root` is `None` when the client opened a single file with no
+    /// folder (legal per the LSP spec). A configured absolute path still
+    /// resolves in that case; a relative one can't be anchored anywhere, so
+    /// this returns `None`.
+    pub fn resolved_project_config_path(&self, root: Option<&Path>) -> Option<PathBuf> {
         let path = PathBuf::from(self.project_config_path.trim());
         if path.is_absolute() {
-            path
+            Some(path)
         } else {
-            root.join(path)
+            root.map(|root| root.join(path))
         }
     }
 
@@ -427,8 +432,8 @@ mod tests {
         let root = Path::new("/tmp/workspace");
         let options = ClientOptions::default();
         assert_eq!(
-            options.project_config_path(root),
-            PathBuf::from("/tmp/workspace/.zed/languagetool.json")
+            options.resolved_project_config_path(Some(root)),
+            Some(PathBuf::from("/tmp/workspace/.zed/languagetool.json"))
         );
         assert_eq!(
             options.project_config_display_path(),
@@ -440,8 +445,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            options.project_config_path(root),
-            PathBuf::from("/tmp/workspace/.idea/languagetool.json")
+            options.resolved_project_config_path(Some(root)),
+            Some(PathBuf::from("/tmp/workspace/.idea/languagetool.json"))
         );
 
         let options = ClientOptions {
@@ -449,8 +454,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            options.project_config_path(root),
-            PathBuf::from("/tmp/languagetool.json")
+            options.resolved_project_config_path(Some(root)),
+            Some(PathBuf::from("/tmp/languagetool.json"))
+        );
+    }
+
+    #[test]
+    fn resolved_project_config_path_without_root_requires_an_absolute_path() {
+        let options = ClientOptions {
+            project_config_path: ".zed/languagetool.json".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(options.resolved_project_config_path(None), None);
+
+        let options = ClientOptions {
+            project_config_path: "/tmp/languagetool.json".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            options.resolved_project_config_path(None),
+            Some(PathBuf::from("/tmp/languagetool.json"))
         );
     }
 

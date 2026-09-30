@@ -81,17 +81,25 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
             return Err(duplicate_initialize_error());
         }
 
-        let root = workspace_root(&params).unwrap_or_else(|| {
-            log::warn!("Client sent no workspace folder; using current directory as root");
-            PathBuf::from(".")
-        });
+        let root = workspace_root(&params);
+        if root.is_none() {
+            log::warn!(
+                "Client opened no workspace folder; project config will only be used if \
+                 `languagetool.projectConfigPath` is set to an absolute path"
+            );
+        }
         let client_options = ClientOptions::from_value(params.initialization_options);
-        let project_config = ProjectConfig::load(&client_options.project_config_path(&root)).await;
+        let project_config = match client_options.resolved_project_config_path(root.as_deref()) {
+            Some(path) => ProjectConfig::load(&path).await,
+            None => ProjectConfig::default(),
+        };
         let config = RuntimeConfig::new(client_options, project_config);
         let options = config.options_and_version().await.0;
         log::info!(
             "LanguageTool LSP initialized for {} using {}",
-            root.display(),
+            root.as_deref()
+                .map(|root| root.display().to_string())
+                .unwrap_or_else(|| "<no workspace folder>".to_string()),
             options.endpoint()
         );
 
@@ -103,7 +111,16 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
             LanguageToolClient::new(),
         );
 
-        let uninitialized = Arc::new(LanguageServerState::Uninitialized);
+        // `tower-lsp-server`'s own duplicate-`initialize` guard is a
+        // check-then-dispatch against an atomic flag that isn't set until
+        // our future resolves, so two `initialize` requests racing each
+        // other could both reach this point. Reload the state right before
+        // publishing (no `.await` between this load and the swap below) and
+        // use it as the compare-and-swap's expected value: `ArcSwap`
+        // compares by pointer identity, so this must be the actual `Arc`
+        // currently in `self.state`, not a freshly constructed one, or the
+        // swap could never succeed.
+        let uninitialized = self.state.load();
         let previous = self.state.compare_and_swap(
             &uninitialized,
             Arc::new(LanguageServerState::Initialized(initialized)),

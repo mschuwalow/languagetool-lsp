@@ -25,7 +25,11 @@ const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace"
 #[derive(Clone)]
 pub struct LanguageServerBackend {
     client: Client,
-    root: PathBuf,
+    /// Workspace root, resolved once from the LSP workspace folders / root
+    /// URI during `initialize`. `None` when the client opened a single
+    /// file with no folder (legal per the LSP spec: `rootUri` and
+    /// `workspaceFolders` may both be `null`).
+    root: Option<PathBuf>,
     documents: DocumentCache,
     config: RuntimeConfig,
     language_tool: LanguageToolClient,
@@ -34,7 +38,7 @@ pub struct LanguageServerBackend {
 impl LanguageServerBackend {
     pub fn new(
         client: Client,
-        root: PathBuf,
+        root: Option<PathBuf>,
         documents: DocumentCache,
         config: RuntimeConfig,
         language_tool: LanguageToolClient,
@@ -248,8 +252,10 @@ impl LanguageServerBackend {
         while tasks.join_next().await.is_some() {}
     }
 
-    async fn project_config_path(&self) -> PathBuf {
-        self.config.project_config_path(&self.root).await
+    async fn project_config_path(&self) -> Option<PathBuf> {
+        self.config
+            .resolved_project_config_path(self.root.as_deref())
+            .await
     }
 
     async fn project_config_display_path(&self) -> String {
@@ -260,7 +266,13 @@ impl LanguageServerBackend {
         &self,
         update: impl FnOnce(&mut ProjectConfig) -> bool,
     ) -> Result<bool, String> {
-        let project_config_path = self.project_config_path().await;
+        let Some(project_config_path) = self.project_config_path().await else {
+            return Err(
+                "No workspace folder is open and `projectConfigPath` is not an absolute path; \
+                 can't persist project config"
+                    .to_string(),
+            );
+        };
         let updated = self
             .config
             .update_project_config(&project_config_path, update)
@@ -453,7 +465,7 @@ impl LanguageServerBackend {
             log::info!("LanguageTool configuration changed; reloading options and project config");
             if let Err(err) = self
                 .config
-                .update_client_options(params.settings, &self.root)
+                .update_client_options(params.settings, self.root.as_deref())
                 .await
             {
                 let message = format!(

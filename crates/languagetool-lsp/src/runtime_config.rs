@@ -39,12 +39,15 @@ impl RuntimeConfig {
         (state.options.clone(), state.options_version)
     }
 
-    pub(crate) async fn project_config_path(&self, root: &Path) -> PathBuf {
+    pub(crate) async fn resolved_project_config_path(
+        &self,
+        root: Option<&Path>,
+    ) -> Option<PathBuf> {
         self.state
             .read()
             .await
             .client_options
-            .project_config_path(root)
+            .resolved_project_config_path(root)
     }
 
     pub(crate) async fn project_config_display_path(&self) -> String {
@@ -58,16 +61,19 @@ impl RuntimeConfig {
     pub(crate) async fn update_client_options(
         &self,
         settings: Value,
-        root: &Path,
+        root: Option<&Path>,
     ) -> serde_json::Result<()> {
         let mut state = self.state.write().await;
-        let old_project_config_path = state.client_options.project_config_path(root);
+        let old_project_config_path = state.client_options.resolved_project_config_path(root);
         let client_options = state.client_options.merged_with_value(settings)?;
-        let new_project_config_path = client_options.project_config_path(root);
+        let new_project_config_path = client_options.resolved_project_config_path(root);
         let project_config = if old_project_config_path == new_project_config_path {
             state.project_config.clone()
         } else {
-            ProjectConfig::load(&new_project_config_path).await
+            match &new_project_config_path {
+                Some(path) => ProjectConfig::load(path).await,
+                None => ProjectConfig::default(),
+            }
         };
 
         state.options = Arc::new(project_config.merged_options(&client_options));
