@@ -1,5 +1,5 @@
 use httpmock::prelude::*;
-use languagetool_lsp::lsp::Backend;
+use languagetool_lsp::lsp::LanguageServer;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,7 +26,7 @@ impl TestContext {
         let (request_tx, server_rx) = duplex(1024 * 1024);
         let (server_tx, response_rx) = duplex(1024 * 1024);
         let response_rx = BufReader::new(response_rx);
-        let (service, socket) = LspService::new(Backend::new);
+        let (service, socket) = LspService::new(LanguageServer::new);
         let server = tokio::spawn(Server::new(server_rx, server_tx, socket).serve(service));
 
         Self {

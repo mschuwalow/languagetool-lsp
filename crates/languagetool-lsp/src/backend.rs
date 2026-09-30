@@ -1,0 +1,886 @@
+use crate::config::{BackendKind, ClientOptions, ProjectConfig};
+use crate::diagnostics::{
+    RawDiagnostic, SOURCE, diagnostic_data_for_text, make_lsp_diagnostic_for_range,
+    match_utf16_range, parse_diagnostic_data,
+};
+use crate::document_cache::{CheckedBlock, DocumentCache, DocumentToken, PreparedCheck};
+use crate::languagetool::{
+    Annotation, LanguageToolClient, LanguageToolError, LanguageToolMatch, LanguageToolResponse,
+};
+use crate::masking::CheckBlock;
+use crate::runtime_config::RuntimeConfig;
+use crate::text_index::{ByteRange, TextIndex, Utf16Range};
+use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tower_lsp_server::Client;
+use tower_lsp_server::jsonrpc::{Error as RpcError, Result as RpcResult};
+use tower_lsp_server::ls_types::*;
+
+const COMMAND_IGNORE_WORD: &str = "languagetool.ignoreWordInWorkspace";
+const COMMAND_DISABLE_RULE: &str = "languagetool.disableRuleInWorkspace";
+const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace";
+
+#[derive(Clone)]
+pub struct LanguageServerBackend {
+    client: Client,
+    root: PathBuf,
+    documents: DocumentCache,
+    config: RuntimeConfig,
+    language_tool: LanguageToolClient,
+}
+
+impl LanguageServerBackend {
+    pub fn new(
+        client: Client,
+        root: PathBuf,
+        documents: DocumentCache,
+        config: RuntimeConfig,
+        language_tool: LanguageToolClient,
+    ) -> Self {
+        Self {
+            client,
+            root,
+            documents,
+            config,
+            language_tool,
+        }
+    }
+
+    async fn options_and_version(&self) -> (Arc<ClientOptions>, u64) {
+        self.config.options_and_version().await
+    }
+
+    async fn schedule_check(&self, uri: Uri) {
+        let Some(token) = self.documents.token(&uri).await else {
+            log::debug!(
+                "Skipping check schedule for {uri}: document not cached",
+                uri = uri.as_str()
+            );
+            return;
+        };
+        let debounce = self.options_and_version().await.0.debounce_ms;
+        log::debug!(
+            "Scheduling check for {uri} token={token:?} debounce_ms={debounce}",
+            uri = uri.as_str()
+        );
+        let backend = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(debounce)).await;
+            let (options, options_version) = backend.config.options_and_version().await;
+            let prepared = backend
+                .documents
+                .prepare_check_if_current(&uri, token, options_version)
+                .await;
+            if let Some((prepared, token)) = prepared {
+                log::debug!(
+                    "Running debounced check for {uri} token={token:?}",
+                    uri = uri.as_str()
+                );
+                backend.run_prepared_check(prepared, token, options).await;
+            } else {
+                log::debug!(
+                    "Skipping stale debounced check for {uri} token={token:?}",
+                    uri = uri.as_str()
+                );
+            }
+        });
+    }
+
+    async fn check_uri_now(&self, uri: &Uri) {
+        let (options, options_version) = self.config.options_and_version().await;
+        let Some(prepared) = self.documents.prepare_check(uri, options_version).await else {
+            log::debug!(
+                "Skipping immediate check for {uri}: document not cached",
+                uri = uri.as_str()
+            );
+            return;
+        };
+        log::debug!("Running immediate check for {uri}", uri = uri.as_str());
+        let (prepared, token) = prepared;
+        self.run_prepared_check(prepared, token, options).await;
+    }
+
+    async fn clear_stale_diagnostics(&self, uri: &Uri, version: Option<i32>) {
+        log::debug!(
+            "Clearing stale diagnostics for {uri} version={version:?}",
+            uri = uri.as_str()
+        );
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), version)
+            .await;
+    }
+
+    async fn run_prepared_check(
+        &self,
+        prepared: PreparedCheck,
+        token: DocumentToken,
+        options: Arc<ClientOptions>,
+    ) {
+        match prepared {
+            PreparedCheck::Check(data) => {
+                let uri = data.uri;
+                let version = data.version;
+                let text = data.text;
+                let index = data.index;
+
+                log::debug!(
+                    "Starting check for {uri} token={token:?} version={version:?} check_blocks={}",
+                    data.blocks.len(),
+                    uri = uri.as_str()
+                );
+
+                let mut checks = tokio::task::JoinSet::new();
+                for block in data.blocks {
+                    let language_tool = self.language_tool.clone();
+                    let options = Arc::clone(&options);
+                    checks.spawn(async move {
+                        let result = language_tool
+                            .check_annotated(&block.annotated, &options)
+                            .await;
+                        (block, result)
+                    });
+                }
+
+                let mut responses = Vec::new();
+                while let Some(result) = checks.join_next().await {
+                    match result {
+                        Ok((block, Ok(response))) => {
+                            log::debug!(
+                                "LanguageTool returned {} match(es) for {} token={token:?} block={:?}",
+                                response.matches.len(),
+                                uri.as_str(),
+                                block.byte_range
+                            );
+                            responses.push((block, response));
+                        }
+                        Ok((_, Err(err))) => {
+                            self.log_check_error(options.as_ref(), err).await;
+                        }
+                        Err(err) => {
+                            let message = format!("LanguageTool check task failed: {err}");
+                            log::warn!("{message}");
+                            self.client.log_message(MessageType::WARNING, message).await;
+                        }
+                    }
+                }
+
+                responses.sort_by_key(|(block, _)| block.byte_range.start.0);
+                let checked_blocks = completed_blocks_from_responses(
+                    responses,
+                    &text,
+                    &index,
+                    version,
+                    options.as_ref(),
+                );
+                self.complete_and_publish_check(uri, version, token, checked_blocks)
+                    .await;
+            }
+            PreparedCheck::ReuseCached { uri, version } => {
+                self.complete_and_publish_check(uri, version, token, Vec::new())
+                    .await;
+            }
+            PreparedCheck::Clear { uri, version } => {
+                log::debug!(
+                    "Document {uri} is not checkable; clearing diagnostics",
+                    uri = uri.as_str()
+                );
+                self.clear_stale_diagnostics(&uri, Some(version)).await;
+            }
+        }
+    }
+
+    async fn complete_and_publish_check(
+        &self,
+        uri: Uri,
+        version: i32,
+        token: DocumentToken,
+        checked_blocks: Vec<CheckedBlock>,
+    ) {
+        let Some(diagnostics) = self
+            .documents
+            .complete_check_if_current(&uri, token, checked_blocks)
+            .await
+        else {
+            log::debug!(
+                "Discarding stale check result for {} token={:?}",
+                uri.as_str(),
+                token
+            );
+            return;
+        };
+
+        log::debug!(
+            "Publishing {} diagnostic(s) for {uri} token={token:?} version={version:?}",
+            diagnostics.len(),
+            uri = uri.as_str()
+        );
+
+        self.client
+            .publish_diagnostics(uri, diagnostics, Some(version))
+            .await;
+    }
+
+    async fn log_check_error(&self, options: &ClientOptions, err: LanguageToolError) {
+        let message = match &err {
+            LanguageToolError::Api { .. } if matches!(options.backend, BackendKind::Custom) => {
+                format!(
+                    "LanguageTool is not reachable at {}. Is the custom server running? {err}",
+                    options.endpoint()
+                )
+            }
+            _ => format!("LanguageTool check failed: {err}"),
+        };
+
+        log::warn!("{message}");
+        self.client.log_message(MessageType::WARNING, message).await;
+    }
+
+    async fn recheck_all(&self) {
+        let urls = self.documents.urls().await;
+        log::info!("Rechecking {} open document(s)", urls.len());
+        let mut tasks = tokio::task::JoinSet::new();
+        for uri in urls {
+            let backend = self.clone();
+            tasks.spawn(async move { backend.check_uri_now(&uri).await });
+        }
+        while tasks.join_next().await.is_some() {}
+    }
+
+    async fn project_config_path(&self) -> PathBuf {
+        self.config.project_config_path(&self.root).await
+    }
+
+    async fn project_config_display_path(&self) -> String {
+        self.config.project_config_display_path().await
+    }
+
+    async fn update_project_config(
+        &self,
+        update: impl FnOnce(&mut ProjectConfig) -> bool,
+    ) -> Result<bool, String> {
+        let project_config_path = self.project_config_path().await;
+        let updated = self
+            .config
+            .update_project_config(&project_config_path, update)
+            .await?;
+
+        if !updated {
+            log::debug!("Project config update made no changes");
+            return Ok(false);
+        }
+
+        log::info!(
+            "Saved LanguageTool project config to {}",
+            project_config_path.display()
+        );
+        Ok(true)
+    }
+
+    async fn add_ignored_word(&self, word: &str) -> Result<bool, String> {
+        self.update_project_config(|project_config| project_config.add_ignored_word(word))
+            .await
+    }
+
+    async fn add_disabled_rule(&self, rule_id: &str) -> Result<bool, String> {
+        self.update_project_config(|project_config| project_config.add_disabled_rule(rule_id))
+            .await
+    }
+
+    async fn add_disabled_category(&self, category_id: &str) -> Result<bool, String> {
+        self.update_project_config(|project_config| {
+            project_config.add_disabled_category(category_id)
+        })
+        .await
+    }
+
+    pub async fn log_ready(&self) {
+        let options = self.options_and_version().await.0;
+        log::info!("LanguageTool LSP ready: {}", options.endpoint());
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("LanguageTool LSP ready: {}", options.endpoint()),
+            )
+            .await;
+    }
+
+    pub async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        log::info!(
+            "Opened document {uri} language_id={} version={} bytes={}",
+            params.text_document.language_id,
+            params.text_document.version,
+            params.text_document.text.len(),
+            uri = uri.as_str()
+        );
+        self.documents.insert(&params.text_document).await;
+        if self.options_and_version().await.0.check_on_open {
+            self.check_uri_now(&uri).await;
+        } else {
+            log::debug!(
+                "Skipping open check for {uri}: check_on_open=false",
+                uri = uri.as_str()
+            );
+        }
+    }
+
+    pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        log::debug!(
+            "Received {} change(s) for {uri} version={}",
+            params.content_changes.len(),
+            params.text_document.version,
+            uri = uri.as_str()
+        );
+        self.documents
+            .apply_changes(&uri, params.text_document.version, params.content_changes)
+            .await;
+
+        if self.options_and_version().await.0.check_while_typing {
+            self.schedule_check(uri).await;
+        } else {
+            log::debug!(
+                "Skipping typing check for {uri}: check_while_typing=false",
+                uri = uri.as_str()
+            );
+        }
+    }
+
+    pub async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        log::info!("Saved document {uri}", uri = uri.as_str());
+        if self.options_and_version().await.0.check_on_save {
+            self.check_uri_now(&uri).await;
+        } else {
+            log::debug!(
+                "Skipping save check for {uri}: check_on_save=false",
+                uri = uri.as_str()
+            );
+        }
+    }
+
+    pub async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        log::info!("Closed document {}", params.text_document.uri.as_str());
+        self.documents.remove(&params.text_document.uri).await;
+        self.clear_stale_diagnostics(&params.text_document.uri, None)
+            .await;
+    }
+
+    pub async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> RpcResult<Option<CodeActionResponse>> {
+        let mut actions = Vec::new();
+        let uri = params.text_document.uri;
+        let project_config_display_path = self.project_config_display_path().await;
+        let diagnostic_count = params.context.diagnostics.len();
+        log::debug!(
+            "Building code actions for {uri} diagnostics={diagnostic_count}",
+            uri = uri.as_str()
+        );
+
+        for diagnostic in params.context.diagnostics {
+            if diagnostic.source.as_deref() != Some(SOURCE) {
+                continue;
+            }
+            let Some(data) = parse_diagnostic_data(&diagnostic) else {
+                continue;
+            };
+
+            for replacement in data.replacements {
+                if replacement.is_empty() {
+                    continue;
+                }
+                actions.push(CodeActionOrCommand::CodeAction(make_replacement_action(
+                    &uri,
+                    &diagnostic,
+                    &replacement,
+                    data.document_version,
+                )));
+            }
+
+            if !data.matched_text.trim().is_empty()
+                && !data.matched_text.chars().any(char::is_whitespace)
+            {
+                actions.push(CodeActionOrCommand::Command(make_command(
+                    format!(
+                        "Ignore '{}' in {}",
+                        data.matched_text, project_config_display_path
+                    ),
+                    COMMAND_IGNORE_WORD,
+                    data.matched_text.clone(),
+                )));
+            }
+
+            actions.push(CodeActionOrCommand::Command(make_command(
+                format!(
+                    "Disable rule '{}' in {}",
+                    data.rule_id, project_config_display_path
+                ),
+                COMMAND_DISABLE_RULE,
+                data.rule_id.clone(),
+            )));
+
+            if let Some(category_id) = data.category_id {
+                actions.push(CodeActionOrCommand::Command(make_command(
+                    format!(
+                        "Disable category '{category_id}' in {}",
+                        project_config_display_path
+                    ),
+                    COMMAND_DISABLE_CATEGORY,
+                    category_id,
+                )));
+            }
+        }
+
+        if actions.is_empty() {
+            log::debug!("No code actions available for {uri}", uri = uri.as_str());
+            Ok(None)
+        } else {
+            log::debug!(
+                "Returning {} code action(s) for {uri}",
+                actions.len(),
+                uri = uri.as_str()
+            );
+            Ok(Some(actions))
+        }
+    }
+
+    pub async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if params.settings != Value::Null {
+            log::info!("LanguageTool configuration changed; reloading options and project config");
+            if let Err(err) = self
+                .config
+                .update_client_options(params.settings, &self.root)
+                .await
+            {
+                let message = format!(
+                    "Ignoring invalid LanguageTool configuration change; keeping previous options: {err}"
+                );
+                log::error!("{message}");
+                self.client.log_message(MessageType::ERROR, message).await;
+                return;
+            }
+            self.recheck_all().await;
+        } else {
+            log::debug!("Ignoring null configuration change notification");
+        }
+    }
+
+    pub async fn execute_command(&self, params: ExecuteCommandParams) -> RpcResult<Option<Value>> {
+        log::info!("Executing command {}", params.command);
+        let first_arg = params.arguments.first().and_then(Value::as_str);
+        let updated = match (params.command.as_str(), first_arg) {
+            (COMMAND_IGNORE_WORD, Some(word)) => self.add_ignored_word(word).await,
+            (COMMAND_DISABLE_RULE, Some(rule_id)) => self.add_disabled_rule(rule_id).await,
+            (COMMAND_DISABLE_CATEGORY, Some(category_id)) => {
+                self.add_disabled_category(category_id).await
+            }
+            _ => {
+                log::warn!("Unknown or invalid command: {}", params.command);
+                Ok(false)
+            }
+        }
+        .map_err(RpcError::invalid_params)?;
+
+        if updated {
+            log::info!(
+                "Command {} updated project config; scheduling recheck",
+                params.command
+            );
+            let backend = self.clone();
+            tokio::spawn(async move {
+                backend.recheck_all().await;
+            });
+        } else {
+            log::debug!("Command {} did not change project config", params.command);
+        }
+        Ok(None)
+    }
+}
+
+struct TextSegment<'a> {
+    lt_utf16: Utf16Range,
+    doc_byte: ByteRange,
+    text: &'a str,
+}
+
+fn completed_blocks_from_responses(
+    responses: Vec<(CheckBlock, LanguageToolResponse)>,
+    text: &str,
+    index: &TextIndex,
+    version: i32,
+    options: &ClientOptions,
+) -> Vec<CheckedBlock> {
+    responses
+        .into_iter()
+        .map(|(block, response)| {
+            let diagnostics =
+                diagnostics_for_block(&block, response.matches, text, index, version, options);
+            CheckedBlock {
+                byte_range: block.byte_range,
+                diagnostics,
+            }
+        })
+        .collect()
+}
+
+fn diagnostics_for_block(
+    block: &CheckBlock,
+    matches: Vec<LanguageToolMatch>,
+    text: &str,
+    index: &TextIndex,
+    version: i32,
+    options: &ClientOptions,
+) -> Vec<RawDiagnostic> {
+    let segments = text_segments_for_block(block);
+    let diagnostics = matches
+        .iter()
+        .filter_map(|item| match_utf16_range(item).map(|range| (item, range)))
+        .filter_map(|(item, lt_range)| {
+            let doc_byte_range = map_lt_range_to_doc_bytes(&segments, lt_range)?;
+            let matched_text = text.get(doc_byte_range.start.0..doc_byte_range.end.0)?;
+            if matched_text.trim().is_empty() || options.is_ignored_word(matched_text) {
+                return None;
+            }
+
+            let utf16_start = index.utf16_offset_for_byte(doc_byte_range.start);
+            let utf16_end = index.utf16_offset_for_byte(doc_byte_range.end);
+            let range = Range {
+                start: index.position(utf16_start),
+                end: index.position(utf16_end),
+            };
+            let data = diagnostic_data_for_text(matched_text.to_string(), item, options, version);
+            Some(RawDiagnostic {
+                doc_byte_range,
+                diagnostic: make_lsp_diagnostic_for_range(range, item, options),
+                data,
+            })
+        })
+        .collect::<Vec<_>>();
+    log::debug!(
+        "Mapped LanguageTool matches to {} diagnostic(s) for block {:?}",
+        diagnostics.len(),
+        block.byte_range
+    );
+    diagnostics
+}
+
+fn text_segments_for_block(block: &CheckBlock) -> Vec<TextSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut lt_utf16_cursor = 0usize;
+    let mut doc_byte_cursor = block.byte_range.start.0;
+
+    for annotation in &block.annotated.annotation {
+        let content = annotation_content(annotation);
+        let utf16_len = content.chars().map(char::len_utf16).sum::<usize>();
+        let byte_len = content.len();
+        if let Annotation::Text { text } = annotation {
+            segments.push(TextSegment {
+                lt_utf16: Utf16Range::new(lt_utf16_cursor, lt_utf16_cursor + utf16_len),
+                doc_byte: ByteRange::new(doc_byte_cursor, doc_byte_cursor + byte_len),
+                text,
+            });
+        }
+        lt_utf16_cursor += utf16_len;
+        doc_byte_cursor += byte_len;
+    }
+
+    segments
+}
+
+fn annotation_content(annotation: &Annotation) -> &str {
+    match annotation {
+        Annotation::Text { text } => text,
+        Annotation::Markup { markup, .. } => markup,
+    }
+}
+
+fn map_lt_range_to_doc_bytes(
+    segments: &[TextSegment<'_>],
+    lt_range: Utf16Range,
+) -> Option<ByteRange> {
+    let segment = segments.iter().find(|segment| {
+        segment.lt_utf16.start <= lt_range.start && lt_range.end <= segment.lt_utf16.end
+    });
+    let Some(segment) = segment else {
+        log::debug!(
+            "Dropping LT match at utf16 {}..{}: spans markup boundary",
+            lt_range.start.0,
+            lt_range.end.0
+        );
+        return None;
+    };
+    let relative_start = lt_range.start.0 - segment.lt_utf16.start.0;
+    let relative_end = lt_range.end.0 - segment.lt_utf16.start.0;
+    let byte_start =
+        segment.doc_byte.start.0 + byte_offset_for_utf16_in_text(segment.text, relative_start)?;
+    let byte_end =
+        segment.doc_byte.start.0 + byte_offset_for_utf16_in_text(segment.text, relative_end)?;
+    Some(ByteRange::new(byte_start, byte_end))
+}
+
+fn byte_offset_for_utf16_in_text(text: &str, target: usize) -> Option<usize> {
+    let mut utf16 = 0usize;
+    for (byte, ch) in text.char_indices() {
+        if utf16 == target {
+            return Some(byte);
+        }
+        utf16 += ch.len_utf16();
+        if utf16 == target {
+            return Some(byte + ch.len_utf8());
+        }
+        if utf16 > target {
+            return None;
+        }
+    }
+    (utf16 == target).then_some(text.len())
+}
+
+fn make_replacement_action(
+    uri: &Uri,
+    diagnostic: &Diagnostic,
+    replacement: &str,
+    document_version: i32,
+) -> CodeAction {
+    let edit = TextEdit {
+        range: diagnostic.range,
+        new_text: replacement.to_string(),
+    };
+
+    CodeAction {
+        title: format!("Replace with '{replacement}'"),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic.clone()]),
+        edit: Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: Some(document_version),
+                },
+                edits: vec![OneOf::Left(edit)],
+            }])),
+            change_annotations: None,
+        }),
+        command: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    }
+}
+
+fn make_command(title: String, command: &str, argument: String) -> Command {
+    Command {
+        title,
+        command: command.to_string(),
+        arguments: Some(vec![Value::String(argument)]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{Document, PreparedCheck};
+    use crate::languagetool::{
+        LanguageToolCategory, LanguageToolMatch, LanguageToolReplacement, LanguageToolRule,
+    };
+
+    struct TestRequest {
+        block: CheckBlock,
+        text: Arc<String>,
+        index: Arc<TextIndex>,
+    }
+
+    fn prepare_test_request(mut document: Document) -> TestRequest {
+        let PreparedCheck::Check(prepared) = document.prepare_check(0) else {
+            panic!("document should be checkable");
+        };
+        let block = prepared
+            .blocks
+            .into_iter()
+            .next()
+            .expect("document should have a check block");
+        TestRequest {
+            block,
+            text: prepared.text,
+            index: prepared.index,
+        }
+    }
+    #[test]
+    fn builds_diagnostics_for_document() {
+        let document = Document::new(
+            "file:///tmp/test.txt".parse::<Uri>().unwrap(),
+            1,
+            Some("plaintext".to_string()),
+            "This are a tset.".to_string(),
+        );
+        let options = ClientOptions::default();
+        let request = prepare_test_request(document);
+        let item = LanguageToolMatch {
+            message: "Possible spelling mistake found.".to_string(),
+            short_message: None,
+            offset: 11,
+            length: 4,
+            replacements: vec![LanguageToolReplacement {
+                value: Some("test".to_string()),
+            }],
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
+                id: "MORFOLOGIK_RULE_EN_US".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
+                issue_type: Some("misspelling".to_string()),
+                category: Box::new(LanguageToolCategory {
+                    id: Some("TYPOS".to_string()),
+                    name: None,
+                }),
+            })),
+        };
+
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 11));
+        assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 15));
+    }
+
+    #[test]
+    fn diagnostics_use_original_document_offsets() {
+        let document = Document::new(
+            "file:///tmp/test.rs".parse::<Uri>().unwrap(),
+            1,
+            Some("rust".to_string()),
+            "let value = 1; // This are a comment.".to_string(),
+        );
+        let options = ClientOptions::default();
+        let request = prepare_test_request(document);
+        let item = LanguageToolMatch {
+            message: "The singular demonstrative pronoun does not agree.".to_string(),
+            short_message: None,
+            offset: 3,
+            length: 4,
+            replacements: Vec::new(),
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
+                id: "THIS_NNS".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
+                issue_type: None,
+                category: Box::new(LanguageToolCategory::new()),
+            })),
+        };
+
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 18));
+        assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 22));
+    }
+
+    #[test]
+    fn diagnostics_drop_matches_in_markup_regions() {
+        let document = Document::new(
+            "file:///tmp/test.rs".parse::<Uri>().unwrap(),
+            1,
+            Some("rust".to_string()),
+            "let typoo = 1; // This are a comment.".to_string(),
+        );
+        let options = ClientOptions::default();
+        let request = prepare_test_request(document);
+        let item = LanguageToolMatch {
+            message: "Possible spelling mistake found.".to_string(),
+            short_message: None,
+            offset: 0,
+            length: 2,
+            replacements: Vec::new(),
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
+                id: "MORFOLOGIK_RULE_EN_US".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
+                issue_type: Some("misspelling".to_string()),
+                category: Box::new(LanguageToolCategory {
+                    id: Some("TYPOS".to_string()),
+                    name: None,
+                }),
+            })),
+        };
+
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_use_languagetool_utf16_offsets() {
+        let document = Document::new(
+            "file:///tmp/test.txt".parse::<Uri>().unwrap(),
+            1,
+            Some("plaintext".to_string()),
+            "😀 This are a tset.".to_string(),
+        );
+        let options = ClientOptions::default();
+        let request = prepare_test_request(document);
+        let item = LanguageToolMatch {
+            message: "The verb 'are' is plural.".to_string(),
+            short_message: None,
+            offset: 3,
+            length: 8,
+            replacements: Vec::new(),
+            context: Box::default(),
+            sentence: String::new(),
+            rule: Some(Box::new(LanguageToolRule {
+                id: "PLURAL_VERB_AFTER_THIS".to_string(),
+                sub_id: None,
+                description: String::new(),
+                urls: None,
+                issue_type: Some("grammar".to_string()),
+                category: Box::new(LanguageToolCategory {
+                    id: Some("GRAMMAR".to_string()),
+                    name: None,
+                }),
+            })),
+        };
+
+        let diagnostics = diagnostics_for_block(
+            &request.block,
+            vec![item],
+            &request.text,
+            &request.index,
+            1,
+            &options,
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic.range.start, Position::new(0, 3));
+        assert_eq!(diagnostics[0].diagnostic.range.end, Position::new(0, 11));
+
+        assert_eq!(diagnostics[0].data.matched_text, "This are");
+    }
+}
