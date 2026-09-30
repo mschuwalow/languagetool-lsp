@@ -449,6 +449,28 @@ fn merge_json(base: &mut Value, patch: Value) {
 }
 
 #[tokio::test]
+async fn duplicate_initialize_request_is_rejected() {
+    let mut ctx = TestContext::new();
+    ctx.initialize().await;
+
+    // Per the LSP spec, `initialize` may only be sent once; a second
+    // request should be rejected rather than silently re-initializing.
+    let error = ctx
+        .request_error(
+            "initialize",
+            json!({
+                "capabilities": {},
+                "processId": null,
+                "rootUri": ctx.root_uri(),
+                "workspaceFolders": [{ "name": "test", "uri": ctx.root_uri() }],
+            }),
+        )
+        .await;
+
+    assert_eq!(error["code"], json!(-32600), "expected InvalidRequest");
+}
+
+#[tokio::test]
 async fn initialize_reports_expected_capabilities() {
     let mut ctx = TestContext::new();
 

@@ -15,14 +15,12 @@ struct RuntimeConfigState {
     project_config: ProjectConfig,
     options: Arc<ClientOptions>,
     /// Monotonically incremented every time `options` changes. Used as a cheap
-    /// cache-invalidation key instead of serializing `ClientOptions` to JSON.
+    /// cache-invalidation key.
     options_version: u64,
 }
 
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        let client_options = ClientOptions::default();
-        let project_config = ProjectConfig::default();
+impl RuntimeConfig {
+    pub(crate) fn new(client_options: ClientOptions, project_config: ProjectConfig) -> Self {
         let options = Arc::new(project_config.merged_options(&client_options));
         Self {
             state: Arc::new(RwLock::new(RuntimeConfigState {
@@ -33,9 +31,7 @@ impl Default for RuntimeConfig {
             })),
         }
     }
-}
 
-impl RuntimeConfig {
     /// Returns the current options and their version counter in a single lock
     /// acquisition, guaranteeing the two values are always consistent.
     pub(crate) async fn options_and_version(&self) -> (Arc<ClientOptions>, u64) {
@@ -57,11 +53,6 @@ impl RuntimeConfig {
             .await
             .client_options
             .project_config_display_path()
-    }
-
-    pub(crate) async fn set_client_options(&self, client_options: ClientOptions, root: &Path) {
-        let project_config = ProjectConfig::load(&client_options.project_config_path(root)).await;
-        self.replace(client_options, project_config).await;
     }
 
     pub(crate) async fn update_client_options(
@@ -107,18 +98,5 @@ impl RuntimeConfig {
         state.project_config = next_config;
         state.options_version += 1;
         Ok(true)
-    }
-
-    async fn replace(&self, client_options: ClientOptions, project_config: ProjectConfig) {
-        let options = Arc::new(project_config.merged_options(&client_options));
-        let mut state = self.state.write().await;
-        // Preserve the current version — `replace` is only called from
-        // `set_client_options` (initialization), not from a user-driven change.
-        *state = RuntimeConfigState {
-            client_options,
-            project_config,
-            options,
-            options_version: state.options_version,
-        };
     }
 }
