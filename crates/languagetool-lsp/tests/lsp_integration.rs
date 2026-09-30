@@ -72,8 +72,7 @@ impl TestContext {
 
     async fn initialize_with_root(&mut self, root_uri: Option<Uri>, extra_options: Value) -> Value {
         let mut initialization_options = json!({
-            "backend": "custom",
-            "customBackendUrl": "http://localhost:8081",
+            "backend": { "type": "custom", "url": "http://localhost:8081" },
             "language": "en-US",
             "checkOnOpen": true,
             "checkOnSave": true,
@@ -706,8 +705,7 @@ async fn check_failure_clears_stale_diagnostics() {
     });
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
-        "backend": "custom",
-        "customBackendUrl": server.base_url()
+        "backend": { "type": "custom", "url": server.base_url() }
     }))
     .await;
     let uri = ctx.doc_uri("document.txt");
@@ -723,8 +721,10 @@ async fn check_failure_clears_stale_diagnostics() {
         "workspace/didChangeConfiguration",
         json!({
             "settings": {
-                "backend": "custom",
-                "customBackendUrl": format!("{}/missing", server.base_url()),
+                "backend": {
+                    "type": "custom",
+                    "url": format!("{}/missing", server.base_url())
+                },
                 "language": "en-US",
                 "checkOnOpen": true,
                 "checkOnSave": true,
@@ -769,8 +769,7 @@ async fn cached_block_diagnostics_are_republished_without_rechecking() {
     });
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
-        "backend": "custom",
-        "customBackendUrl": server.base_url(),
+        "backend": { "type": "custom", "url": server.base_url() },
         "checkWhileTyping": false,
         "checkOnSave": true
     }))

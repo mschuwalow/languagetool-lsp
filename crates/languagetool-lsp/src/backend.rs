@@ -1,4 +1,4 @@
-use crate::config::{BackendKind, ClientOptions, ProjectConfig};
+use crate::config::{ClientOptions, LanguageToolBackend, ProjectConfig};
 use crate::diagnostics::{
     RawDiagnostic, SOURCE, diagnostic_data_for_text, make_lsp_diagnostic_for_range,
     match_utf16_range, parse_diagnostic_data,
@@ -8,10 +8,9 @@ use crate::languagetool::{
     Annotation, LanguageToolClient, LanguageToolError, LanguageToolMatch, LanguageToolResponse,
 };
 use crate::masking::CheckBlock;
-use crate::runtime_config::RuntimeConfig;
 use crate::text_index::{ByteRange, TextIndex, Utf16Range};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_lsp_server::Client;
@@ -22,6 +21,15 @@ const COMMAND_IGNORE_WORD: &str = "languagetool.ignoreWordInWorkspace";
 const COMMAND_DISABLE_RULE: &str = "languagetool.disableRuleInWorkspace";
 const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace";
 
+/// Everything the server knows once `initialize` (or the most recent
+/// `workspace/didChangeConfiguration` / config-mutating `executeCommand`)
+/// has resolved workspace root, client options, project config, and the
+/// merged effective options. This is treated as an immutable snapshot:
+/// there's no interior mutability here (unlike `documents`, which really is
+/// live shared state). A configuration change produces a *new*
+/// `LanguageServerBackend` (see [`LanguageServerBackend::with_new_config`])
+/// rather than mutating this one in place — see that method's docs for the
+/// resulting trade-off with in-flight debounced checks.
 #[derive(Clone)]
 pub struct LanguageServerBackend {
     client: Client,
@@ -31,29 +39,116 @@ pub struct LanguageServerBackend {
     /// `workspaceFolders` may both be `null`).
     root: Option<PathBuf>,
     documents: DocumentCache,
-    config: RuntimeConfig,
+    client_options: ClientOptions,
+    project_config: ProjectConfig,
+    /// `project_config` merged into `client_options`; the options actually
+    /// used for checks.
+    options: Arc<ClientOptions>,
+    /// Bumped every time `options` is recomputed (i.e. on every
+    /// [`LanguageServerBackend::with_new_config`] /
+    /// [`LanguageServerBackend::with_new_project_config`]), so a
+    /// document's per-block diagnostics cache can tell a check that ran
+    /// under old options apart from one that ran under the current ones.
+    options_version: u64,
     language_tool: LanguageToolClient,
 }
 
 impl LanguageServerBackend {
-    pub fn new(
-        client: Client,
-        root: Option<PathBuf>,
-        documents: DocumentCache,
-        config: RuntimeConfig,
-        language_tool: LanguageToolClient,
-    ) -> Self {
+    pub async fn new(client: Client, root: Option<PathBuf>, client_options: ClientOptions) -> Self {
+        let project_config = load_project_config(&client_options, root.as_deref()).await;
+        let options = Arc::new(project_config.merged_options(&client_options));
+        let language_tool = LanguageToolClient::new(&options.backend);
         Self {
             client,
             root,
-            documents,
-            config,
+            documents: DocumentCache::default(),
+            client_options,
+            project_config,
+            options,
+            options_version: 0,
             language_tool,
         }
     }
 
-    async fn options_and_version(&self) -> (Arc<ClientOptions>, u64) {
-        self.config.options_and_version().await
+    pub fn options(&self) -> &Arc<ClientOptions> {
+        &self.options
+    }
+
+    /// Rebuilds everything derived from client-provided configuration
+    /// (`client_options`, `project_config` reloaded if its resolved path
+    /// changed, the merged `options`, and the LanguageTool HTTP client)
+    /// while reusing the existing open-document cache — document contents
+    /// aren't part of "configuration" and don't need re-syncing with the
+    /// client.
+    ///
+    /// Note: any check already scheduled (debounced `didChange` or an
+    /// in-flight `recheck_all`) against the *previous* backend keeps using
+    /// that snapshot's options until it completes, since it holds its own
+    /// clone. The caller is expected to trigger [`Self::recheck_all`] on
+    /// the returned backend to bring every open document back in sync.
+    pub async fn with_new_config(&self, client_options: ClientOptions) -> Self {
+        let project_config = load_project_config(&client_options, self.root.as_deref()).await;
+        let options = Arc::new(project_config.merged_options(&client_options));
+        let language_tool = LanguageToolClient::new(&options.backend);
+        Self {
+            client: self.client.clone(),
+            root: self.root.clone(),
+            documents: self.documents.clone(),
+            client_options,
+            project_config,
+            options,
+            options_version: self.options_version + 1,
+            language_tool,
+        }
+    }
+
+    /// Like [`Self::with_new_config`], but for when only `project_config`
+    /// changed on disk (via a `workspace/executeCommand` that edits ignored
+    /// words / disabled rules / disabled categories). `client_options` and
+    /// the LanguageTool HTTP client are unaffected by that, so both are
+    /// reused as-is; only the merged `options` and `options_version` change.
+    fn with_new_project_config(&self, project_config: ProjectConfig) -> Self {
+        let options = Arc::new(project_config.merged_options(&self.client_options));
+        Self {
+            client: self.client.clone(),
+            root: self.root.clone(),
+            documents: self.documents.clone(),
+            client_options: self.client_options.clone(),
+            project_config,
+            options,
+            options_version: self.options_version + 1,
+            language_tool: self.language_tool.clone(),
+        }
+    }
+
+    /// Merges `settings` into the current [`ClientOptions`] (real clients
+    /// send `workspace/didChangeConfiguration` payloads containing only
+    /// whatever fields the user configured, not a full mirror of every
+    /// option — see [`ClientOptions::merged_with_value`]) and rebuilds
+    /// everything derived from the result via [`Self::with_new_config`].
+    /// Returns `None` for a `null` notification (nothing changed) or a
+    /// value that fails to parse (reported to the client, previous options
+    /// kept as-is); the caller should install and recheck against `Some`.
+    pub async fn with_new_config_from_settings(&self, settings: Value) -> Option<Self> {
+        if settings == Value::Null {
+            log::debug!("Ignoring null configuration change notification");
+            return None;
+        }
+
+        let client_options = match self.client_options.merged_with_value(settings) {
+            Ok(client_options) => client_options,
+            Err(err) => {
+                let message = format!(
+                    "Ignoring invalid LanguageTool configuration change; keeping previous options: {err}"
+                );
+                log::error!("{message}");
+                self.client.log_message(MessageType::ERROR, message).await;
+                return None;
+            }
+        };
+
+        log::info!("LanguageTool configuration changed; reloading options and project config");
+        Some(self.with_new_config(client_options).await)
     }
 
     async fn schedule_check(&self, uri: Uri) {
@@ -64,7 +159,7 @@ impl LanguageServerBackend {
             );
             return;
         };
-        let debounce = self.options_and_version().await.0.debounce_ms;
+        let debounce = self.options.debounce_ms;
         log::debug!(
             "Scheduling check for {uri} token={token:?} debounce_ms={debounce}",
             uri = uri.as_str()
@@ -72,17 +167,18 @@ impl LanguageServerBackend {
         let backend = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
-            let (options, options_version) = backend.config.options_and_version().await;
             let prepared = backend
                 .documents
-                .prepare_check_if_current(&uri, token, options_version)
+                .prepare_check_if_current(&uri, token, backend.options_version)
                 .await;
             if let Some((prepared, token)) = prepared {
                 log::debug!(
                     "Running debounced check for {uri} token={token:?}",
                     uri = uri.as_str()
                 );
-                backend.run_prepared_check(prepared, token, options).await;
+                backend
+                    .run_prepared_check(prepared, token, backend.options.clone())
+                    .await;
             } else {
                 log::debug!(
                     "Skipping stale debounced check for {uri} token={token:?}",
@@ -93,8 +189,11 @@ impl LanguageServerBackend {
     }
 
     async fn check_uri_now(&self, uri: &Uri) {
-        let (options, options_version) = self.config.options_and_version().await;
-        let Some(prepared) = self.documents.prepare_check(uri, options_version).await else {
+        let Some(prepared) = self
+            .documents
+            .prepare_check(uri, self.options_version)
+            .await
+        else {
             log::debug!(
                 "Skipping immediate check for {uri}: document not cached",
                 uri = uri.as_str()
@@ -103,7 +202,8 @@ impl LanguageServerBackend {
         };
         log::debug!("Running immediate check for {uri}", uri = uri.as_str());
         let (prepared, token) = prepared;
-        self.run_prepared_check(prepared, token, options).await;
+        self.run_prepared_check(prepared, token, self.options.clone())
+            .await;
     }
 
     async fn clear_stale_diagnostics(&self, uri: &Uri, version: Option<i32>) {
@@ -228,7 +328,9 @@ impl LanguageServerBackend {
 
     async fn log_check_error(&self, options: &ClientOptions, err: LanguageToolError) {
         let message = match &err {
-            LanguageToolError::Api { .. } if matches!(options.backend, BackendKind::Custom) => {
+            LanguageToolError::Api { .. }
+                if matches!(options.backend, LanguageToolBackend::Custom { .. }) =>
+            {
                 format!(
                     "LanguageTool is not reachable at {}. Is the custom server running? {err}",
                     options.endpoint()
@@ -241,7 +343,10 @@ impl LanguageServerBackend {
         self.client.log_message(MessageType::WARNING, message).await;
     }
 
-    async fn recheck_all(&self) {
+    /// Rechecks every open document against this backend's (current)
+    /// options. Called after a config change has been installed as the new
+    /// backend, to bring all documents back in sync.
+    pub async fn recheck_all(&self) {
         let urls = self.documents.urls().await;
         log::info!("Rechecking {} open document(s)", urls.len());
         let mut tasks = tokio::task::JoinSet::new();
@@ -252,63 +357,71 @@ impl LanguageServerBackend {
         while tasks.join_next().await.is_some() {}
     }
 
-    async fn project_config_path(&self) -> Option<PathBuf> {
-        self.config
+    fn project_config_path(&self) -> Option<PathBuf> {
+        self.client_options
             .resolved_project_config_path(self.root.as_deref())
-            .await
     }
 
-    async fn project_config_display_path(&self) -> String {
-        self.config.project_config_display_path().await
+    fn project_config_display_path(&self) -> String {
+        self.client_options.project_config_display_path()
     }
 
-    async fn update_project_config(
+    /// Applies `update` to a copy of the current project config and, if it
+    /// actually changed anything, saves the result to disk and returns it
+    /// (the caller is responsible for installing it via
+    /// [`Self::with_new_project_config`] and rechecking).
+    async fn updated_project_config(
         &self,
         update: impl FnOnce(&mut ProjectConfig) -> bool,
-    ) -> Result<bool, String> {
-        let Some(project_config_path) = self.project_config_path().await else {
+    ) -> Result<Option<ProjectConfig>, String> {
+        let Some(project_config_path) = self.project_config_path() else {
             return Err(
                 "No workspace folder is open and `projectConfigPath` is not an absolute path; \
                  can't persist project config"
                     .to_string(),
             );
         };
-        let updated = self
-            .config
-            .update_project_config(&project_config_path, update)
-            .await?;
 
-        if !updated {
+        let mut next_config = self.project_config.clone();
+        if !update(&mut next_config) {
             log::debug!("Project config update made no changes");
-            return Ok(false);
+            return Ok(None);
         }
+
+        next_config
+            .save(&project_config_path)
+            .await
+            .map_err(|err| format!("Failed to save project config: {err}"))?;
 
         log::info!(
             "Saved LanguageTool project config to {}",
             project_config_path.display()
         );
-        Ok(true)
+        Ok(Some(next_config))
     }
 
-    async fn add_ignored_word(&self, word: &str) -> Result<bool, String> {
-        self.update_project_config(|project_config| project_config.add_ignored_word(word))
+    async fn add_ignored_word(&self, word: &str) -> Result<Option<ProjectConfig>, String> {
+        self.updated_project_config(|project_config| project_config.add_ignored_word(word))
             .await
     }
 
-    async fn add_disabled_rule(&self, rule_id: &str) -> Result<bool, String> {
-        self.update_project_config(|project_config| project_config.add_disabled_rule(rule_id))
+    async fn add_disabled_rule(&self, rule_id: &str) -> Result<Option<ProjectConfig>, String> {
+        self.updated_project_config(|project_config| project_config.add_disabled_rule(rule_id))
             .await
     }
 
-    async fn add_disabled_category(&self, category_id: &str) -> Result<bool, String> {
-        self.update_project_config(|project_config| {
+    async fn add_disabled_category(
+        &self,
+        category_id: &str,
+    ) -> Result<Option<ProjectConfig>, String> {
+        self.updated_project_config(|project_config| {
             project_config.add_disabled_category(category_id)
         })
         .await
     }
 
     pub async fn log_ready(&self) {
-        let options = self.options_and_version().await.0;
+        let options = &self.options;
         log::info!("LanguageTool LSP ready: {}", options.endpoint());
         self.client
             .log_message(
@@ -328,7 +441,7 @@ impl LanguageServerBackend {
             uri = uri.as_str()
         );
         self.documents.insert(&params.text_document).await;
-        if self.options_and_version().await.0.check_on_open {
+        if self.options.check_on_open {
             self.check_uri_now(&uri).await;
         } else {
             log::debug!(
@@ -350,7 +463,7 @@ impl LanguageServerBackend {
             .apply_changes(&uri, params.text_document.version, params.content_changes)
             .await;
 
-        if self.options_and_version().await.0.check_while_typing {
+        if self.options.check_while_typing {
             self.schedule_check(uri).await;
         } else {
             log::debug!(
@@ -363,7 +476,7 @@ impl LanguageServerBackend {
     pub async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         log::info!("Saved document {uri}", uri = uri.as_str());
-        if self.options_and_version().await.0.check_on_save {
+        if self.options.check_on_save {
             self.check_uri_now(&uri).await;
         } else {
             log::debug!(
@@ -386,7 +499,7 @@ impl LanguageServerBackend {
     ) -> RpcResult<Option<CodeActionResponse>> {
         let mut actions = Vec::new();
         let uri = params.text_document.uri;
-        let project_config_display_path = self.project_config_display_path().await;
+        let project_config_display_path = self.project_config_display_path();
         let diagnostic_count = params.context.diagnostics.len();
         log::debug!(
             "Building code actions for {uri} diagnostics={diagnostic_count}",
@@ -460,31 +573,18 @@ impl LanguageServerBackend {
         }
     }
 
-    pub async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        if params.settings != Value::Null {
-            log::info!("LanguageTool configuration changed; reloading options and project config");
-            if let Err(err) = self
-                .config
-                .update_client_options(params.settings, self.root.as_deref())
-                .await
-            {
-                let message = format!(
-                    "Ignoring invalid LanguageTool configuration change; keeping previous options: {err}"
-                );
-                log::error!("{message}");
-                self.client.log_message(MessageType::ERROR, message).await;
-                return;
-            }
-            self.recheck_all().await;
-        } else {
-            log::debug!("Ignoring null configuration change notification");
-        }
-    }
-
-    pub async fn execute_command(&self, params: ExecuteCommandParams) -> RpcResult<Option<Value>> {
+    /// Applies a project-config-mutating command (ignore word / disable
+    /// rule / disable category). Returns the backend rebuilt via
+    /// [`Self::with_new_project_config`] when the project config actually
+    /// changed on disk; the caller is expected to install it and call
+    /// [`Self::recheck_all`] on it.
+    pub async fn handle_execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> RpcResult<Option<Self>> {
         log::info!("Executing command {}", params.command);
         let first_arg = params.arguments.first().and_then(Value::as_str);
-        let updated = match (params.command.as_str(), first_arg) {
+        let updated_project_config = match (params.command.as_str(), first_arg) {
             (COMMAND_IGNORE_WORD, Some(word)) => self.add_ignored_word(word).await,
             (COMMAND_DISABLE_RULE, Some(rule_id)) => self.add_disabled_rule(rule_id).await,
             (COMMAND_DISABLE_CATEGORY, Some(category_id)) => {
@@ -492,24 +592,34 @@ impl LanguageServerBackend {
             }
             _ => {
                 log::warn!("Unknown or invalid command: {}", params.command);
-                Ok(false)
+                Ok(None)
             }
         }
         .map_err(RpcError::invalid_params)?;
 
-        if updated {
-            log::info!(
-                "Command {} updated project config; scheduling recheck",
-                params.command
-            );
-            let backend = self.clone();
-            tokio::spawn(async move {
-                backend.recheck_all().await;
-            });
-        } else {
-            log::debug!("Command {} did not change project config", params.command);
+        match updated_project_config {
+            Some(project_config) => {
+                log::info!(
+                    "Command {} updated project config; scheduling recheck",
+                    params.command
+                );
+                Ok(Some(self.with_new_project_config(project_config)))
+            }
+            None => {
+                log::debug!("Command {} did not change project config", params.command);
+                Ok(None)
+            }
         }
-        Ok(None)
+    }
+}
+
+/// Loads the project config file `client_options` resolves to against
+/// `root`, or falls back to an empty one if there's no resolvable path
+/// (see [`ClientOptions::resolved_project_config_path`]).
+async fn load_project_config(client_options: &ClientOptions, root: Option<&Path>) -> ProjectConfig {
+    match client_options.resolved_project_config_path(root) {
+        Some(path) => ProjectConfig::load(&path).await,
+        None => ProjectConfig::default(),
     }
 }
 

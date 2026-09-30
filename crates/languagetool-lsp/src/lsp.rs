@@ -1,8 +1,5 @@
 use crate::backend::LanguageServerBackend;
-use crate::config::{ClientOptions, ProjectConfig};
-use crate::document_cache::DocumentCache;
-use crate::languagetool::LanguageToolClient;
-use crate::runtime_config::RuntimeConfig;
+use crate::config::ClientOptions;
 use arc_swap::ArcSwap;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -40,6 +37,13 @@ fn duplicate_initialize_error() -> RpcError {
     RpcError::invalid_request()
 }
 
+// `LanguageServerBackend` is a few hundred bytes (it now inlines the parsed
+// `ClientOptions`/`ProjectConfig`, not just a pointer to shared state), but
+// this enum is only ever touched behind an `Arc` (see `LanguageServer::state`
+// below) and swapped on rare events (init, config change), not per-request —
+// boxing it to appease the lint would just move that same allocation cost
+// around rather than removing it.
+#[allow(clippy::large_enum_variant)]
 enum LanguageServerState {
     Uninitialized,
     Initialized(LanguageServerBackend),
@@ -89,26 +93,15 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
             );
         }
         let client_options = ClientOptions::from_value(params.initialization_options);
-        let project_config = match client_options.resolved_project_config_path(root.as_deref()) {
-            Some(path) => ProjectConfig::load(&path).await,
-            None => ProjectConfig::default(),
-        };
-        let config = RuntimeConfig::new(client_options, project_config);
-        let options = config.options_and_version().await.0;
+        let root_display = root
+            .as_deref()
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "<no workspace folder>".to_string());
+        let initialized =
+            LanguageServerBackend::new(self.client.clone(), root, client_options).await;
         log::info!(
-            "LanguageTool LSP initialized for {} using {}",
-            root.as_deref()
-                .map(|root| root.display().to_string())
-                .unwrap_or_else(|| "<no workspace folder>".to_string()),
-            options.endpoint()
-        );
-
-        let initialized = LanguageServerBackend::new(
-            self.client.clone(),
-            root,
-            DocumentCache::default(),
-            config,
-            LanguageToolClient::new(),
+            "LanguageTool LSP initialized for {root_display} using {}",
+            initialized.options().endpoint()
         );
 
         // `tower-lsp-server`'s own duplicate-`initialize` guard is a
@@ -223,11 +216,26 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
             );
             return;
         };
-        backend.did_change_configuration(params).await;
+        let Some(new_backend) = backend.with_new_config_from_settings(params.settings).await else {
+            return;
+        };
+        self.state.store(Arc::new(LanguageServerState::Initialized(
+            new_backend.clone(),
+        )));
+        new_backend.recheck_all().await;
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> RpcResult<Option<Value>> {
-        self.require_initialized()?.execute_command(params).await
+        let backend = self.require_initialized()?;
+        if let Some(new_backend) = backend.handle_execute_command(params).await? {
+            self.state.store(Arc::new(LanguageServerState::Initialized(
+                new_backend.clone(),
+            )));
+            tokio::spawn(async move {
+                new_backend.recheck_all().await;
+            });
+        }
+        Ok(None)
     }
 }
 

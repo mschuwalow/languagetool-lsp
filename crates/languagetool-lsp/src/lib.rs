@@ -8,5 +8,4 @@ pub(crate) mod language;
 pub(crate) mod languagetool;
 pub mod lsp;
 pub(crate) mod masking;
-pub(crate) mod runtime_config;
 pub(crate) mod text_index;
