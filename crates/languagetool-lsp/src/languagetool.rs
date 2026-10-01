@@ -26,9 +26,8 @@ pub enum LanguageToolError {
 /// Thin wrapper around a `reqwest::Client` built once for a given
 /// [`LanguageToolBackend`]'s timeout (the only backend setting baked into
 /// the client itself — the base URL is applied per-request). There's no
-/// caching or lazy rebuilding here: `LanguageServerBackend` treats
-/// configuration as immutable for its own lifetime and constructs a whole
-/// new `LanguageToolClient` (via `new`) whenever the backend changes,
+/// caching or lazy rebuilding here: `RuntimeConfig` constructs a whole new
+/// `LanguageToolClient` (via `new`) whenever `client_options` changes,
 /// rather than mutating an existing one.
 #[derive(Debug, Clone)]
 pub struct LanguageToolClient {

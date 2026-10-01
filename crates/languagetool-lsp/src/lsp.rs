@@ -200,10 +200,10 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
             return;
         };
         // `apply_new_client_options` (via `with_new_config_from_settings`)
-        // mutates `backend`'s own `runtime_config`/`language_tool` and
-        // points the project config file watcher at the new target
-        // itself; since `backend` is the very same `Arc` installed in
-        // `self.backend`, there's nothing to re-install here.
+        // mutates `backend`'s own `runtime_config` and points the project
+        // config file watcher at the new target itself; since `backend`
+        // is the very same `Arc` installed in `self.backend`, there's
+        // nothing to re-install here.
         if backend.with_new_config_from_settings(params.settings).await {
             backend.recheck_all().await;
         }

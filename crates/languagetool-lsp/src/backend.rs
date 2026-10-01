@@ -4,9 +4,7 @@ use crate::diagnostics::{
     match_utf16_range, parse_diagnostic_data,
 };
 use crate::document_cache::{CheckedBlock, DocumentCache, DocumentToken, PreparedCheck};
-use crate::languagetool::{
-    Annotation, LanguageToolClient, LanguageToolError, LanguageToolMatch, LanguageToolResponse,
-};
+use crate::languagetool::{Annotation, LanguageToolError, LanguageToolMatch, LanguageToolResponse};
 use crate::masking::CheckBlock;
 use crate::project_config_watcher::{
     ProjectConfigChanged, ProjectConfigWatcher, ProjectConfigWatcherHandle,
@@ -33,8 +31,7 @@ const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace"
 /// (the project config file watcher and the loop reacting to it) need
 /// their own cheaply-clonable handle to the *same* instance.
 ///
-/// Only `runtime_config` and `language_tool` are actually mutable (each
-/// behind its own `ArcSwap`, updated together -- see
+/// Only `runtime_config` is actually mutable (behind an `ArcSwap`, see
 /// [`Self::apply_new_client_options`]); everything else (`client`,
 /// `root`, `documents`, the watcher handle) is fixed for the connection's
 /// whole lifetime. This is a deliberate departure from treating the
@@ -53,7 +50,6 @@ pub struct LanguageServerBackend {
     root: Option<PathBuf>,
     documents: DocumentCache,
     runtime_config: ArcSwap<RuntimeConfig>,
-    language_tool: ArcSwap<LanguageToolClient>,
     /// Handle for telling the project config file watcher what to watch;
     /// see [`Self::apply_new_client_options`] for when that happens.
     project_config_watcher: ProjectConfigWatcherHandle,
@@ -71,7 +67,6 @@ impl LanguageServerBackend {
         let project_config_path = client_options.resolved_project_config_path(root.as_deref());
         let project_config = load_project_config(project_config_path.as_deref()).await;
         let runtime_config = RuntimeConfig::new(client_options, project_config);
-        let language_tool = LanguageToolClient::new(&runtime_config.options.backend);
         let revision = runtime_config.revision;
 
         let (changed_tx, changed_rx) = unbounded_channel();
@@ -84,7 +79,6 @@ impl LanguageServerBackend {
             root,
             documents: DocumentCache::default(),
             runtime_config: ArcSwap::new(Arc::new(runtime_config)),
-            language_tool: ArcSwap::new(Arc::new(language_tool)),
             project_config_watcher,
             _project_config_watcher_task: project_config_watcher_task,
         });
@@ -109,10 +103,11 @@ impl LanguageServerBackend {
 
     /// Applies a full replacement [`ClientOptions`], synchronously
     /// reloading the project config from its (possibly new) resolved
-    /// path and installing both together (see
+    /// path and installing both together with a freshly built
+    /// LanguageTool HTTP client (see
     /// [`RuntimeConfig::with_new_client_options`]) under a freshly
-    /// bumped revision, then rebuilding the LanguageTool HTTP client and
-    /// pointing the project config file watcher at the new path.
+    /// bumped revision, then pointing the project config file watcher at
+    /// the new path.
     ///
     /// Ordering matters here: `runtime_config` (and so the new revision)
     /// is installed *before* the watcher is told anything, so by the
@@ -130,10 +125,8 @@ impl LanguageServerBackend {
             .runtime_config
             .load()
             .with_new_client_options(client_options, project_config);
-        let language_tool = LanguageToolClient::new(&new_runtime_config.options.backend);
         let revision = new_runtime_config.revision;
 
-        self.language_tool.store(Arc::new(language_tool));
         self.runtime_config.store(Arc::new(new_runtime_config));
         self.project_config_watcher
             .set_watch_target(project_config_path, revision);
@@ -184,6 +177,16 @@ impl LanguageServerBackend {
     /// and is dropped rather than acted on. Otherwise, reloads
     /// `project_config` from disk and, if it actually changed, installs
     /// it and rechecks every open document.
+    ///
+    /// Installs via `compare_and_swap` rather than a plain `store`: the
+    /// disk read above is an `.await` point, during which a concurrent
+    /// `apply_new_client_options` could install a new revision. Without
+    /// the compare, storing unconditionally afterwards would silently
+    /// revert that concurrent change back to the stale revision this
+    /// function started with. If the swap doesn't go through, whatever
+    /// replaced `runtime_config` in the meantime already read this same
+    /// file itself (see [`Self::apply_new_client_options`]), so dropping
+    /// here loses nothing.
     async fn handle_project_config_changed(self: &Arc<Self>, revision: u64) {
         let current = self.runtime_config.load_full();
         if current.revision != revision {
@@ -203,9 +206,19 @@ impl LanguageServerBackend {
             return;
         }
 
+        let new_runtime_config = Arc::new(current.with_new_project_config(project_config));
+        let previous = self
+            .runtime_config
+            .compare_and_swap(&current, new_runtime_config);
+        if !Arc::ptr_eq(&previous, &current) {
+            log::debug!(
+                "Dropping project config reload: configuration changed concurrently while \
+                 reading the file from disk"
+            );
+            return;
+        }
+
         log::info!("Project config file changed on disk; reloading and rechecking open documents");
-        let new_runtime_config = current.with_new_project_config(project_config);
-        self.runtime_config.store(Arc::new(new_runtime_config));
         self.recheck_all().await;
     }
 
@@ -218,9 +231,10 @@ impl LanguageServerBackend {
             return;
         };
         // Snapshotted once up front (not re-read when the debounce timer
-        // fires below) so this check runs under the options active when
-        // it was *scheduled*, matching what a non-debounced check would
-        // have used had it run immediately.
+        // fires below) so this check runs under the options and
+        // LanguageTool client active when it was *scheduled*, matching
+        // what a non-debounced check would have used had it run
+        // immediately.
         let runtime_config = self.runtime_config.load_full();
         let debounce = runtime_config.options.debounce_ms;
         log::debug!(
@@ -240,7 +254,7 @@ impl LanguageServerBackend {
                     uri = uri.as_str()
                 );
                 backend
-                    .run_prepared_check(prepared, token, Arc::clone(&runtime_config.options))
+                    .run_prepared_check(prepared, token, runtime_config)
                     .await;
             } else {
                 log::debug!(
@@ -266,7 +280,7 @@ impl LanguageServerBackend {
         };
         log::debug!("Running immediate check for {uri}", uri = uri.as_str());
         let (prepared, token) = prepared;
-        self.run_prepared_check(prepared, token, Arc::clone(&runtime_config.options))
+        self.run_prepared_check(prepared, token, runtime_config)
             .await;
     }
 
@@ -284,8 +298,10 @@ impl LanguageServerBackend {
         &self,
         prepared: PreparedCheck,
         token: DocumentToken,
-        options: Arc<ClientOptions>,
+        runtime_config: Arc<RuntimeConfig>,
     ) {
+        let options = &runtime_config.options;
+        let language_tool = &runtime_config.language_tool;
         match prepared {
             PreparedCheck::Check(data) => {
                 let uri = data.uri;
@@ -299,11 +315,10 @@ impl LanguageServerBackend {
                     uri = uri.as_str()
                 );
 
-                let language_tool = self.language_tool.load_full();
                 let mut checks = tokio::task::JoinSet::new();
                 for block in data.blocks {
-                    let language_tool = Arc::clone(&language_tool);
-                    let options = Arc::clone(&options);
+                    let language_tool = Arc::clone(language_tool);
+                    let options = Arc::clone(options);
                     checks.spawn(async move {
                         let result = language_tool
                             .check_annotated(&block.annotated, &options)
