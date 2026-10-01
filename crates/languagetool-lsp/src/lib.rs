@@ -9,4 +9,5 @@ pub(crate) mod languagetool;
 pub mod lsp;
 pub(crate) mod masking;
 pub(crate) mod project_config_watcher;
+pub(crate) mod runtime_config;
 pub(crate) mod text_index;

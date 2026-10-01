@@ -1,12 +1,10 @@
-use crate::backend::{LanguageServerBackend, run_project_config_reload_loop};
+use crate::backend::LanguageServerBackend;
 use crate::config::ClientOptions;
-use crate::project_config_watcher::{ProjectConfigWatcher, ProjectConfigWatcherHandle};
 use arc_swap::ArcSwapOption;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc::unbounded_channel;
 use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::{Error as RpcError, ErrorCode, Result as RpcResult};
 use tower_lsp_server::ls_types::*;
@@ -41,43 +39,26 @@ fn duplicate_initialize_error() -> RpcError {
 
 pub struct LanguageServer {
     client: Client,
+    /// `None` until `initialize` completes; `LanguageServerBackend::new`
+    /// sets up its own project config file watcher and the loop that
+    /// reacts to it internally, so there's nothing else to wire up here
+    /// beyond installing the `Arc` it returns.
     backend: Arc<ArcSwapOption<LanguageServerBackend>>,
-    /// Handle for telling the project config file watcher what to watch;
-    /// cloned into every [`LanguageServerBackend`] that gets constructed
-    /// so it can (re-)point the watcher itself (see that struct's docs).
-    project_config_watcher_handle: ProjectConfigWatcherHandle,
-    /// Kept alive for as long as `LanguageServer` is; dropping either of
-    /// these would stop the corresponding background task (the file
-    /// watcher itself, and the loop that reacts to its messages).
-    _project_config_watcher: ProjectConfigWatcher,
-    _project_config_reload_task: tokio::task::JoinHandle<()>,
 }
 
 impl LanguageServer {
     pub fn new(client: Client) -> Self {
-        let backend: Arc<ArcSwapOption<LanguageServerBackend>> =
-            Arc::new(ArcSwapOption::from(None));
-        let (changed_tx, changed_rx) = unbounded_channel();
-        let (project_config_watcher, project_config_watcher_handle) =
-            ProjectConfigWatcher::spawn(changed_tx);
-        let reload_task = tokio::spawn(run_project_config_reload_loop(
-            Arc::clone(&backend),
-            changed_rx,
-        ));
         Self {
             client,
-            backend,
-            project_config_watcher_handle,
-            _project_config_watcher: project_config_watcher,
-            _project_config_reload_task: reload_task,
+            backend: Arc::new(ArcSwapOption::from(None)),
         }
     }
 
-    fn current_backend(&self) -> Option<LanguageServerBackend> {
-        self.backend.load_full().map(|backend| (*backend).clone())
+    fn current_backend(&self) -> Option<Arc<LanguageServerBackend>> {
+        self.backend.load_full()
     }
 
-    fn require_initialized(&self) -> RpcResult<LanguageServerBackend> {
+    fn require_initialized(&self) -> RpcResult<Arc<LanguageServerBackend>> {
         self.current_backend().ok_or_else(not_initialized_error)
     }
 }
@@ -102,13 +83,8 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
             .as_deref()
             .map(|root| root.display().to_string())
             .unwrap_or_else(|| "<no workspace folder>".to_string());
-        let initialized = LanguageServerBackend::new(
-            self.client.clone(),
-            root,
-            client_options,
-            self.project_config_watcher_handle.clone(),
-        )
-        .await;
+        let initialized =
+            LanguageServerBackend::new(self.client.clone(), root, client_options).await;
         log::info!(
             "LanguageTool LSP initialized for {root_display} using {}",
             initialized.options().endpoint()
@@ -122,10 +98,9 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
         // the swap actually happens; if the returned previous value is
         // `Some` instead, another request's `initialize` call won the
         // race.
-        let previous = self.backend.compare_and_swap(
-            &None::<Arc<LanguageServerBackend>>,
-            Some(Arc::new(initialized)),
-        );
+        let previous = self
+            .backend
+            .compare_and_swap(&None::<Arc<LanguageServerBackend>>, Some(initialized));
         if previous.is_some() {
             return Err(duplicate_initialize_error());
         }
@@ -224,15 +199,14 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
             );
             return;
         };
-        let Some(new_backend) = backend.with_new_config_from_settings(params.settings).await else {
-            return;
-        };
-        // `with_new_config_from_settings` already told the project config
-        // file watcher where to look next (see `LanguageServerBackend`'s
-        // docs), so installing the new backend and rechecking is all
-        // that's left to do here.
-        self.backend.store(Some(Arc::new(new_backend.clone())));
-        new_backend.recheck_all().await;
+        // `apply_new_client_options` (via `with_new_config_from_settings`)
+        // mutates `backend`'s own `runtime_config`/`language_tool` and
+        // points the project config file watcher at the new target
+        // itself; since `backend` is the very same `Arc` installed in
+        // `self.backend`, there's nothing to re-install here.
+        if backend.with_new_config_from_settings(params.settings).await {
+            backend.recheck_all().await;
+        }
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> RpcResult<Option<Value>> {
@@ -240,7 +214,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
         backend.handle_execute_command(params).await?;
         // `handle_execute_command` only writes to disk; the project config
         // file watcher notices the write and installs+rechecks it (see
-        // `ProjectConfigWatcher`'s docs), so there's nothing further to do
+        // `LanguageServerBackend`'s docs), so there's nothing further to do
         // here.
         Ok(None)
     }

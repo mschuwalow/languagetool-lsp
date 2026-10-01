@@ -8,14 +8,17 @@ use crate::languagetool::{
     Annotation, LanguageToolClient, LanguageToolError, LanguageToolMatch, LanguageToolResponse,
 };
 use crate::masking::CheckBlock;
-use crate::project_config_watcher::{ProjectConfigChanged, ProjectConfigWatcherHandle};
+use crate::project_config_watcher::{
+    ProjectConfigChanged, ProjectConfigWatcher, ProjectConfigWatcherHandle,
+};
+use crate::runtime_config::RuntimeConfig;
 use crate::text_index::{ByteRange, TextIndex, Utf16Range};
-use arc_swap::ArcSwapOption;
+use arc_swap::ArcSwap;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::{Error as RpcError, Result as RpcResult};
 use tower_lsp_server::ls_types::*;
@@ -24,17 +27,23 @@ const COMMAND_IGNORE_WORD: &str = "languagetool.ignoreWordInWorkspace";
 const COMMAND_DISABLE_RULE: &str = "languagetool.disableRuleInWorkspace";
 const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace";
 
-/// Everything the server knows once `initialize` (or the most recent
-/// `workspace/didChangeConfiguration`, or the project config file watcher
-/// picking up a change to the project config file on disk) has resolved
-/// workspace root, client options, project config, and the merged
-/// effective options. This is treated as an immutable snapshot: there's
-/// no interior mutability here (unlike `documents`, which really is live
-/// shared state). A configuration change produces a *new*
-/// `LanguageServerBackend` (see [`LanguageServerBackend::with_new_config`])
-/// rather than mutating this one in place — see that method's docs for the
-/// resulting trade-off with in-flight debounced checks.
-#[derive(Clone)]
+/// Everything the server knows for the lifetime of one `initialize`d
+/// connection. Constructed once (see [`Self::new`]) and returned as an
+/// `Arc`, since both request handlers and the background tasks it spawns
+/// (the project config file watcher and the loop reacting to it) need
+/// their own cheaply-clonable handle to the *same* instance.
+///
+/// Only `runtime_config` and `language_tool` are actually mutable (each
+/// behind its own `ArcSwap`, updated together -- see
+/// [`Self::apply_new_client_options`]); everything else (`client`,
+/// `root`, `documents`, the watcher handle) is fixed for the connection's
+/// whole lifetime. This is a deliberate departure from treating the
+/// *whole* backend as an immutable snapshot that gets replaced wholesale
+/// on every configuration change: `documents` in particular is a shared
+/// cache that every open document, debounced check, and project config
+/// reload needs to see consistently, which is much simpler to reason
+/// about as one long-lived object than as a chain of snapshots each
+/// capturing their own clone of it.
 pub struct LanguageServerBackend {
     client: Client,
     /// Workspace root, resolved once from the LSP workspace folders / root
@@ -43,36 +52,14 @@ pub struct LanguageServerBackend {
     /// `workspaceFolders` may both be `null`).
     root: Option<PathBuf>,
     documents: DocumentCache,
-    client_options: ClientOptions,
-    project_config: ProjectConfig,
-    /// `project_config` merged into `client_options`; the options actually
-    /// used for checks.
-    options: Arc<ClientOptions>,
-    /// Bumped every time `options` is recomputed (i.e. on every
-    /// [`LanguageServerBackend::with_new_config`] /
-    /// [`LanguageServerBackend::with_new_project_config`]), so a
-    /// document's per-block diagnostics cache can tell a check that ran
-    /// under old options apart from one that ran under the current ones.
-    options_version: u64,
-    language_tool: LanguageToolClient,
-    /// Bumped every time `client_options` (and therefore the resolved
-    /// project config path) might have changed, i.e. on every
-    /// [`Self::with_new_config`] -- but *not* on
-    /// [`Self::with_new_project_config`], which never changes the path.
-    /// Sent alongside the path in every [`WatchTarget`](crate::project_config_watcher)
-    /// message to the project config file watcher, and echoed back in
-    /// its [`ProjectConfigChanged`] notifications so a stale one (sent
-    /// for a path this backend has since moved on from) can be told
-    /// apart from a current one and dropped; see
-    /// [`run_project_config_reload_loop`].
-    config_generation: u64,
-    /// Handle to the long-lived project config file watcher task (shared
-    /// by the whole server, not respawned per backend); see
-    /// [`ProjectConfigWatcherHandle`]. Cloning it is cheap (just an mpsc
-    /// sender clone), so every backend produced from this one keeps the
-    /// same handle -- only [`Self::with_new_config`] actually sends it a
-    /// new target, since only it can change the resolved path.
+    runtime_config: ArcSwap<RuntimeConfig>,
+    language_tool: ArcSwap<LanguageToolClient>,
+    /// Handle for telling the project config file watcher what to watch;
+    /// see [`Self::apply_new_client_options`] for when that happens.
     project_config_watcher: ProjectConfigWatcherHandle,
+    /// Keeps the watcher's background task alive for as long as this
+    /// backend is; see [`ProjectConfigWatcher`]'s docs.
+    _project_config_watcher_task: ProjectConfigWatcher,
 }
 
 impl LanguageServerBackend {
@@ -80,111 +67,95 @@ impl LanguageServerBackend {
         client: Client,
         root: Option<PathBuf>,
         client_options: ClientOptions,
-        project_config_watcher: ProjectConfigWatcherHandle,
-    ) -> Self {
-        let config_generation = 0;
+    ) -> Arc<Self> {
         let project_config_path = client_options.resolved_project_config_path(root.as_deref());
         let project_config = load_project_config(project_config_path.as_deref()).await;
-        let options = Arc::new(project_config.merged_options(&client_options));
-        let language_tool = LanguageToolClient::new(&options.backend);
-        project_config_watcher.set_watch_target(project_config_path, config_generation);
-        Self {
+        let runtime_config = RuntimeConfig::new(client_options, project_config);
+        let language_tool = LanguageToolClient::new(&runtime_config.options.backend);
+        let revision = runtime_config.revision;
+
+        let (changed_tx, changed_rx) = unbounded_channel();
+        let (project_config_watcher_task, project_config_watcher) =
+            ProjectConfigWatcher::spawn(changed_tx);
+        project_config_watcher.set_watch_target(project_config_path, revision);
+
+        let backend = Arc::new(Self {
             client,
             root,
             documents: DocumentCache::default(),
-            client_options,
-            project_config,
-            options,
-            options_version: 0,
-            language_tool,
-            config_generation,
+            runtime_config: ArcSwap::new(Arc::new(runtime_config)),
+            language_tool: ArcSwap::new(Arc::new(language_tool)),
             project_config_watcher,
-        }
+            _project_config_watcher_task: project_config_watcher_task,
+        });
+
+        // Give the watcher's message loop a handle to this exact backend
+        // (not a lookup into some separate shared slot) so it can react
+        // directly -- see `run_project_config_reload_loop`'s docs. This
+        // is also why `new` returns an `Arc<Self>` rather than `Self`:
+        // the backend needs to exist, fully constructed, before anything
+        // can hold a clone of it.
+        tokio::spawn(run_project_config_reload_loop(
+            Arc::clone(&backend),
+            changed_rx,
+        ));
+
+        backend
     }
 
-    pub fn options(&self) -> &Arc<ClientOptions> {
-        &self.options
+    pub fn options(&self) -> Arc<ClientOptions> {
+        Arc::clone(&self.runtime_config.load().options)
     }
 
-    /// Rebuilds everything derived from client-provided configuration
-    /// (`client_options`, `project_config` reloaded if its resolved path
-    /// changed, the merged `options`, and the LanguageTool HTTP client)
-    /// while reusing the existing open-document cache — document contents
-    /// aren't part of "configuration" and don't need re-syncing with the
-    /// client. Also points the project config file watcher at the
-    /// (possibly new) resolved path under the next `config_generation`
-    /// (see that field's docs).
+    /// Applies a full replacement [`ClientOptions`], synchronously
+    /// reloading the project config from its (possibly new) resolved
+    /// path and installing both together (see
+    /// [`RuntimeConfig::with_new_client_options`]) under a freshly
+    /// bumped revision, then rebuilding the LanguageTool HTTP client and
+    /// pointing the project config file watcher at the new path.
     ///
-    /// Note: any check already scheduled (debounced `didChange` or an
-    /// in-flight `recheck_all`) against the *previous* backend keeps using
-    /// that snapshot's options until it completes, since it holds its own
-    /// clone. The caller is expected to trigger [`Self::recheck_all`] on
-    /// the returned backend to bring every open document back in sync.
-    pub async fn with_new_config(&self, client_options: ClientOptions) -> Self {
-        let config_generation = self.config_generation + 1;
+    /// Ordering matters here: `runtime_config` (and so the new revision)
+    /// is installed *before* the watcher is told anything, so by the
+    /// time it could possibly fire for the new target, any
+    /// [`ProjectConfigChanged`] message still in flight for the *old*
+    /// revision is unambiguously stale -- see
+    /// [`run_project_config_reload_loop`]'s docs.
+    ///
+    /// Does *not* recheck open documents itself; the caller is expected
+    /// to call [`Self::recheck_all`] afterwards.
+    pub async fn apply_new_client_options(&self, client_options: ClientOptions) {
         let project_config_path = client_options.resolved_project_config_path(self.root.as_deref());
         let project_config = load_project_config(project_config_path.as_deref()).await;
-        let options = Arc::new(project_config.merged_options(&client_options));
-        let language_tool = LanguageToolClient::new(&options.backend);
+        let new_runtime_config = self
+            .runtime_config
+            .load()
+            .with_new_client_options(client_options, project_config);
+        let language_tool = LanguageToolClient::new(&new_runtime_config.options.backend);
+        let revision = new_runtime_config.revision;
+
+        self.language_tool.store(Arc::new(language_tool));
+        self.runtime_config.store(Arc::new(new_runtime_config));
         self.project_config_watcher
-            .set_watch_target(project_config_path, config_generation);
-        Self {
-            client: self.client.clone(),
-            root: self.root.clone(),
-            documents: self.documents.clone(),
-            client_options,
-            project_config,
-            options,
-            options_version: self.options_version + 1,
-            language_tool,
-            config_generation,
-            project_config_watcher: self.project_config_watcher.clone(),
-        }
-    }
-
-    /// Like [`Self::with_new_config`], but for when only `project_config`
-    /// changed on disk (via a `workspace/executeCommand` that edits ignored
-    /// words / disabled rules / disabled categories, or the project config
-    /// file watcher noticing an out-of-band edit). `client_options` and
-    /// therefore the resolved project config path are unaffected by that,
-    /// so the LanguageTool HTTP client, `config_generation`, and the
-    /// watcher handle are all reused as-is (in particular, this never
-    /// sends the watcher a new target); only the merged `options` and
-    /// `options_version` change.
-    fn with_new_project_config(&self, project_config: ProjectConfig) -> Self {
-        let options = Arc::new(project_config.merged_options(&self.client_options));
-        Self {
-            client: self.client.clone(),
-            root: self.root.clone(),
-            documents: self.documents.clone(),
-            client_options: self.client_options.clone(),
-            project_config,
-            options,
-            options_version: self.options_version + 1,
-            language_tool: self.language_tool.clone(),
-            config_generation: self.config_generation,
-            project_config_watcher: self.project_config_watcher.clone(),
-        }
-    }
-
-    pub fn config_generation(&self) -> u64 {
-        self.config_generation
+            .set_watch_target(project_config_path, revision);
     }
 
     /// Parses `settings` as a full replacement [`ClientOptions`] value and
-    /// rebuilds everything derived from it via [`Self::with_new_config`].
-    /// This does *not* merge with the previous options: any field the
-    /// payload doesn't mention falls back to its `#[serde(default)]`, not
-    /// whatever was set at `initialize` or by an earlier config change —
-    /// if a user drops a setting from their config, they expect the
-    /// default to take effect, not for a stale value to linger.
-    /// Returns `None` for a `null` notification (nothing changed) or a
-    /// value that fails to parse (reported to the client, previous options
-    /// kept as-is); the caller should install and recheck against `Some`.
-    pub async fn with_new_config_from_settings(&self, settings: Value) -> Option<Self> {
+    /// applies it via [`Self::apply_new_client_options`]. This does *not*
+    /// merge with the previous options: any field the payload doesn't
+    /// mention falls back to its `#[serde(default)]`, not whatever was
+    /// set at `initialize` or by an earlier config change -- if a user
+    /// drops a setting from their config, they expect the default to
+    /// take effect, not for a stale value to linger.
+    ///
+    /// Returns `false` for a `null` notification (nothing changed) or a
+    /// value that fails to parse (reported to the client, previous
+    /// options kept as-is), in which case there's nothing for the caller
+    /// to recheck. Returns `true` otherwise, in which case the caller is
+    /// expected to call [`Self::recheck_all`] afterwards.
+    pub async fn with_new_config_from_settings(&self, settings: Value) -> bool {
         if settings == Value::Null {
             log::debug!("Ignoring null configuration change notification");
-            return None;
+            return false;
         }
 
         let client_options = match ClientOptions::parse_value(settings) {
@@ -195,15 +166,50 @@ impl LanguageServerBackend {
                 );
                 log::error!("{message}");
                 self.client.log_message(MessageType::ERROR, message).await;
-                return None;
+                return false;
             }
         };
 
         log::info!("LanguageTool configuration changed; reloading options and project config");
-        Some(self.with_new_config(client_options).await)
+        self.apply_new_client_options(client_options).await;
+        true
     }
 
-    async fn schedule_check(&self, uri: Uri) {
+    /// Reacts to a [`ProjectConfigChanged`] notification tagged with
+    /// `revision`. If `revision` doesn't match the currently installed
+    /// `RuntimeConfig::revision`, the notification is stale -- a
+    /// `workspace/didChangeConfiguration` moved the watched path on from
+    /// underneath it, whether because the message was already in flight
+    /// or because the watcher hadn't gotten around to re-arming yet --
+    /// and is dropped rather than acted on. Otherwise, reloads
+    /// `project_config` from disk and, if it actually changed, installs
+    /// it and rechecks every open document.
+    async fn handle_project_config_changed(self: &Arc<Self>, revision: u64) {
+        let current = self.runtime_config.load_full();
+        if current.revision != revision {
+            log::debug!(
+                "Dropping project config change notification for stale revision {revision} \
+                 (current revision is {})",
+                current.revision
+            );
+            return;
+        }
+
+        let project_config_path = current
+            .client_options
+            .resolved_project_config_path(self.root.as_deref());
+        let project_config = load_project_config(project_config_path.as_deref()).await;
+        if project_config == current.project_config {
+            return;
+        }
+
+        log::info!("Project config file changed on disk; reloading and rechecking open documents");
+        let new_runtime_config = current.with_new_project_config(project_config);
+        self.runtime_config.store(Arc::new(new_runtime_config));
+        self.recheck_all().await;
+    }
+
+    async fn schedule_check(self: &Arc<Self>, uri: Uri) {
         let Some(token) = self.documents.token(&uri).await else {
             log::debug!(
                 "Skipping check schedule for {uri}: document not cached",
@@ -211,17 +217,22 @@ impl LanguageServerBackend {
             );
             return;
         };
-        let debounce = self.options.debounce_ms;
+        // Snapshotted once up front (not re-read when the debounce timer
+        // fires below) so this check runs under the options active when
+        // it was *scheduled*, matching what a non-debounced check would
+        // have used had it run immediately.
+        let runtime_config = self.runtime_config.load_full();
+        let debounce = runtime_config.options.debounce_ms;
         log::debug!(
             "Scheduling check for {uri} token={token:?} debounce_ms={debounce}",
             uri = uri.as_str()
         );
-        let backend = self.clone();
+        let backend = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
             let prepared = backend
                 .documents
-                .prepare_check_if_current(&uri, token, backend.options_version)
+                .prepare_check_if_current(&uri, token, runtime_config.options_version)
                 .await;
             if let Some((prepared, token)) = prepared {
                 log::debug!(
@@ -229,7 +240,7 @@ impl LanguageServerBackend {
                     uri = uri.as_str()
                 );
                 backend
-                    .run_prepared_check(prepared, token, backend.options.clone())
+                    .run_prepared_check(prepared, token, Arc::clone(&runtime_config.options))
                     .await;
             } else {
                 log::debug!(
@@ -241,9 +252,10 @@ impl LanguageServerBackend {
     }
 
     async fn check_uri_now(&self, uri: &Uri) {
+        let runtime_config = self.runtime_config.load_full();
         let Some(prepared) = self
             .documents
-            .prepare_check(uri, self.options_version)
+            .prepare_check(uri, runtime_config.options_version)
             .await
         else {
             log::debug!(
@@ -254,7 +266,7 @@ impl LanguageServerBackend {
         };
         log::debug!("Running immediate check for {uri}", uri = uri.as_str());
         let (prepared, token) = prepared;
-        self.run_prepared_check(prepared, token, self.options.clone())
+        self.run_prepared_check(prepared, token, Arc::clone(&runtime_config.options))
             .await;
     }
 
@@ -287,9 +299,10 @@ impl LanguageServerBackend {
                     uri = uri.as_str()
                 );
 
+                let language_tool = self.language_tool.load_full();
                 let mut checks = tokio::task::JoinSet::new();
                 for block in data.blocks {
-                    let language_tool = self.language_tool.clone();
+                    let language_tool = Arc::clone(&language_tool);
                     let options = Arc::clone(&options);
                     checks.spawn(async move {
                         let result = language_tool
@@ -395,57 +408,39 @@ impl LanguageServerBackend {
         self.client.log_message(MessageType::WARNING, message).await;
     }
 
-    /// Rechecks every open document against this backend's (current)
-    /// options. Called after a config change has been installed as the new
-    /// backend, to bring all documents back in sync.
-    pub async fn recheck_all(&self) {
+    /// Rechecks every open document against this backend's current
+    /// options. Called after a configuration change has been installed,
+    /// to bring all documents back in sync.
+    pub async fn recheck_all(self: &Arc<Self>) {
         let urls = self.documents.urls().await;
         log::info!("Rechecking {} open document(s)", urls.len());
         let mut tasks = tokio::task::JoinSet::new();
         for uri in urls {
-            let backend = self.clone();
+            let backend = Arc::clone(self);
             tasks.spawn(async move { backend.check_uri_now(&uri).await });
         }
         while tasks.join_next().await.is_some() {}
     }
 
     fn project_config_path(&self) -> Option<PathBuf> {
-        self.client_options
+        self.runtime_config
+            .load()
+            .client_options
             .resolved_project_config_path(self.root.as_deref())
     }
 
     fn project_config_display_path(&self) -> String {
-        self.client_options.project_config_display_path()
-    }
-
-    /// Reloads `project_config` from the currently resolved project config
-    /// path and, if it actually differs from what's currently loaded,
-    /// rebuilds derived options via [`Self::with_new_project_config`].
-    /// Returns `None` if nothing changed (including when there's no
-    /// resolvable path at all), in which case there's nothing for the
-    /// caller to install or recheck against.
-    ///
-    /// This is how project config changes reach a running server: both
-    /// hand edits (or edits from another editor window) and this
-    /// server's own `workspace/executeCommand` handlers (which only
-    /// write to disk; see [`Self::handle_execute_command`]) are picked
-    /// up by the project config file watcher, which sends a
-    /// [`ProjectConfigChanged`] message rather than reloading directly;
-    /// [`run_project_config_reload_loop`] validates that message and
-    /// calls this in response.
-    pub async fn reload_project_config_if_changed(&self) -> Option<Self> {
-        let project_config = load_project_config(self.project_config_path().as_deref()).await;
-        if project_config == self.project_config {
-            return None;
-        }
-        Some(self.with_new_project_config(project_config))
+        self.runtime_config
+            .load()
+            .client_options
+            .project_config_display_path()
     }
 
     /// Applies `update` to a copy of the current project config and, if it
     /// actually changed anything, saves the result to disk. Deliberately
-    /// does *not* install the result as this backend's `project_config`:
-    /// per [`Self::reload_project_config_if_changed`]'s docs, that's the
-    /// project config file watcher's job once it notices the write below.
+    /// does *not* install the result into `runtime_config`: per
+    /// [`Self::handle_project_config_changed`]'s docs, that's the project
+    /// config file watcher's job once it notices the write below.
     async fn updated_project_config(
         &self,
         update: impl FnOnce(&mut ProjectConfig) -> bool,
@@ -458,7 +453,7 @@ impl LanguageServerBackend {
             );
         };
 
-        let mut next_config = self.project_config.clone();
+        let mut next_config = self.runtime_config.load().project_config.clone();
         if !update(&mut next_config) {
             log::debug!("Project config update made no changes");
             return Ok(());
@@ -495,7 +490,7 @@ impl LanguageServerBackend {
     }
 
     pub async fn log_ready(&self) {
-        let options = &self.options;
+        let options = self.options();
         log::info!("LanguageTool LSP ready: {}", options.endpoint());
         self.client
             .log_message(
@@ -515,7 +510,7 @@ impl LanguageServerBackend {
             uri = uri.as_str()
         );
         self.documents.insert(&params.text_document).await;
-        if self.options.check_on_open {
+        if self.options().check_on_open {
             self.check_uri_now(&uri).await;
         } else {
             log::debug!(
@@ -525,7 +520,7 @@ impl LanguageServerBackend {
         }
     }
 
-    pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    pub async fn did_change(self: &Arc<Self>, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         log::debug!(
             "Received {} change(s) for {uri} version={}",
@@ -537,7 +532,7 @@ impl LanguageServerBackend {
             .apply_changes(&uri, params.text_document.version, params.content_changes)
             .await;
 
-        if self.options.check_while_typing {
+        if self.options().check_while_typing {
             self.schedule_check(uri).await;
         } else {
             log::debug!(
@@ -550,7 +545,7 @@ impl LanguageServerBackend {
     pub async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         log::info!("Saved document {uri}", uri = uri.as_str());
-        if self.options.check_on_save {
+        if self.options().check_on_save {
             self.check_uri_now(&uri).await;
         } else {
             log::debug!(
@@ -650,7 +645,7 @@ impl LanguageServerBackend {
     /// Applies a project-config-mutating command (ignore word / disable
     /// rule / disable category). Only writes the change to disk; the
     /// project config file watcher is responsible for noticing the write
-    /// and installing it via [`Self::reload_project_config_if_changed`],
+    /// and installing it (see [`Self::handle_project_config_changed`]),
     /// so there's nothing further for the caller to install here.
     pub async fn handle_execute_command(&self, params: ExecuteCommandParams) -> RpcResult<()> {
         log::info!("Executing command {}", params.command);
@@ -680,43 +675,17 @@ async fn load_project_config(path: Option<&Path>) -> ProjectConfig {
     }
 }
 
-/// Reacts to [`ProjectConfigChanged`] messages from the project config
-/// file watcher by reloading and installing project config changes into
-/// `state`, for as long as `changed` keeps producing messages (i.e. for
-/// as long as the watcher, and whatever holds the
-/// [`ProjectConfigWatcherHandle`] that feeds it, are alive).
-///
-/// Each message is validated against the *currently installed* backend's
-/// [`LanguageServerBackend::config_generation`] before acting on it: a
-/// message tagged with an older generation means a
-/// `workspace/didChangeConfiguration` moved the watched path on from
-/// underneath it (the message was already in flight, or the watcher
-/// hadn't gotten around to re-arming yet) and is simply stale, not an
-/// error -- it's dropped rather than clobbering whatever the newer
-/// generation installed.
-pub async fn run_project_config_reload_loop(
-    state: Arc<ArcSwapOption<LanguageServerBackend>>,
+/// Pumps [`ProjectConfigChanged`] messages from the project config file
+/// watcher into [`LanguageServerBackend::handle_project_config_changed`],
+/// for as long as `changed` keeps producing them (i.e. for as long as the
+/// watcher task, spawned alongside this loop in
+/// [`LanguageServerBackend::new`], is alive).
+async fn run_project_config_reload_loop(
+    backend: Arc<LanguageServerBackend>,
     mut changed: UnboundedReceiver<ProjectConfigChanged>,
 ) {
-    while let Some(ProjectConfigChanged { generation }) = changed.recv().await {
-        let Some(current) = state.load_full() else {
-            continue;
-        };
-        if current.config_generation() != generation {
-            log::debug!(
-                "Dropping project config change notification for stale generation {generation} \
-                 (current generation is {})",
-                current.config_generation()
-            );
-            continue;
-        }
-
-        let Some(new_backend) = current.reload_project_config_if_changed().await else {
-            continue;
-        };
-        log::info!("Project config file changed on disk; reloading and rechecking open documents");
-        state.store(Some(Arc::new(new_backend.clone())));
-        new_backend.recheck_all().await;
+    while let Some(ProjectConfigChanged { revision }) = changed.recv().await {
+        backend.handle_project_config_changed(revision).await;
     }
 }
 

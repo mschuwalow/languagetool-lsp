@@ -10,22 +10,22 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Tells the watcher what to watch from now on (sent by whoever installs
-/// a new config generation; see [`ProjectConfigWatcherHandle`]).
+/// a new config revision; see [`ProjectConfigWatcherHandle`]).
 struct WatchTarget {
     path: Option<PathBuf>,
-    generation: u64,
+    revision: u64,
 }
 
 /// Sent by the watcher when the file at the most recently requested watch
-/// target changes on disk, tagged with the `generation` from the
+/// target changes on disk, tagged with the `revision` from the
 /// [`WatchTarget`] that was active at the time. The receiver is
 /// responsible for comparing this against whatever it considers the
-/// current generation and dropping the message if it's fallen behind
+/// current revision and dropping the message if it's fallen behind
 /// (e.g. a `workspace/didChangeConfiguration` moved `projectConfigPath`
-/// to a new generation after this event was already in flight for the
+/// to a new revision after this event was already in flight for the
 /// old one).
 pub struct ProjectConfigChanged {
-    pub generation: u64,
+    pub revision: u64,
 }
 
 /// A cheap, cloneable handle for telling the long-lived
@@ -33,7 +33,7 @@ pub struct ProjectConfigChanged {
 /// doesn't wait for the watcher to act on it -- the whole point of this
 /// being message-passing is that neither side blocks on the other; the
 /// watcher will get to it and emit [`ProjectConfigChanged`] (tagged with
-/// `generation`) once it notices a change, whenever that happens to be.
+/// `revision`) once it notices a change, whenever that happens to be.
 #[derive(Clone)]
 pub struct ProjectConfigWatcherHandle(UnboundedSender<WatchTarget>);
 
@@ -41,11 +41,11 @@ impl ProjectConfigWatcherHandle {
     /// Tells the watcher to watch `path` (or nothing at all, if `None`)
     /// from now on, superseding whatever it was watching before.
     /// Subsequent [`ProjectConfigChanged`] notifications for this target
-    /// will carry `generation`.
-    pub fn set_watch_target(&self, path: Option<PathBuf>, generation: u64) {
+    /// will carry `revision`.
+    pub fn set_watch_target(&self, path: Option<PathBuf>, revision: u64) {
         // Only fails if the watcher task is gone (server shutting down);
         // nothing useful to do about that here.
-        let _ = self.0.send(WatchTarget { path, generation });
+        let _ = self.0.send(WatchTarget { path, revision });
     }
 }
 
@@ -56,12 +56,12 @@ impl ProjectConfigWatcherHandle {
 /// disk and rely on this watcher noticing the write, ...) and reports
 /// them via [`ProjectConfigChanged`] messages. It does *not* reload or
 /// install anything itself -- that's the receiving end's job, once it has
-/// validated the message's generation is still current.
+/// validated the message's revision is still current.
 ///
 /// What path is being watched is driven entirely by [`WatchTarget`]
 /// messages sent through a [`ProjectConfigWatcherHandle`]; there's a
 /// single watcher task for the server's whole lifetime, re-pointed as
-/// needed rather than respawned per config generation.
+/// needed rather than respawned per config revision.
 ///
 /// Must be kept alive for as long as watching should continue: dropping
 /// this drops the background task (and, with it, the underlying OS-level
@@ -124,7 +124,7 @@ async fn run(
                     Some(Ok(_events)) => {
                         if let Some(target) = &current {
                             let _ = changed.send(ProjectConfigChanged {
-                                generation: target.generation,
+                                revision: target.revision,
                             });
                         }
                         // A closer ancestor of the target path may have
