@@ -9,6 +9,7 @@ use crate::languagetool::{
 };
 use crate::masking::CheckBlock;
 use crate::text_index::{ByteRange, TextIndex, Utf16Range};
+use arc_swap::ArcSwap;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,11 +23,12 @@ const COMMAND_DISABLE_RULE: &str = "languagetool.disableRuleInWorkspace";
 const COMMAND_DISABLE_CATEGORY: &str = "languagetool.disableCategoryInWorkspace";
 
 /// Everything the server knows once `initialize` (or the most recent
-/// `workspace/didChangeConfiguration` / config-mutating `executeCommand`)
-/// has resolved workspace root, client options, project config, and the
-/// merged effective options. This is treated as an immutable snapshot:
-/// there's no interior mutability here (unlike `documents`, which really is
-/// live shared state). A configuration change produces a *new*
+/// `workspace/didChangeConfiguration`, or the project config file watcher
+/// picking up a change to the project config file on disk) has resolved
+/// workspace root, client options, project config, and the merged
+/// effective options. This is treated as an immutable snapshot: there's
+/// no interior mutability here (unlike `documents`, which really is live
+/// shared state). A configuration change produces a *new*
 /// `LanguageServerBackend` (see [`LanguageServerBackend::with_new_config`])
 /// rather than mutating this one in place — see that method's docs for the
 /// resulting trade-off with in-flight debounced checks.
@@ -359,7 +361,7 @@ impl LanguageServerBackend {
         while tasks.join_next().await.is_some() {}
     }
 
-    fn project_config_path(&self) -> Option<PathBuf> {
+    pub fn project_config_path(&self) -> Option<PathBuf> {
         self.client_options
             .resolved_project_config_path(self.root.as_deref())
     }
@@ -368,14 +370,36 @@ impl LanguageServerBackend {
         self.client_options.project_config_display_path()
     }
 
+    /// Reloads `project_config` from the currently resolved project config
+    /// path and, if it actually differs from what's currently loaded,
+    /// rebuilds derived options via [`Self::with_new_project_config`].
+    /// Returns `None` if nothing changed (including when there's no
+    /// resolvable path at all), in which case there's nothing for the
+    /// caller to install or recheck against.
+    ///
+    /// This is how project config changes reach a running server: both
+    /// the project config file watcher (picking up hand edits, or edits
+    /// from another editor window) and this server's own
+    /// `workspace/executeCommand` handlers (which only write to disk; see
+    /// [`Self::handle_execute_command`]) rely on this being called after
+    /// the file changes, rather than swapping in a new backend directly.
+    pub async fn reload_project_config_if_changed(&self) -> Option<Self> {
+        let project_config = load_project_config(&self.client_options, self.root.as_deref()).await;
+        if project_config == self.project_config {
+            return None;
+        }
+        Some(self.with_new_project_config(project_config))
+    }
+
     /// Applies `update` to a copy of the current project config and, if it
-    /// actually changed anything, saves the result to disk and returns it
-    /// (the caller is responsible for installing it via
-    /// [`Self::with_new_project_config`] and rechecking).
+    /// actually changed anything, saves the result to disk. Deliberately
+    /// does *not* install the result as this backend's `project_config`:
+    /// per [`Self::reload_project_config_if_changed`]'s docs, that's the
+    /// project config file watcher's job once it notices the write below.
     async fn updated_project_config(
         &self,
         update: impl FnOnce(&mut ProjectConfig) -> bool,
-    ) -> Result<Option<ProjectConfig>, String> {
+    ) -> Result<(), String> {
         let Some(project_config_path) = self.project_config_path() else {
             return Err(
                 "No workspace folder is open and `projectConfigPath` is not an absolute path; \
@@ -387,7 +411,7 @@ impl LanguageServerBackend {
         let mut next_config = self.project_config.clone();
         if !update(&mut next_config) {
             log::debug!("Project config update made no changes");
-            return Ok(None);
+            return Ok(());
         }
 
         next_config
@@ -396,26 +420,24 @@ impl LanguageServerBackend {
             .map_err(|err| format!("Failed to save project config: {err}"))?;
 
         log::info!(
-            "Saved LanguageTool project config to {}",
+            "Saved LanguageTool project config to {}; the project config watcher will pick up \
+             the change",
             project_config_path.display()
         );
-        Ok(Some(next_config))
+        Ok(())
     }
 
-    async fn add_ignored_word(&self, word: &str) -> Result<Option<ProjectConfig>, String> {
+    async fn add_ignored_word(&self, word: &str) -> Result<(), String> {
         self.updated_project_config(|project_config| project_config.add_ignored_word(word))
             .await
     }
 
-    async fn add_disabled_rule(&self, rule_id: &str) -> Result<Option<ProjectConfig>, String> {
+    async fn add_disabled_rule(&self, rule_id: &str) -> Result<(), String> {
         self.updated_project_config(|project_config| project_config.add_disabled_rule(rule_id))
             .await
     }
 
-    async fn add_disabled_category(
-        &self,
-        category_id: &str,
-    ) -> Result<Option<ProjectConfig>, String> {
+    async fn add_disabled_category(&self, category_id: &str) -> Result<(), String> {
         self.updated_project_config(|project_config| {
             project_config.add_disabled_category(category_id)
         })
@@ -576,17 +598,14 @@ impl LanguageServerBackend {
     }
 
     /// Applies a project-config-mutating command (ignore word / disable
-    /// rule / disable category). Returns the backend rebuilt via
-    /// [`Self::with_new_project_config`] when the project config actually
-    /// changed on disk; the caller is expected to install it and call
-    /// [`Self::recheck_all`] on it.
-    pub async fn handle_execute_command(
-        &self,
-        params: ExecuteCommandParams,
-    ) -> RpcResult<Option<Self>> {
+    /// rule / disable category). Only writes the change to disk; the
+    /// project config file watcher is responsible for noticing the write
+    /// and installing it via [`Self::reload_project_config_if_changed`],
+    /// so there's nothing further for the caller to install here.
+    pub async fn handle_execute_command(&self, params: ExecuteCommandParams) -> RpcResult<()> {
         log::info!("Executing command {}", params.command);
         let first_arg = params.arguments.first().and_then(Value::as_str);
-        let updated_project_config = match (params.command.as_str(), first_arg) {
+        match (params.command.as_str(), first_arg) {
             (COMMAND_IGNORE_WORD, Some(word)) => self.add_ignored_word(word).await,
             (COMMAND_DISABLE_RULE, Some(rule_id)) => self.add_disabled_rule(rule_id).await,
             (COMMAND_DISABLE_CATEGORY, Some(category_id)) => {
@@ -594,24 +613,61 @@ impl LanguageServerBackend {
             }
             _ => {
                 log::warn!("Unknown or invalid command: {}", params.command);
-                Ok(None)
+                Ok(())
             }
         }
-        .map_err(RpcError::invalid_params)?;
+        .map_err(RpcError::invalid_params)
+    }
+}
 
-        match updated_project_config {
-            Some(project_config) => {
-                log::info!(
-                    "Command {} updated project config; scheduling recheck",
-                    params.command
-                );
-                Ok(Some(self.with_new_project_config(project_config)))
-            }
-            None => {
-                log::debug!("Command {} did not change project config", params.command);
-                Ok(None)
-            }
+/// A shared, swappable handle to the server's current
+/// [`LanguageServerBackend`] (or lack thereof, before `initialize`
+/// completes). Cloning is cheap (an `Arc` bump) and every clone observes
+/// the same underlying value, which is how the project config file
+/// watcher (a background task with its own long-lived clone) and the
+/// request-handling code both see backend installs from one another.
+#[derive(Clone)]
+pub struct SharedBackend(Arc<ArcSwap<Option<LanguageServerBackend>>>);
+
+impl SharedBackend {
+    pub fn new() -> Self {
+        Self(Arc::new(ArcSwap::new(Arc::new(None))))
+    }
+
+    pub fn get(&self) -> Option<LanguageServerBackend> {
+        self.0.load().as_ref().clone()
+    }
+
+    pub fn install(&self, backend: LanguageServerBackend) {
+        self.0.store(Arc::new(Some(backend)));
+    }
+
+    /// Installs `backend` iff nothing has been installed yet. Returns
+    /// `true` if it was installed.
+    ///
+    /// This guards against two concurrent `initialize` requests racing
+    /// each other: `tower-lsp-server`'s own duplicate-`initialize` guard
+    /// is a check-then-dispatch against an atomic flag that isn't set
+    /// until the `initialize` future resolves, so both requests could
+    /// otherwise reach this point. Comparing-and-swapping against the
+    /// exact `Arc` most recently observed (by pointer identity, which is
+    /// what `ArcSwap::compare_and_swap` checks) rather than just checking
+    /// `is_some()` and then unconditionally storing closes that race.
+    pub fn try_initialize(&self, backend: LanguageServerBackend) -> bool {
+        let uninitialized = self.0.load();
+        if uninitialized.is_some() {
+            return false;
         }
+        let previous = self
+            .0
+            .compare_and_swap(&uninitialized, Arc::new(Some(backend)));
+        Arc::ptr_eq(&previous, &uninitialized)
+    }
+}
+
+impl Default for SharedBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

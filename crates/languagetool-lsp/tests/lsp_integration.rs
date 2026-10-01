@@ -980,3 +980,110 @@ async fn existing_project_config_is_loaded_on_initialize() {
                 .is_none_or(|replacements| replacements.iter().all(|value| value != "test"))
     }));
 }
+
+#[tokio::test]
+async fn hand_edited_project_config_is_picked_up_by_watcher() {
+    let mut ctx = TestContext::new();
+    // Pre-create the project config directory so the watcher is armed
+    // against it directly from `initialize`, rather than falling back to
+    // watching an ancestor because `.zed/` doesn't exist yet.
+    tokio::fs::create_dir_all(ctx.project_config_path().parent().unwrap())
+        .await
+        .expect("project config directory should be created");
+    ctx.initialize().await;
+    let uri = ctx.doc_uri("document.txt");
+
+    ctx.open_document(&uri, "plaintext", "This are a tset.")
+        .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["data"]["matchedText"] == "tset"),
+        "expected an initial diagnostic for 'tset': {diagnostics:?}"
+    );
+
+    // A hand edit (or another editor window's own commands) writes the
+    // project config directly, bypassing `workspace/executeCommand`
+    // entirely.
+    tokio::fs::write(
+        ctx.project_config_path(),
+        serde_json::to_string_pretty(&json!({ "ignored_words": ["tset"] })).unwrap(),
+    )
+    .await
+    .expect("hand-edited project config should be saved");
+
+    // Nothing in this test ever told the running server about that write;
+    // the project config file watcher notices it, reloads, and triggers
+    // this recheck on its own.
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["data"]["matchedText"] != "tset"),
+        "expected the 'tset' diagnostic to be gone after the watcher picked up the hand-edited \
+         project config: {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn ignore_word_command_takes_effect_via_project_config_watcher() {
+    let mut ctx = TestContext::new();
+    ctx.initialize().await;
+    let uri = ctx.doc_uri("document.txt");
+
+    ctx.open_document(&uri, "plaintext", "This are a tset.")
+        .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["data"]["matchedText"] == "tset"),
+        "expected an initial diagnostic for 'tset': {diagnostics:?}"
+    );
+
+    let result = ctx
+        .request(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+    assert_eq!(result, Value::Null);
+
+    // `executeCommand` only wrote the ignored word to disk (already
+    // covered by `execute_ignore_word_command_writes_project_config`);
+    // there's no direct call path from there to a recheck. This
+    // notification only arrives because the project config file watcher
+    // noticed that write and triggered it.
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["data"]["matchedText"] != "tset"),
+        "expected the 'tset' diagnostic to be gone after ignoring it via \
+         `workspace/executeCommand`: {diagnostics:?}"
+    );
+}

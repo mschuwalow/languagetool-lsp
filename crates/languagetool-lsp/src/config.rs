@@ -238,7 +238,7 @@ impl ClientOptions {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub ignored_words: Vec<String>,

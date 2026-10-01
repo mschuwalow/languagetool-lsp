@@ -1,10 +1,9 @@
-use crate::backend::LanguageServerBackend;
+use crate::backend::{LanguageServerBackend, SharedBackend};
 use crate::config::ClientOptions;
-use arc_swap::ArcSwap;
+use crate::project_config_watcher::ProjectConfigWatcher;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::{Error as RpcError, ErrorCode, Result as RpcResult};
 use tower_lsp_server::ls_types::*;
@@ -37,40 +36,27 @@ fn duplicate_initialize_error() -> RpcError {
     RpcError::invalid_request()
 }
 
-// `LanguageServerBackend` is a few hundred bytes (it now inlines the parsed
-// `ClientOptions`/`ProjectConfig`, not just a pointer to shared state), but
-// this enum is only ever touched behind an `Arc` (see `LanguageServer::state`
-// below) and swapped on rare events (init, config change), not per-request —
-// boxing it to appease the lint would just move that same allocation cost
-// around rather than removing it.
-#[allow(clippy::large_enum_variant)]
-enum LanguageServerState {
-    Uninitialized,
-    Initialized(LanguageServerBackend),
-}
-
 pub struct LanguageServer {
     client: Client,
-    state: ArcSwap<LanguageServerState>,
+    backend: SharedBackend,
+    /// Kept alive for as long as `LanguageServer` is; dropping it would
+    /// stop the project config file watcher (see its docs).
+    project_config_watcher: ProjectConfigWatcher,
 }
 
 impl LanguageServer {
     pub fn new(client: Client) -> Self {
+        let backend = SharedBackend::new();
+        let project_config_watcher = ProjectConfigWatcher::spawn(backend.clone());
         Self {
             client,
-            state: ArcSwap::new(Arc::new(LanguageServerState::Uninitialized)),
-        }
-    }
-
-    fn initialized_backend(&self) -> Option<LanguageServerBackend> {
-        match self.state.load().as_ref() {
-            LanguageServerState::Initialized(backend) => Some(backend.clone()),
-            LanguageServerState::Uninitialized => None,
+            backend,
+            project_config_watcher,
         }
     }
 
     fn require_initialized(&self) -> RpcResult<LanguageServerBackend> {
-        self.initialized_backend().ok_or_else(not_initialized_error)
+        self.backend.get().ok_or_else(not_initialized_error)
     }
 }
 
@@ -78,10 +64,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
         // The `initialize` request may only be sent once per the spec. Fail
         // fast if we're obviously already past that point.
-        if !matches!(
-            self.state.load().as_ref(),
-            LanguageServerState::Uninitialized
-        ) {
+        if self.backend.get().is_some() {
             return Err(duplicate_initialize_error());
         }
 
@@ -107,20 +90,12 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
         // `tower-lsp-server`'s own duplicate-`initialize` guard is a
         // check-then-dispatch against an atomic flag that isn't set until
         // our future resolves, so two `initialize` requests racing each
-        // other could both reach this point. Reload the state right before
-        // publishing (no `.await` between this load and the swap below) and
-        // use it as the compare-and-swap's expected value: `ArcSwap`
-        // compares by pointer identity, so this must be the actual `Arc`
-        // currently in `self.state`, not a freshly constructed one, or the
-        // swap could never succeed.
-        let uninitialized = self.state.load();
-        let previous = self.state.compare_and_swap(
-            &uninitialized,
-            Arc::new(LanguageServerState::Initialized(initialized)),
-        );
-        if !Arc::ptr_eq(&previous, &uninitialized) {
+        // other could both reach this point; `try_initialize` closes that
+        // race with its own compare-and-swap.
+        if !self.backend.try_initialize(initialized) {
             return Err(duplicate_initialize_error());
         }
+        self.project_config_watcher.backend_changed();
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -161,7 +136,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        let Some(backend) = self.initialized_backend() else {
+        let Some(backend) = self.backend.get() else {
             log::warn!("Received `initialized` notification before `initialize` completed");
             return;
         };
@@ -174,7 +149,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let Some(backend) = self.initialized_backend() else {
+        let Some(backend) = self.backend.get() else {
             log::warn!("Dropping `textDocument/didOpen` notification received before initialize");
             return;
         };
@@ -182,7 +157,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let Some(backend) = self.initialized_backend() else {
+        let Some(backend) = self.backend.get() else {
             log::warn!("Dropping `textDocument/didChange` notification received before initialize");
             return;
         };
@@ -190,7 +165,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        let Some(backend) = self.initialized_backend() else {
+        let Some(backend) = self.backend.get() else {
             log::warn!("Dropping `textDocument/didSave` notification received before initialize");
             return;
         };
@@ -198,7 +173,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let Some(backend) = self.initialized_backend() else {
+        let Some(backend) = self.backend.get() else {
             log::warn!("Dropping `textDocument/didClose` notification received before initialize");
             return;
         };
@@ -210,7 +185,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        let Some(backend) = self.initialized_backend() else {
+        let Some(backend) = self.backend.get() else {
             log::warn!(
                 "Dropping `workspace/didChangeConfiguration` notification received before initialize"
             );
@@ -219,22 +194,21 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
         let Some(new_backend) = backend.with_new_config_from_settings(params.settings).await else {
             return;
         };
-        self.state.store(Arc::new(LanguageServerState::Initialized(
-            new_backend.clone(),
-        )));
+        self.backend.install(new_backend.clone());
+        // The resolved project config path may have changed (e.g. a new
+        // `projectConfigPath`); re-arm the watcher immediately rather than
+        // waiting for a filesystem event that might never come.
+        self.project_config_watcher.backend_changed();
         new_backend.recheck_all().await;
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> RpcResult<Option<Value>> {
         let backend = self.require_initialized()?;
-        if let Some(new_backend) = backend.handle_execute_command(params).await? {
-            self.state.store(Arc::new(LanguageServerState::Initialized(
-                new_backend.clone(),
-            )));
-            tokio::spawn(async move {
-                new_backend.recheck_all().await;
-            });
-        }
+        backend.handle_execute_command(params).await?;
+        // `handle_execute_command` only writes to disk; the project config
+        // file watcher notices the write and installs+rechecks it (see
+        // `ProjectConfigWatcher`'s docs), so there's nothing further to do
+        // here.
         Ok(None)
     }
 }
