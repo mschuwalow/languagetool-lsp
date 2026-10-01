@@ -264,7 +264,7 @@ impl TestContext {
 
 /// Sends a sequence of incremental didChange edits and then a didSave trigger.
 /// This test does not require a LanguageTool server; it only validates that the
-/// incremental-edit machinery in DocumentCache doesn't corrupt state.
+/// incremental-edit machinery in `Document` doesn't corrupt state.
 #[tokio::test]
 async fn incremental_did_change_keeps_document_consistent() {
     let mut ctx = TestContext::new();

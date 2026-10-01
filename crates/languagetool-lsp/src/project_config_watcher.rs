@@ -4,82 +4,53 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-/// How long to wait for a burst of filesystem events (e.g. an editor's
-/// write-temp-file-then-rename save pattern, which can produce several
-/// raw events for a single logical change) to settle before notifying.
+/// Settles bursts of filesystem events (e.g. an editor's
+/// write-temp-then-rename save pattern) into a single notification.
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// Tells the watcher what to watch from now on (sent by whoever installs
-/// a new config revision; see [`ProjectConfigWatcherHandle`]).
 struct WatchTarget {
     path: Option<PathBuf>,
     revision: u64,
 }
 
-/// Sent by the watcher when the file at the most recently requested watch
-/// target changes on disk, tagged with the `revision` from the
-/// [`WatchTarget`] that was active at the time. The receiver is
-/// responsible for comparing this against whatever it considers the
-/// current revision and dropping the message if it's fallen behind
-/// (e.g. a `workspace/didChangeConfiguration` moved `projectConfigPath`
-/// to a new revision after this event was already in flight for the
-/// old one).
+/// Sent when the file at the most recently requested watch target changes
+/// on disk, tagged with the revision that was active when the target was
+/// set. The receiver drops this if its own current revision has since
+/// moved on (e.g. `didChangeConfiguration` repointed the watcher before
+/// this notification arrived).
 pub struct ProjectConfigChanged {
     pub revision: u64,
 }
 
-/// A cheap, cloneable handle for telling the long-lived
-/// [`ProjectConfigWatcher`] task what to watch. Sending a new target
-/// doesn't wait for the watcher to act on it -- the whole point of this
-/// being message-passing is that neither side blocks on the other; the
-/// watcher will get to it and emit [`ProjectConfigChanged`] (tagged with
-/// `revision`) once it notices a change, whenever that happens to be.
-#[derive(Clone)]
-pub struct ProjectConfigWatcherHandle(UnboundedSender<WatchTarget>);
-
-impl ProjectConfigWatcherHandle {
-    /// Tells the watcher to watch `path` (or nothing at all, if `None`)
-    /// from now on, superseding whatever it was watching before.
-    /// Subsequent [`ProjectConfigChanged`] notifications for this target
-    /// will carry `revision`.
-    pub fn set_watch_target(&self, path: Option<PathBuf>, revision: u64) {
-        // Only fails if the watcher task is gone (server shutting down);
-        // nothing useful to do about that here.
-        let _ = self.0.send(WatchTarget { path, revision });
-    }
-}
-
-/// Owns the long-lived background task that watches a project config file
-/// path for out-of-band changes (hand edits, another editor window's
-/// commands, version control checkouts, this server's own
-/// project-config-mutating `executeCommand` handlers which only write to
-/// disk and rely on this watcher noticing the write, ...) and reports
-/// them via [`ProjectConfigChanged`] messages. It does *not* reload or
-/// install anything itself -- that's the receiving end's job, once it has
-/// validated the message's revision is still current.
-///
-/// What path is being watched is driven entirely by [`WatchTarget`]
-/// messages sent through a [`ProjectConfigWatcherHandle`]; there's a
-/// single watcher task for the server's whole lifetime, re-pointed as
-/// needed rather than respawned per config revision.
-///
-/// Must be kept alive for as long as watching should continue: dropping
-/// this drops the background task (and, with it, the underlying OS-level
-/// watch), stopping notification of file changes.
+/// A long-lived background task that watches a project config file path
+/// for out-of-band changes (hand edits, another editor window, this
+/// server's own `executeCommand` handlers writing to disk) and reports
+/// them as [`ProjectConfigChanged`]; reloading and installing a new
+/// config is the receiving end's job. One task serves the whole server
+/// lifetime, re-pointed via [`Self::set_watch_target`] as needed.
+/// Dropping it stops the background task and the underlying OS watch.
 pub struct ProjectConfigWatcher {
+    targets: UnboundedSender<WatchTarget>,
     _task: tokio::task::JoinHandle<()>,
 }
 
 impl ProjectConfigWatcher {
-    /// Spawns the background task. `changed` is where it sends
-    /// [`ProjectConfigChanged`] notifications. Returns the watcher (keep
-    /// it alive) and a handle for directing what it watches.
-    pub fn spawn(
-        changed: UnboundedSender<ProjectConfigChanged>,
-    ) -> (Self, ProjectConfigWatcherHandle) {
+    pub fn spawn() -> (Self, UnboundedReceiver<ProjectConfigChanged>) {
+        let (changed_tx, changed_rx) = unbounded_channel();
         let (targets_tx, targets_rx) = unbounded_channel();
-        let task = tokio::spawn(run(targets_rx, changed));
-        (Self { _task: task }, ProjectConfigWatcherHandle(targets_tx))
+        let task = tokio::spawn(run(targets_rx, changed_tx));
+        let watcher = Self {
+            targets: targets_tx,
+            _task: task,
+        };
+        (watcher, changed_rx)
+    }
+
+    /// Watches `path` (or nothing, if `None`) from now on, superseding
+    /// any previous target. Subsequent [`ProjectConfigChanged`]
+    /// notifications for it carry `revision`.
+    pub fn set_watch_target(&self, path: Option<PathBuf>, revision: u64) {
+        let _ = self.targets.send(WatchTarget { path, revision });
     }
 }
 
@@ -89,9 +60,8 @@ async fn run(
 ) {
     let (fs_tx, mut fs_events) = unbounded_channel::<DebounceEventResult>();
     let mut debouncer = match new_debouncer(DEBOUNCE, move |result| {
-        // Runs on a native OS thread managed by `notify`/`notify-debouncer-mini`,
-        // not on the tokio runtime; just forward the (already debounced)
-        // result and let this task do the actual async work below.
+        // Runs on a thread owned by `notify`, not the tokio runtime; just
+        // forward the result and let this task do the async work below.
         let _ = fs_tx.send(result);
     }) {
         Ok(debouncer) => debouncer,
@@ -100,9 +70,8 @@ async fn run(
                 "Failed to start the project config file watcher; changes made to it outside \
                  of this server's own commands won't be picked up automatically: {err}"
             );
-            // Keep draining `targets` so `set_watch_target` callers don't
-            // see a closed channel; there's just nothing to act on them
-            // with.
+            // Keep draining so `set_watch_target` callers don't see a
+            // closed channel; there's just nothing to act on.
             while targets.recv().await.is_some() {}
             return;
         }
@@ -128,21 +97,17 @@ async fn run(
                             });
                         }
                         // A closer ancestor of the target path may have
-                        // just been created (see
-                        // `nearest_existing_ancestor`'s docs); check
-                        // again so later events are observed precisely.
+                        // just appeared; re-check so later events are
+                        // watched precisely (see `nearest_existing_ancestor`).
                         let dir = resolved_target_dir(&current).await;
                         rearm(&mut debouncer, &mut watched_dir, dir).await;
                     }
                     Some(Err(err)) => {
                         log::warn!("Project config file watcher error: {err}");
                     }
-                    // The sender (owned by the `notify` callback closure,
-                    // which is owned by `debouncer`, which this task
-                    // owns) can only have been dropped by dropping
-                    // `debouncer` -- which this loop never does, so this
-                    // is unreachable in practice. Stop rather than spin
-                    // if it somehow does happen.
+                    // Only reachable if `debouncer` (which owns the
+                    // sending half) were dropped, which this loop never
+                    // does.
                     None => break,
                 }
             }
@@ -155,9 +120,8 @@ async fn resolved_target_dir(current: &Option<WatchTarget>) -> Option<PathBuf> {
     Some(nearest_existing_ancestor(path).await)
 }
 
-/// (Re-)adjusts `debouncer`'s watch set to match `target_dir`, if it
-/// changed. A no-op (not just a no-op watch call, but no filesystem
-/// syscalls at all) when the target is unchanged from last time.
+/// Adjusts `debouncer`'s watch set to `target_dir`, if it changed; a
+/// true no-op (no syscalls) otherwise.
 async fn rearm(
     debouncer: &mut Debouncer<RecommendedWatcher>,
     watched_dir: &mut Option<PathBuf>,
@@ -199,21 +163,13 @@ async fn rearm(
     }
 }
 
-/// `notify` needs an existing path to watch (a file can be watched
-/// directly, but not one that doesn't exist yet; watching a nonexistent
-/// directory fails outright on most platforms). Rather than requiring the
-/// project config file (or even its parent directory, e.g. `.zed/`) to
-/// already exist, this walks up to the nearest ancestor that does, and
-/// watches that non-recursively instead. Once a closer ancestor is
-/// created, the watcher will observe *that* creation event, which
-/// triggers a re-check of this function's result (see `run`'s main
-/// loop), re-arming the watch against the now-existing (and more
-/// specific) directory.
-///
-/// Watching the parent directory rather than the file itself is also
-/// `notify`'s own recommended pattern for surviving the file being
-/// replaced (e.g. an editor's write-temp-then-rename save) or removed,
-/// which behave surprisingly if the file itself is the watch target.
+/// `notify` can't watch a path that doesn't exist yet, so this walks up
+/// to the nearest existing ancestor and watches that non-recursively
+/// instead -- also `notify`'s recommended way to survive the file being
+/// replaced (e.g. write-temp-then-rename) or removed. Once a closer
+/// ancestor appears, the watcher observes *that* creation event, which
+/// re-triggers this via `run`'s main loop and re-arms against the now
+/// more specific directory.
 async fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     let mut candidate = path
         .parent()

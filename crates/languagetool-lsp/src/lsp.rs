@@ -52,6 +52,17 @@ impl LanguageServer {
     fn require_initialized(&self) -> RpcResult<&LanguageServerBackend> {
         self.backend.get().ok_or_else(not_initialized_error)
     }
+
+    /// Same as [`Self::require_initialized`], but for notification
+    /// handlers, which have no error channel back to the client and so
+    /// just log and drop the notification instead.
+    fn backend_for_notification(&self, method: &str) -> Option<&LanguageServerBackend> {
+        let backend = self.backend.get();
+        if backend.is_none() {
+            log::warn!("Dropping `{method}` notification received before initialize");
+        }
+        backend
+    }
 }
 
 impl tower_lsp_server::LanguageServer for LanguageServer {
@@ -117,8 +128,7 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        let Some(backend) = self.backend.get() else {
-            log::warn!("Received `initialized` notification before `initialize` completed");
+        let Some(backend) = self.backend_for_notification("initialized") else {
             return;
         };
         backend.log_ready().await;
@@ -130,32 +140,28 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let Some(backend) = self.backend.get() else {
-            log::warn!("Dropping `textDocument/didOpen` notification received before initialize");
+        let Some(backend) = self.backend_for_notification("textDocument/didOpen") else {
             return;
         };
         backend.did_open(params).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let Some(backend) = self.backend.get() else {
-            log::warn!("Dropping `textDocument/didChange` notification received before initialize");
+        let Some(backend) = self.backend_for_notification("textDocument/didChange") else {
             return;
         };
         backend.did_change(params).await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        let Some(backend) = self.backend.get() else {
-            log::warn!("Dropping `textDocument/didSave` notification received before initialize");
+        let Some(backend) = self.backend_for_notification("textDocument/didSave") else {
             return;
         };
         backend.did_save(params).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let Some(backend) = self.backend.get() else {
-            log::warn!("Dropping `textDocument/didClose` notification received before initialize");
+        let Some(backend) = self.backend_for_notification("textDocument/didClose") else {
             return;
         };
         backend.did_close(params).await;
@@ -166,10 +172,8 @@ impl tower_lsp_server::LanguageServer for LanguageServer {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        let Some(backend) = self.backend.get() else {
-            log::warn!(
-                "Dropping `workspace/didChangeConfiguration` notification received before initialize"
-            );
+        let Some(backend) = self.backend_for_notification("workspace/didChangeConfiguration")
+        else {
             return;
         };
         backend.with_new_config_from_settings(params.settings).await;

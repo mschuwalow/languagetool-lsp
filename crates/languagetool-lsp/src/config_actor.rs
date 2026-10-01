@@ -1,7 +1,5 @@
 use crate::config::{ClientOptions, ProjectConfig};
-use crate::project_config_watcher::{
-    ProjectConfigChanged, ProjectConfigWatcher, ProjectConfigWatcherHandle,
-};
+use crate::project_config_watcher::{ProjectConfigChanged, ProjectConfigWatcher};
 use crate::runtime_config::RuntimeConfig;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,28 +44,25 @@ pub async fn spawn(
     let project_config = load_project_config(project_config_path.as_deref()).await;
     let runtime_config = Arc::new(RuntimeConfig::new(client_options, project_config));
 
-    let (watcher_events_tx, watcher_events_rx) = mpsc::unbounded_channel();
-    let (watcher_task, watcher_handle) = ProjectConfigWatcher::spawn(watcher_events_tx);
-    watcher_handle.set_watch_target(project_config_path, runtime_config.revision);
+    let (watcher, watcher_events) = ProjectConfigWatcher::spawn();
+    watcher.set_watch_target(project_config_path, runtime_config.revision);
 
     let (config_tx, config_rx) = watch::channel(runtime_config);
     let (events_tx, events_rx) = mpsc::unbounded_channel();
 
     let actor = ConfigActor {
         root,
-        watcher_handle,
-        _watcher_task: watcher_task,
+        watcher,
         config_tx,
     };
-    tokio::spawn(run(actor, events_rx, watcher_events_rx));
+    tokio::spawn(run(actor, events_rx, watcher_events));
 
     (ConfigActorHandle(events_tx), config_rx)
 }
 
 struct ConfigActor {
     root: Option<PathBuf>,
-    watcher_handle: ProjectConfigWatcherHandle,
-    _watcher_task: ProjectConfigWatcher,
+    watcher: ProjectConfigWatcher,
     config_tx: watch::Sender<Arc<RuntimeConfig>>,
 }
 
@@ -82,7 +77,7 @@ impl ConfigActor {
         let new_config = self
             .current()
             .with_new_client_options(client_options, project_config);
-        self.watcher_handle
+        self.watcher
             .set_watch_target(project_config_path, new_config.revision);
         let _ = self.config_tx.send(Arc::new(new_config));
     }
