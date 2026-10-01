@@ -56,6 +56,9 @@ impl LanguageServerBackend {
             self.config.clone(),
             &params.text_document,
         );
+        // Dropping a replaced handle closes its actor (see
+        // `DocumentActorHandle`'s docs), so this also cleans up properly
+        // if the client reopens a document it never closed.
         if self
             .documents
             .lock()
@@ -86,10 +89,11 @@ impl LanguageServerBackend {
     }
 
     pub async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let uri = params.text_document.uri;
-        if let Some(handle) = self.documents.lock().await.remove(uri.as_str()) {
-            handle.close();
-        }
+        // Dropping the handle closes the actor; see `DocumentActorHandle`.
+        self.documents
+            .lock()
+            .await
+            .remove(params.text_document.uri.as_str());
     }
 
     pub async fn code_action(

@@ -16,13 +16,23 @@ use tower_lsp_server::ls_types::{
     MessageType, Range, TextDocumentContentChangeEvent, TextDocumentItem,
 };
 
-enum DocumentEvent {
+/// What [`DocumentActorHandle`] sends. The actor shuts down when this
+/// channel closes, i.e. when the handle is dropped -- so this must stay
+/// the *only* sender the actor doesn't hold a clone of itself.
+enum ExternalEvent {
     Changed {
         version: i32,
         changes: Vec<TextDocumentContentChangeEvent>,
     },
     Saved,
-    Close,
+}
+
+/// What the actor sends to itself, for debounce timers and check tasks it
+/// spawns to report back on. Kept on a separate channel from
+/// [`ExternalEvent`] specifically because the actor holds a sender clone
+/// of this one permanently, which would otherwise keep the actor alive
+/// forever once dropped by its handle.
+enum InternalEvent {
     DebounceElapsed(u64),
     CheckCompleted {
         generation: u64,
@@ -30,20 +40,17 @@ enum DocumentEvent {
     },
 }
 
-#[derive(Clone)]
-pub struct DocumentActorHandle(mpsc::UnboundedSender<DocumentEvent>);
+/// Dropping this closes the document actor (see [`ExternalEvent`]'s
+/// docs); deliberately not `Clone` so there's exactly one owner to drop.
+pub struct DocumentActorHandle(mpsc::UnboundedSender<ExternalEvent>);
 
 impl DocumentActorHandle {
     pub fn changed(&self, version: i32, changes: Vec<TextDocumentContentChangeEvent>) {
-        let _ = self.0.send(DocumentEvent::Changed { version, changes });
+        let _ = self.0.send(ExternalEvent::Changed { version, changes });
     }
 
     pub fn saved(&self) {
-        let _ = self.0.send(DocumentEvent::Saved);
-    }
-
-    pub fn close(&self) {
-        let _ = self.0.send(DocumentEvent::Close);
+        let _ = self.0.send(ExternalEvent::Saved);
     }
 }
 
@@ -52,30 +59,32 @@ pub fn spawn(
     config: watch::Receiver<Arc<RuntimeConfig>>,
     text_document: &TextDocumentItem,
 ) -> DocumentActorHandle {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (external_tx, external_rx) = mpsc::unbounded_channel();
+    let (internal_tx, internal_rx) = mpsc::unbounded_channel();
     let actor = DocumentActor {
         document: Document::from_text_document(text_document),
         client,
         config,
-        events: tx.clone(),
+        internal: internal_tx,
         generation: 0,
     };
-    tokio::spawn(run(actor, rx));
-    DocumentActorHandle(tx)
+    tokio::spawn(run(actor, external_rx, internal_rx));
+    DocumentActorHandle(external_tx)
 }
 
 struct DocumentActor {
     document: Document,
     client: Client,
     config: watch::Receiver<Arc<RuntimeConfig>>,
-    events: mpsc::UnboundedSender<DocumentEvent>,
+    internal: mpsc::UnboundedSender<InternalEvent>,
     generation: u64,
 }
 
-// `Close` is a message rather than relying on the channel closing because
-// the actor holds its own `events` sender for self-scheduled checks, so
-// the channel never naturally closes on its own.
-async fn run(mut actor: DocumentActor, mut events: mpsc::UnboundedReceiver<DocumentEvent>) {
+async fn run(
+    mut actor: DocumentActor,
+    mut external: mpsc::UnboundedReceiver<ExternalEvent>,
+    mut internal: mpsc::UnboundedReceiver<InternalEvent>,
+) {
     let uri = actor.document.uri().clone();
     log::info!("Opened document {}", uri.as_str());
 
@@ -85,10 +94,11 @@ async fn run(mut actor: DocumentActor, mut events: mpsc::UnboundedReceiver<Docum
 
     loop {
         tokio::select! {
-            event = events.recv() => match event {
-                Some(DocumentEvent::Close) | None => break,
-                Some(event) => actor.handle(event).await,
+            event = external.recv() => match event {
+                Some(event) => actor.handle_external(event).await,
+                None => break,
             },
+            Some(event) = internal.recv() => actor.handle_internal(event).await,
             Ok(()) = actor.config.changed() => actor.start_check().await,
         }
     }
@@ -101,23 +111,27 @@ async fn run(mut actor: DocumentActor, mut events: mpsc::UnboundedReceiver<Docum
 }
 
 impl DocumentActor {
-    async fn handle(&mut self, event: DocumentEvent) {
+    async fn handle_external(&mut self, event: ExternalEvent) {
         match event {
-            DocumentEvent::Changed { version, changes } => self.apply_changes(version, changes),
-            DocumentEvent::Saved if self.config.borrow().options.check_on_save => {
+            ExternalEvent::Changed { version, changes } => self.apply_changes(version, changes),
+            ExternalEvent::Saved if self.config.borrow().options.check_on_save => {
                 self.start_check().await;
             }
-            DocumentEvent::Saved => {}
-            DocumentEvent::DebounceElapsed(generation) if generation == self.generation => {
+            ExternalEvent::Saved => {}
+        }
+    }
+
+    async fn handle_internal(&mut self, event: InternalEvent) {
+        match event {
+            InternalEvent::DebounceElapsed(generation) if generation == self.generation => {
                 self.start_check().await;
             }
-            DocumentEvent::DebounceElapsed(_) => {}
-            DocumentEvent::CheckCompleted {
+            InternalEvent::DebounceElapsed(_) => {}
+            InternalEvent::CheckCompleted {
                 generation,
                 checked_blocks,
             } if generation == self.generation => self.publish(checked_blocks).await,
-            DocumentEvent::CheckCompleted { .. } => {}
-            DocumentEvent::Close => unreachable!("handled in the main loop"),
+            InternalEvent::CheckCompleted { .. } => {}
         }
     }
 
@@ -146,10 +160,10 @@ impl DocumentActor {
         self.generation += 1;
         let generation = self.generation;
         let debounce = self.config.borrow().options.debounce_ms;
-        let events = self.events.clone();
+        let internal = self.internal.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
-            let _ = events.send(DocumentEvent::DebounceElapsed(generation));
+            let _ = internal.send(InternalEvent::DebounceElapsed(generation));
         });
     }
 
@@ -163,10 +177,10 @@ impl DocumentActor {
         match self.document.prepare_check(config.options_version) {
             PreparedCheck::Check(data) => {
                 let client = self.client.clone();
-                let events = self.events.clone();
+                let internal = self.internal.clone();
                 tokio::spawn(async move {
                     let checked_blocks = run_check(data, &config, &client).await;
-                    let _ = events.send(DocumentEvent::CheckCompleted {
+                    let _ = internal.send(InternalEvent::CheckCompleted {
                         generation,
                         checked_blocks,
                     });
