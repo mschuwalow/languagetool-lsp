@@ -10,11 +10,10 @@ use std::sync::Arc;
 /// counters -- see [`Self::options_version`] and [`Self::revision`]'s
 /// docs for why they're not the same thing.
 ///
-/// Always replaced as a whole behind a single `ArcSwap<RuntimeConfig>`,
-/// never mutated field-by-field or swapped alongside a second `ArcSwap`,
-/// so that one `.load()` always sees a mutually consistent snapshot of
-/// all of them -- there's no window where a reader could observe, say,
-/// the new `options` paired with the old `language_tool` client.
+/// Always replaced as a whole, broadcast via a single `watch::Sender`, so
+/// that one `.borrow()` always sees a mutually consistent snapshot of all
+/// of them -- there's no window where a reader could observe, say, the
+/// new `options` paired with the old `language_tool` client.
 pub struct RuntimeConfig {
     pub client_options: ClientOptions,
     pub project_config: ProjectConfig,

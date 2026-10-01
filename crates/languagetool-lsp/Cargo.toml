@@ -17,7 +17,6 @@ path = "src/lib.rs"
 [dependencies]
 languagetool-client = { path = "../languagetool-client", default-features = false, features = ["rustls"] }
 
-arc-swap = "1"
 env_logger = "0.11"
 log = "0.4"
 notify-debouncer-mini = "0.7"

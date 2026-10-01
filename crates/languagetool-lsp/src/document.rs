@@ -45,13 +45,12 @@ struct OutOfSyncDocument {
 #[derive(Debug)]
 pub enum PreparedCheck {
     Check(PreparedCheckData),
-    ReuseCached { uri: Uri, version: i32 },
-    Clear { uri: Uri, version: i32 },
+    ReuseCached,
+    Clear,
 }
 
 #[derive(Debug)]
 pub struct PreparedCheckData {
-    pub uri: Uri,
     pub version: i32,
     pub text: Arc<String>,
     pub index: Arc<TextIndex>,
@@ -156,10 +155,7 @@ impl Document {
 
     pub(crate) fn prepare_check(&mut self, options_version: u64) -> PreparedCheck {
         let Some(document) = self.supported_mut() else {
-            return PreparedCheck::Clear {
-                uri: self.uri().clone(),
-                version: self.version(),
-            };
+            return PreparedCheck::Clear;
         };
         document.prepare_check(options_version)
     }
@@ -263,10 +259,7 @@ impl SupportedDocument {
                 self.language
             );
             self.diagnostics_cache.clear();
-            return PreparedCheck::Clear {
-                uri: self.uri.clone(),
-                version: self.version,
-            };
+            return PreparedCheck::Clear;
         }
 
         self.diagnostics_cache
@@ -278,14 +271,10 @@ impl SupportedDocument {
             .collect();
 
         if blocks.is_empty() {
-            return PreparedCheck::ReuseCached {
-                uri: self.uri.clone(),
-                version: self.version,
-            };
+            return PreparedCheck::ReuseCached;
         }
 
         PreparedCheck::Check(PreparedCheckData {
-            uri: self.uri.clone(),
             version: self.version,
             text: Arc::clone(&self.text),
             index: Arc::clone(&self.index),
@@ -353,10 +342,7 @@ mod tests {
 
         assert!(matches!(document.kind, DocumentKind::OutOfSync(_)));
         assert_eq!(document.version(), 2);
-        assert!(matches!(
-            document.prepare_check(0),
-            PreparedCheck::Clear { .. }
-        ));
+        assert!(matches!(document.prepare_check(0), PreparedCheck::Clear));
     }
 
     #[test]
@@ -527,10 +513,7 @@ mod tests {
         );
 
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
-        assert!(matches!(
-            document.prepare_check(0),
-            PreparedCheck::Clear { .. }
-        ));
+        assert!(matches!(document.prepare_check(0), PreparedCheck::Clear));
         assert_eq!(document.version(), 1);
 
         document.incremental_update(
@@ -540,10 +523,7 @@ mod tests {
         );
 
         assert!(matches!(&document.kind, DocumentKind::Unsupported(_)));
-        assert!(matches!(
-            document.prepare_check(0),
-            PreparedCheck::Clear { .. }
-        ));
+        assert!(matches!(document.prepare_check(0), PreparedCheck::Clear));
         assert_eq!(document.version(), 2);
     }
 
