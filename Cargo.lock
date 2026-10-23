@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "languagetool-client"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "languagetool-lsp"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "env_logger",
  "httpmock",
