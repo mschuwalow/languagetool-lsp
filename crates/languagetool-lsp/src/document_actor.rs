@@ -17,8 +17,7 @@ use tower_lsp_server::ls_types::{
 };
 
 /// What [`DocumentActorHandle`] sends. The actor shuts down when this
-/// channel closes, i.e. when the handle is dropped -- so this must stay
-/// the *only* sender the actor doesn't hold a clone of itself.
+/// channel closes, i.e. when the handle is dropped.
 enum ExternalEvent {
     Changed {
         version: i32,
@@ -40,8 +39,7 @@ enum InternalEvent {
     },
 }
 
-/// Dropping this closes the document actor (see [`ExternalEvent`]'s
-/// docs); deliberately not `Clone` so there's exactly one owner to drop.
+/// Dropping this closes the document actor.
 pub struct DocumentActorHandle(mpsc::UnboundedSender<ExternalEvent>);
 
 impl DocumentActorHandle {
@@ -167,9 +165,6 @@ impl DocumentActor {
         });
     }
 
-    // Bumping `generation` on every start, not just on edits, lets an
-    // immediate check (on save, or triggered by a config change) supersede
-    // an older debounce that's still pending or a check still in flight.
     async fn start_check(&mut self) {
         self.generation += 1;
         let generation = self.generation;

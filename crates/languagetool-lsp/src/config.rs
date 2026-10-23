@@ -28,12 +28,6 @@ fn default_cloud_timeout_ms() -> u64 {
     20_000
 }
 
-/// The LanguageTool backend to check text against, plus whatever
-/// configuration only makes sense for that specific backend: a self-hosted
-/// `Custom` server has a `url` but no credentials, while `Cloud` (the
-/// hosted api.languagetool.org service) takes optional `username`/`apiKey`
-/// but has a fixed URL. Each variant also carries its own timeout, since a
-/// self-hosted server and a remote cloud API warrant different defaults.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(
     tag = "type",

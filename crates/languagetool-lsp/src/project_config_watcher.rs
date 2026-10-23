@@ -13,22 +13,10 @@ struct WatchTarget {
     revision: u64,
 }
 
-/// Sent when the file at the most recently requested watch target changes
-/// on disk, tagged with the revision that was active when the target was
-/// set. The receiver drops this if its own current revision has since
-/// moved on (e.g. `didChangeConfiguration` repointed the watcher before
-/// this notification arrived).
 pub struct ProjectConfigChanged {
     pub revision: u64,
 }
 
-/// A long-lived background task that watches a project config file path
-/// for out-of-band changes (hand edits, another editor window, this
-/// server's own `executeCommand` handlers writing to disk) and reports
-/// them as [`ProjectConfigChanged`]; reloading and installing a new
-/// config is the receiving end's job. One task serves the whole server
-/// lifetime, re-pointed via [`Self::set_watch_target`] as needed.
-/// Dropping it stops the background task and the underlying OS watch.
 pub struct ProjectConfigWatcher {
     targets: UnboundedSender<WatchTarget>,
     _task: tokio::task::JoinHandle<()>,
@@ -46,9 +34,6 @@ impl ProjectConfigWatcher {
         (watcher, changed_rx)
     }
 
-    /// Watches `path` (or nothing, if `None`) from now on, superseding
-    /// any previous target. Subsequent [`ProjectConfigChanged`]
-    /// notifications for it carry `revision`.
     pub fn set_watch_target(&self, path: Option<PathBuf>, revision: u64) {
         let _ = self.targets.send(WatchTarget { path, revision });
     }
@@ -96,9 +81,7 @@ async fn run(
                                 revision: target.revision,
                             });
                         }
-                        // A closer ancestor of the target path may have
-                        // just appeared; re-check so later events are
-                        // watched precisely (see `nearest_existing_ancestor`).
+
                         let dir = resolved_target_dir(&current).await;
                         rearm(&mut debouncer, &mut watched_dir, dir).await;
                     }
@@ -120,8 +103,6 @@ async fn resolved_target_dir(current: &Option<WatchTarget>) -> Option<PathBuf> {
     Some(nearest_existing_ancestor(path).await)
 }
 
-/// Adjusts `debouncer`'s watch set to `target_dir`, if it changed; a
-/// true no-op (no syscalls) otherwise.
 async fn rearm(
     debouncer: &mut Debouncer<RecommendedWatcher>,
     watched_dir: &mut Option<PathBuf>,

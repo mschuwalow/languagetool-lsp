@@ -2,10 +2,6 @@ use crate::config::{ClientOptions, ProjectConfig};
 use crate::languagetool::LanguageToolClient;
 use std::sync::Arc;
 
-/// A backend's full configuration, replaced as a whole and broadcast via
-/// a single `watch::Sender` so a reader never observes a mix of fields
-/// from two different revisions (e.g. new `options` with a stale
-/// `language_tool` client).
 pub struct RuntimeConfig {
     pub client_options: ClientOptions,
     pub project_config: ProjectConfig,
@@ -41,10 +37,6 @@ impl RuntimeConfig {
         }
     }
 
-    /// Replaces `client_options` wholesale; the caller resolves and
-    /// loads the matching `project_config` itself, since that's an
-    /// async disk read this method can't do. Bumps both
-    /// `options_version` and `revision`.
     pub fn with_new_client_options(
         &self,
         client_options: ClientOptions,
@@ -62,9 +54,6 @@ impl RuntimeConfig {
         }
     }
 
-    /// Replaces `project_config` only; `client_options` (and the
-    /// resolved project config path) are untouched. Bumps
-    /// `options_version` but deliberately not `revision`.
     pub fn with_new_project_config(&self, project_config: ProjectConfig) -> Self {
         let options = Arc::new(project_config.merged_options(&self.client_options));
         Self {
