@@ -1,6 +1,7 @@
-use crate::config::{BackendKind, ClientOptions};
+use crate::config::{ClientOptions, LanguageToolBackend};
 use languagetool_client as api;
 use serde::Serialize;
+use std::time::Duration;
 use thiserror::Error;
 
 pub type LanguageToolMatch = languagetool_client::models::CheckPost200ResponseMatchesInner;
@@ -24,21 +25,13 @@ pub enum LanguageToolError {
 
 #[derive(Debug, Clone)]
 pub struct LanguageToolClient {
-    custom_client: reqwest::Client,
-    cloud_client: reqwest::Client,
-}
-
-impl Default for LanguageToolClient {
-    fn default() -> Self {
-        Self::new()
-    }
+    client: reqwest::Client,
 }
 
 impl LanguageToolClient {
-    pub fn new() -> Self {
+    pub fn new(backend: &LanguageToolBackend) -> Self {
         Self {
-            custom_client: http_client(BackendKind::Custom),
-            cloud_client: http_client(BackendKind::Cloud),
+            client: http_client(backend.timeout()),
         }
     }
 
@@ -66,19 +59,11 @@ impl LanguageToolClient {
         let enabled_rules = none_if_empty(&enabled_rules);
         let enabled_categories = none_if_empty(&enabled_categories);
         let level = options.level.map(|level| level.as_str());
-
-        let (username, api_key) = match (&options.username, &options.api_key) {
-            (Some(username), Some(api_key))
-                if !username.trim().is_empty() && !api_key.trim().is_empty() =>
-            {
-                (Some(username.as_str()), Some(api_key.as_str()))
-            }
-            _ => (None, None),
-        };
+        let (username, api_key) = options.backend.credentials();
 
         let configuration = api::apis::configuration::Configuration {
             base_path: api_base_url,
-            client: self.client_for(options).clone(),
+            client: self.client.clone(),
             ..api::apis::configuration::Configuration::default()
         };
 
@@ -107,13 +92,6 @@ impl LanguageToolClient {
             response.matches.len()
         );
         Ok(response)
-    }
-
-    fn client_for(&self, options: &ClientOptions) -> &reqwest::Client {
-        match options.backend {
-            BackendKind::Custom => &self.custom_client,
-            BackendKind::Cloud => &self.cloud_client,
-        }
     }
 }
 
@@ -211,9 +189,9 @@ impl Annotation {
     }
 }
 
-fn http_client(backend: BackendKind) -> reqwest::Client {
+fn http_client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(backend.timeout())
+        .timeout(timeout)
         .build()
         .expect("LanguageTool HTTP client should build")
 }

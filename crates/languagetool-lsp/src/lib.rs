@@ -1,11 +1,14 @@
+pub(crate) mod backend;
 pub(crate) mod config;
+pub(crate) mod config_actor;
 pub(crate) mod diagnostics;
 pub(crate) mod diagnostics_cache;
 pub(crate) mod document;
-pub(crate) mod document_cache;
+pub(crate) mod document_actor;
 pub(crate) mod language;
 pub(crate) mod languagetool;
 pub mod lsp;
 pub(crate) mod masking;
+pub(crate) mod project_config_watcher;
 pub(crate) mod runtime_config;
 pub(crate) mod text_index;

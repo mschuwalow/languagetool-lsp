@@ -1,5 +1,5 @@
 use httpmock::prelude::*;
-use languagetool_lsp::lsp::Backend;
+use languagetool_lsp::lsp::LanguageServer;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,7 +26,7 @@ impl TestContext {
         let (request_tx, server_rx) = duplex(1024 * 1024);
         let (server_tx, response_rx) = duplex(1024 * 1024);
         let response_rx = BufReader::new(response_rx);
-        let (service, socket) = LspService::new(Backend::new);
+        let (service, socket) = LspService::new(LanguageServer::new);
         let server = tokio::spawn(Server::new(server_rx, server_tx, socket).serve(service));
 
         Self {
@@ -59,9 +59,20 @@ impl TestContext {
 
     async fn initialize_with_options(&mut self, extra_options: Value) -> Value {
         let root_uri = self.root_uri();
+        self.initialize_with_root(Some(root_uri), extra_options)
+            .await
+    }
+
+    /// Initializes without a workspace root, simulating a client that opened
+    /// a single file with no folder (legal per the LSP spec: `rootUri` and
+    /// `workspaceFolders` may both be `null`).
+    async fn initialize_without_workspace_folder(&mut self) -> Value {
+        self.initialize_with_root(None, json!({})).await
+    }
+
+    async fn initialize_with_root(&mut self, root_uri: Option<Uri>, extra_options: Value) -> Value {
         let mut initialization_options = json!({
-            "backend": "custom",
-            "customBackendUrl": "http://localhost:8081",
+            "backend": { "type": "custom", "url": "http://localhost:8081" },
             "language": "en-US",
             "checkOnOpen": true,
             "checkOnSave": true,
@@ -88,7 +99,7 @@ impl TestContext {
                 },
                 "processId": null,
                 "rootUri": root_uri,
-                "workspaceFolders": [{ "name": "test", "uri": root_uri }],
+                "workspaceFolders": root_uri.map(|uri| vec![json!({ "name": "test", "uri": uri })]),
                 "initializationOptions": initialization_options
             }),
         )
@@ -253,7 +264,7 @@ impl TestContext {
 
 /// Sends a sequence of incremental didChange edits and then a didSave trigger.
 /// This test does not require a LanguageTool server; it only validates that the
-/// incremental-edit machinery in DocumentCache doesn't corrupt state.
+/// incremental-edit machinery in `Document` doesn't corrupt state.
 #[tokio::test]
 async fn incremental_did_change_keeps_document_consistent() {
     let mut ctx = TestContext::new();
@@ -449,6 +460,28 @@ fn merge_json(base: &mut Value, patch: Value) {
 }
 
 #[tokio::test]
+async fn duplicate_initialize_request_is_rejected() {
+    let mut ctx = TestContext::new();
+    ctx.initialize().await;
+
+    // Per the LSP spec, `initialize` may only be sent once; a second
+    // request should be rejected rather than silently re-initializing.
+    let error = ctx
+        .request_error(
+            "initialize",
+            json!({
+                "capabilities": {},
+                "processId": null,
+                "rootUri": ctx.root_uri(),
+                "workspaceFolders": [{ "name": "test", "uri": ctx.root_uri() }],
+            }),
+        )
+        .await;
+
+    assert_eq!(error["code"], json!(-32600), "expected InvalidRequest");
+}
+
+#[tokio::test]
 async fn initialize_reports_expected_capabilities() {
     let mut ctx = TestContext::new();
 
@@ -605,6 +638,25 @@ async fn initialize_workspace_root_controls_project_config_location() {
 }
 
 #[tokio::test]
+async fn initialize_without_workspace_folder_disables_relative_project_config() {
+    let mut ctx = TestContext::new();
+    ctx.initialize_without_workspace_folder().await;
+
+    let error = ctx
+        .request_error(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+
+    assert_eq!(error["code"], -32602);
+    assert!(!ctx.project_config_path().exists());
+}
+
+#[tokio::test]
 async fn execute_command_reports_project_config_save_failure() {
     let mut ctx = TestContext::new();
     ctx.initialize().await;
@@ -653,8 +705,7 @@ async fn check_failure_clears_stale_diagnostics() {
     });
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
-        "backend": "custom",
-        "customBackendUrl": server.base_url()
+        "backend": { "type": "custom", "url": server.base_url() }
     }))
     .await;
     let uri = ctx.doc_uri("document.txt");
@@ -670,8 +721,10 @@ async fn check_failure_clears_stale_diagnostics() {
         "workspace/didChangeConfiguration",
         json!({
             "settings": {
-                "backend": "custom",
-                "customBackendUrl": format!("{}/missing", server.base_url()),
+                "backend": {
+                    "type": "custom",
+                    "url": format!("{}/missing", server.base_url())
+                },
                 "language": "en-US",
                 "checkOnOpen": true,
                 "checkOnSave": true,
@@ -716,8 +769,7 @@ async fn cached_block_diagnostics_are_republished_without_rechecking() {
     });
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
-        "backend": "custom",
-        "customBackendUrl": server.base_url(),
+        "backend": { "type": "custom", "url": server.base_url() },
         "checkWhileTyping": false,
         "checkOnSave": true
     }))
@@ -809,18 +861,32 @@ async fn execute_command_uses_configured_project_config_path() {
 }
 
 #[tokio::test]
-async fn partial_configuration_change_preserves_existing_options() {
+async fn dropped_configuration_settings_revert_to_defaults() {
     let mut ctx = TestContext::new();
     ctx.initialize_with_options(json!({
         "projectConfigPath": ".idea/languagetool.json"
     }))
     .await;
 
+    let uri = ctx.doc_uri("document.txt");
+    ctx.open_document(&uri, "plaintext", "hello world").await;
+    // Consume the open-triggered diagnostics notification so it isn't
+    // confused with the one triggered by the config change below.
+    ctx.wait_notification("textDocument/publishDiagnostics")
+        .await;
+
     ctx.notify(
         "workspace/didChangeConfiguration",
         json!({ "settings": { "debounceMs": 100 } }),
     )
     .await;
+    // `recheck_all` (triggered by the config change) only publishes
+    // diagnostics after installing the new backend, so waiting for this
+    // notification guarantees the swap has already happened by the time
+    // the request below is sent.
+    ctx.wait_notification("textDocument/publishDiagnostics")
+        .await;
+
     let result = ctx
         .request(
             "workspace/executeCommand",
@@ -832,13 +898,17 @@ async fn partial_configuration_change_preserves_existing_options() {
         .await;
 
     assert_eq!(result, Value::Null);
-    assert!(!ctx.project_config_path().exists());
+    // The `didChangeConfiguration` settings only mentioned `debounceMs`, so
+    // `projectConfigPath` (set at `initialize`) is *not* preserved — it
+    // reverts to the default, since settings are parsed fresh rather than
+    // merged with the previous options.
     assert!(
-        ctx.workspace
+        !ctx.workspace
             .path()
             .join(".idea/languagetool.json")
             .exists()
     );
+    assert!(ctx.project_config_path().exists());
 }
 
 #[tokio::test]
@@ -909,4 +979,111 @@ async fn existing_project_config_is_loaded_on_initialize() {
                 .as_array()
                 .is_none_or(|replacements| replacements.iter().all(|value| value != "test"))
     }));
+}
+
+#[tokio::test]
+async fn hand_edited_project_config_is_picked_up_by_watcher() {
+    let mut ctx = TestContext::new();
+    // Pre-create the project config directory so the watcher is armed
+    // against it directly from `initialize`, rather than falling back to
+    // watching an ancestor because `.zed/` doesn't exist yet.
+    tokio::fs::create_dir_all(ctx.project_config_path().parent().unwrap())
+        .await
+        .expect("project config directory should be created");
+    ctx.initialize().await;
+    let uri = ctx.doc_uri("document.txt");
+
+    ctx.open_document(&uri, "plaintext", "This are a tset.")
+        .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["data"]["matchedText"] == "tset"),
+        "expected an initial diagnostic for 'tset': {diagnostics:?}"
+    );
+
+    // A hand edit (or another editor window's own commands) writes the
+    // project config directly, bypassing `workspace/executeCommand`
+    // entirely.
+    tokio::fs::write(
+        ctx.project_config_path(),
+        serde_json::to_string_pretty(&json!({ "ignored_words": ["tset"] })).unwrap(),
+    )
+    .await
+    .expect("hand-edited project config should be saved");
+
+    // Nothing in this test ever told the running server about that write;
+    // the project config file watcher notices it, reloads, and triggers
+    // this recheck on its own.
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["data"]["matchedText"] != "tset"),
+        "expected the 'tset' diagnostic to be gone after the watcher picked up the hand-edited \
+         project config: {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn ignore_word_command_takes_effect_via_project_config_watcher() {
+    let mut ctx = TestContext::new();
+    ctx.initialize().await;
+    let uri = ctx.doc_uri("document.txt");
+
+    ctx.open_document(&uri, "plaintext", "This are a tset.")
+        .await;
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["data"]["matchedText"] == "tset"),
+        "expected an initial diagnostic for 'tset': {diagnostics:?}"
+    );
+
+    let result = ctx
+        .request(
+            "workspace/executeCommand",
+            json!({
+                "command": "languagetool.ignoreWordInWorkspace",
+                "arguments": ["tset"]
+            }),
+        )
+        .await;
+    assert_eq!(result, Value::Null);
+
+    // `executeCommand` only wrote the ignored word to disk (already
+    // covered by `execute_ignore_word_command_writes_project_config`);
+    // there's no direct call path from there to a recheck. This
+    // notification only arrives because the project config file watcher
+    // noticed that write and triggered it.
+    let params = ctx
+        .wait_notification("textDocument/publishDiagnostics")
+        .await;
+    let diagnostics = params["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["data"]["matchedText"] != "tset"),
+        "expected the 'tset' diagnostic to be gone after ignoring it via \
+         `workspace/executeCommand`: {diagnostics:?}"
+    );
 }

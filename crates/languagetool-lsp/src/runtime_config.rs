@@ -1,124 +1,68 @@
 use crate::config::{ClientOptions, ProjectConfig};
-use serde_json::Value;
-use std::path::{Path, PathBuf};
+use crate::languagetool::LanguageToolClient;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-#[derive(Debug, Clone)]
-pub(crate) struct RuntimeConfig {
-    state: Arc<RwLock<RuntimeConfigState>>,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeConfigState {
-    client_options: ClientOptions,
-    project_config: ProjectConfig,
-    options: Arc<ClientOptions>,
-    /// Monotonically incremented every time `options` changes. Used as a cheap
-    /// cache-invalidation key instead of serializing `ClientOptions` to JSON.
-    options_version: u64,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        let client_options = ClientOptions::default();
-        let project_config = ProjectConfig::default();
-        let options = Arc::new(project_config.merged_options(&client_options));
-        Self {
-            state: Arc::new(RwLock::new(RuntimeConfigState {
-                client_options,
-                project_config,
-                options,
-                options_version: 0,
-            })),
-        }
-    }
+pub struct RuntimeConfig {
+    pub client_options: ClientOptions,
+    pub project_config: ProjectConfig,
+    /// `project_config` merged into `client_options`; what checks
+    /// actually use.
+    pub options: Arc<ClientOptions>,
+    /// Rebuilt alongside `options` from `client_options.backend`.
+    pub language_tool: Arc<LanguageToolClient>,
+    /// Bumped on every replacement, so a document's diagnostics cache
+    /// can tell a check that ran under old options apart from the
+    /// current ones.
+    pub options_version: u64,
+    /// Bumped only when `client_options` (and therefore the resolved
+    /// project config path) changes, *not* on a project-config-only
+    /// reload. Sent to [`crate::project_config_watcher::ProjectConfigWatcher`]
+    /// alongside the new path and echoed back in its change
+    /// notifications, so a notification for a path this backend has
+    /// since moved on from can be recognized and dropped.
+    pub revision: u64,
 }
 
 impl RuntimeConfig {
-    /// Returns the current options and their version counter in a single lock
-    /// acquisition, guaranteeing the two values are always consistent.
-    pub(crate) async fn options_and_version(&self) -> (Arc<ClientOptions>, u64) {
-        let state = self.state.read().await;
-        (state.options.clone(), state.options_version)
-    }
-
-    pub(crate) async fn project_config_path(&self, root: &Path) -> PathBuf {
-        self.state
-            .read()
-            .await
-            .client_options
-            .project_config_path(root)
-    }
-
-    pub(crate) async fn project_config_display_path(&self) -> String {
-        self.state
-            .read()
-            .await
-            .client_options
-            .project_config_display_path()
-    }
-
-    pub(crate) async fn set_client_options(&self, client_options: ClientOptions, root: &Path) {
-        let project_config = ProjectConfig::load(&client_options.project_config_path(root)).await;
-        self.replace(client_options, project_config).await;
-    }
-
-    pub(crate) async fn update_client_options(
-        &self,
-        settings: Value,
-        root: &Path,
-    ) -> serde_json::Result<()> {
-        let mut state = self.state.write().await;
-        let old_project_config_path = state.client_options.project_config_path(root);
-        let client_options = state.client_options.merged_with_value(settings)?;
-        let new_project_config_path = client_options.project_config_path(root);
-        let project_config = if old_project_config_path == new_project_config_path {
-            state.project_config.clone()
-        } else {
-            ProjectConfig::load(&new_project_config_path).await
-        };
-
-        state.options = Arc::new(project_config.merged_options(&client_options));
-        state.client_options = client_options;
-        state.project_config = project_config;
-        state.options_version += 1;
-        Ok(())
-    }
-
-    pub(crate) async fn update_project_config(
-        &self,
-        path: &Path,
-        update: impl FnOnce(&mut ProjectConfig) -> bool,
-    ) -> Result<bool, String> {
-        let mut state = self.state.write().await;
-        let mut next_config = state.project_config.clone();
-        let updated = update(&mut next_config);
-        if !updated {
-            return Ok(false);
-        }
-
-        next_config
-            .save(path)
-            .await
-            .map_err(|err| format!("Failed to save project config: {err}"))?;
-
-        state.options = Arc::new(next_config.merged_options(&state.client_options));
-        state.project_config = next_config;
-        state.options_version += 1;
-        Ok(true)
-    }
-
-    async fn replace(&self, client_options: ClientOptions, project_config: ProjectConfig) {
+    pub fn new(client_options: ClientOptions, project_config: ProjectConfig) -> Self {
         let options = Arc::new(project_config.merged_options(&client_options));
-        let mut state = self.state.write().await;
-        // Preserve the current version — `replace` is only called from
-        // `set_client_options` (initialization), not from a user-driven change.
-        *state = RuntimeConfigState {
+        let language_tool = Arc::new(LanguageToolClient::new(&client_options.backend));
+        Self {
             client_options,
             project_config,
             options,
-            options_version: state.options_version,
-        };
+            language_tool,
+            options_version: 0,
+            revision: 0,
+        }
+    }
+
+    pub fn with_new_client_options(
+        &self,
+        client_options: ClientOptions,
+        project_config: ProjectConfig,
+    ) -> Self {
+        let options = Arc::new(project_config.merged_options(&client_options));
+        let language_tool = Arc::new(LanguageToolClient::new(&client_options.backend));
+        Self {
+            client_options,
+            project_config,
+            options,
+            language_tool,
+            options_version: self.options_version + 1,
+            revision: self.revision + 1,
+        }
+    }
+
+    pub fn with_new_project_config(&self, project_config: ProjectConfig) -> Self {
+        let options = Arc::new(project_config.merged_options(&self.client_options));
+        Self {
+            client_options: self.client_options.clone(),
+            project_config,
+            options,
+            language_tool: Arc::clone(&self.language_tool),
+            options_version: self.options_version + 1,
+            revision: self.revision,
+        }
     }
 }

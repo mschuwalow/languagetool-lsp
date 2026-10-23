@@ -20,19 +20,74 @@ fn default_cloud_url() -> String {
     "https://api.languagetool.org".to_string()
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum BackendKind {
-    #[default]
-    Custom,
-    Cloud,
+fn default_custom_timeout_ms() -> u64 {
+    10_000
 }
 
-impl BackendKind {
-    pub fn timeout(self) -> Duration {
-        match self {
-            BackendKind::Custom => Duration::from_secs(10),
-            BackendKind::Cloud => Duration::from_secs(20),
+fn default_cloud_timeout_ms() -> u64 {
+    20_000
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LanguageToolBackend {
+    Custom {
+        #[serde(default = "default_custom_url")]
+        url: String,
+        #[serde(default = "default_custom_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Cloud {
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default = "default_cloud_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+impl Default for LanguageToolBackend {
+    fn default() -> Self {
+        LanguageToolBackend::Custom {
+            url: default_custom_url(),
+            timeout_ms: default_custom_timeout_ms(),
+        }
+    }
+}
+
+impl LanguageToolBackend {
+    pub fn timeout(&self) -> Duration {
+        let timeout_ms = match self {
+            LanguageToolBackend::Custom { timeout_ms, .. } => *timeout_ms,
+            LanguageToolBackend::Cloud { timeout_ms, .. } => *timeout_ms,
+        };
+        Duration::from_millis(timeout_ms)
+    }
+
+    /// Returns `(username, api_key)` for the `Cloud` backend, but only when
+    /// both are configured and non-empty. LanguageTool's cloud API needs
+    /// them as a pair, so sending just one is useless; `Custom` never has
+    /// credentials at all.
+    pub fn credentials(&self) -> (Option<&str>, Option<&str>) {
+        let LanguageToolBackend::Cloud {
+            username, api_key, ..
+        } = self
+        else {
+            return (None, None);
+        };
+
+        match (username.as_deref(), api_key.as_deref()) {
+            (Some(username), Some(api_key))
+                if !username.trim().is_empty() && !api_key.trim().is_empty() =>
+            {
+                (Some(username), Some(api_key))
+            }
+            _ => (None, None),
         }
     }
 }
@@ -78,10 +133,7 @@ impl CheckingLevel {
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct ClientOptions {
-    pub backend: BackendKind,
-    pub custom_backend_url: String,
-    pub username: Option<String>,
-    pub api_key: Option<String>,
+    pub backend: LanguageToolBackend,
     pub language: String,
     pub mother_tongue: Option<String>,
     pub preferred_variants: Vec<String>,
@@ -104,10 +156,7 @@ pub struct ClientOptions {
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
-            backend: BackendKind::default(),
-            custom_backend_url: default_custom_url(),
-            username: None,
-            api_key: None,
+            backend: LanguageToolBackend::default(),
             language: "en-US".to_string(),
             mother_tongue: None,
             preferred_variants: Vec::new(),
@@ -144,18 +193,11 @@ impl ClientOptions {
         serde_json::from_value(value)
     }
 
-    pub fn merged_with_value(&self, value: Value) -> serde_json::Result<Self> {
-        let mut merged = serde_json::to_value(self)?;
-        merge_json_value(&mut merged, value);
-        Self::parse_value(merged)
-    }
-
     pub fn base_url(&self) -> String {
-        let url = match self.backend {
-            BackendKind::Custom => self.custom_backend_url.as_str(),
-            BackendKind::Cloud => return default_cloud_url(),
-        };
-        url.trim().trim_end_matches('/').to_string()
+        match &self.backend {
+            LanguageToolBackend::Custom { url, .. } => url.trim().trim_end_matches('/').to_string(),
+            LanguageToolBackend::Cloud { .. } => default_cloud_url(),
+        }
     }
 
     pub fn api_base_url(&self) -> String {
@@ -166,12 +208,17 @@ impl ClientOptions {
         format!("{}/check", self.api_base_url())
     }
 
-    pub fn project_config_path(&self, root: &Path) -> PathBuf {
+    /// Resolves the configured `projectConfigPath` against the workspace
+    /// root. `root` is `None` when the client opened a single file with no
+    /// folder (legal per the LSP spec). A configured absolute path still
+    /// resolves in that case; a relative one can't be anchored anywhere, so
+    /// this returns `None`.
+    pub fn resolved_project_config_path(&self, root: Option<&Path>) -> Option<PathBuf> {
         let path = PathBuf::from(self.project_config_path.trim());
         if path.is_absolute() {
-            path
+            Some(path)
         } else {
-            root.join(path)
+            root.map(|root| root.join(path))
         }
     }
 
@@ -185,23 +232,7 @@ impl ClientOptions {
     }
 }
 
-fn merge_json_value(base: &mut Value, update: Value) {
-    match (base, update) {
-        (Value::Object(base), Value::Object(update)) => {
-            for (key, value) in update {
-                match base.get_mut(&key) {
-                    Some(base_value) => merge_json_value(base_value, value),
-                    None => {
-                        base.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base, update) => *base = update,
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub ignored_words: Vec<String>,
@@ -319,8 +350,11 @@ mod tests {
         assert_eq!(options.endpoint(), "http://localhost:8081/v2/check");
 
         let options = ClientOptions {
-            backend: BackendKind::Cloud,
-            custom_backend_url: " https://custom.example.test/ ".to_string(),
+            backend: LanguageToolBackend::Cloud {
+                username: None,
+                api_key: None,
+                timeout_ms: default_cloud_timeout_ms(),
+            },
             ..ClientOptions::default()
         };
         assert_eq!(options.base_url(), "https://api.languagetool.org");
@@ -329,9 +363,56 @@ mod tests {
     }
 
     #[test]
+    fn backend_timeouts_default_per_variant_and_are_configurable() {
+        let options = ClientOptions::default();
+        assert_eq!(options.backend.timeout(), Duration::from_millis(10_000));
+
+        let options = ClientOptions {
+            backend: LanguageToolBackend::Cloud {
+                username: None,
+                api_key: None,
+                timeout_ms: default_cloud_timeout_ms(),
+            },
+            ..ClientOptions::default()
+        };
+        assert_eq!(options.backend.timeout(), Duration::from_millis(20_000));
+
+        let options = ClientOptions::from_value(Some(serde_json::json!({
+            "backend": { "type": "custom", "timeoutMs": 5_000 }
+        })));
+        assert_eq!(options.backend.timeout(), Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn cloud_backend_only_returns_credentials_when_both_are_set() {
+        let custom = LanguageToolBackend::Custom {
+            url: default_custom_url(),
+            timeout_ms: default_custom_timeout_ms(),
+        };
+        assert_eq!(custom.credentials(), (None, None));
+
+        let cloud_without_credentials = LanguageToolBackend::Cloud {
+            username: Some("user".to_string()),
+            api_key: None,
+            timeout_ms: default_cloud_timeout_ms(),
+        };
+        assert_eq!(cloud_without_credentials.credentials(), (None, None));
+
+        let cloud_with_credentials = LanguageToolBackend::Cloud {
+            username: Some("user".to_string()),
+            api_key: Some("key".to_string()),
+            timeout_ms: default_cloud_timeout_ms(),
+        };
+        assert_eq!(
+            cloud_with_credentials.credentials(),
+            (Some("user"), Some("key"))
+        );
+    }
+
+    #[test]
     fn parses_camel_case_options() {
         let options = ClientOptions::from_value(Some(serde_json::json!({
-            "backend": "cloud",
+            "backend": { "type": "cloud", "username": "user", "apiKey": "key" },
             "enabledRules": ["WHITESPACE_RULE"],
             "enabledCategories": ["TYPOGRAPHY"],
             "preferredVariants": ["en-US"],
@@ -340,8 +421,14 @@ mod tests {
             "projectConfigPath": ".config/languagetool/project.json",
             "defaultDiagnosticSeverity": "warning"
         })));
-        assert_eq!(options.backend, BackendKind::Cloud);
-        assert_eq!(options.custom_backend_url, default_custom_url());
+        assert_eq!(
+            options.backend,
+            LanguageToolBackend::Cloud {
+                username: Some("user".to_string()),
+                api_key: Some("key".to_string()),
+                timeout_ms: default_cloud_timeout_ms(),
+            }
+        );
         assert_eq!(options.base_url(), default_cloud_url());
         assert_eq!(options.enabled_rules, vec!["WHITESPACE_RULE"]);
         assert_eq!(options.enabled_categories, vec!["TYPOGRAPHY"]);
@@ -375,51 +462,50 @@ mod tests {
     }
 
     #[test]
-    fn merges_partial_option_updates() {
-        let options = ClientOptions {
-            backend: BackendKind::Cloud,
-            custom_backend_url: "https://example.test".to_string(),
-            language: "de-DE".to_string(),
-            debounce_ms: 750,
-            check_on_save: false,
-            ..Default::default()
-        };
+    fn from_value_ignores_previous_options_dropped_settings_revert_to_default() {
+        // `workspace/didChangeConfiguration` settings are parsed as a full
+        // replacement, not merged with whatever was active before. This
+        // matters specifically when a user *drops* a setting from their
+        // config: the expectation is that it reverts to the server
+        // default, not that a stale value from an earlier config lingers.
+        let first = ClientOptions::from_value(Some(serde_json::json!({
+            "backend": {
+                "type": "custom",
+                "url": "https://old.example.test",
+                "timeoutMs": 5_000
+            },
+            "language": "de-DE",
+            "debounceMs": 100,
+            "checkOnSave": false
+        })));
+        assert_eq!(first.language, "de-DE");
+        assert_eq!(first.debounce_ms, 100);
+        assert!(!first.check_on_save);
 
-        let options = options
-            .merged_with_value(serde_json::json!({ "debounceMs": 100 }))
-            .unwrap();
-
-        assert_eq!(options.backend, BackendKind::Cloud);
-        assert_eq!(options.custom_backend_url, "https://example.test");
-        assert_eq!(options.language, "de-DE");
-        assert_eq!(options.debounce_ms, 100);
-        assert!(!options.check_on_save);
-    }
-
-    #[test]
-    fn merges_flat_backend_option_updates() {
-        let options = ClientOptions {
-            backend: BackendKind::Cloud,
-            custom_backend_url: "https://old.example.test".to_string(),
-            ..Default::default()
-        };
-
-        let options = options
-            .merged_with_value(serde_json::json!({
-                "customBackendUrl": "https://new.example.test"
-            }))
-            .unwrap();
-        assert_eq!(options.backend, BackendKind::Cloud);
-        assert_eq!(options.custom_backend_url, "https://new.example.test");
-        assert_eq!(options.base_url(), default_cloud_url());
-
-        let options = options
-            .merged_with_value(serde_json::json!({
-                "backend": "custom"
-            }))
-            .unwrap();
-        assert_eq!(options.backend, BackendKind::Custom);
-        assert_eq!(options.base_url(), "https://new.example.test");
+        // A later config drops `language`/`checkOnSave`/`backend.url`
+        // entirely (e.g. the user removed those lines) and switches
+        // backends without specifying `timeoutMs`.
+        let second = ClientOptions::from_value(Some(serde_json::json!({
+            "backend": { "type": "cloud" },
+            "debounceMs": 200
+        })));
+        assert_eq!(
+            second.backend,
+            LanguageToolBackend::Cloud {
+                username: None,
+                api_key: None,
+                timeout_ms: default_cloud_timeout_ms(),
+            },
+            "switching backends without a `timeoutMs` should use `Cloud`'s \
+             own default, not `Custom`'s leftover value"
+        );
+        assert_eq!(second.debounce_ms, 200);
+        assert_eq!(
+            second.language,
+            ClientOptions::default().language,
+            "a dropped setting should revert to the default, not `first`'s value"
+        );
+        assert!(second.check_on_save);
     }
 
     #[test]
@@ -427,8 +513,8 @@ mod tests {
         let root = Path::new("/tmp/workspace");
         let options = ClientOptions::default();
         assert_eq!(
-            options.project_config_path(root),
-            PathBuf::from("/tmp/workspace/.zed/languagetool.json")
+            options.resolved_project_config_path(Some(root)),
+            Some(PathBuf::from("/tmp/workspace/.zed/languagetool.json"))
         );
         assert_eq!(
             options.project_config_display_path(),
@@ -440,8 +526,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            options.project_config_path(root),
-            PathBuf::from("/tmp/workspace/.idea/languagetool.json")
+            options.resolved_project_config_path(Some(root)),
+            Some(PathBuf::from("/tmp/workspace/.idea/languagetool.json"))
         );
 
         let options = ClientOptions {
@@ -449,8 +535,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            options.project_config_path(root),
-            PathBuf::from("/tmp/languagetool.json")
+            options.resolved_project_config_path(Some(root)),
+            Some(PathBuf::from("/tmp/languagetool.json"))
+        );
+    }
+
+    #[test]
+    fn resolved_project_config_path_without_root_requires_an_absolute_path() {
+        let options = ClientOptions {
+            project_config_path: ".zed/languagetool.json".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(options.resolved_project_config_path(None), None);
+
+        let options = ClientOptions {
+            project_config_path: "/tmp/languagetool.json".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            options.resolved_project_config_path(None),
+            Some(PathBuf::from("/tmp/languagetool.json"))
         );
     }
 
